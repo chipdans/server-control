@@ -1,9 +1,9 @@
 {
-  "api_base_url": "https://server-control-hub.YOUR-SUBDOMAIN.workers.dev",
+  "api_base_url": "https://server-control-hub.channelchipdanq.workers.dev",
   "update": {
     "enabled": true,
     "install_automatically": true,
-    "repository": "YOUR-GITHUB-ACCOUNT/server-control-releases",
+    "repository": "chipdans/server-control",
     "asset_name": "ServerControl-Update.zip"
   }
 }
