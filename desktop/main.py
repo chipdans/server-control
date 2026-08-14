@@ -16,7 +16,7 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 APP_TITLE = "Server Control"
 ALL_PERMISSIONS = [
     ("power_view", "Видеть питание"),
@@ -53,6 +53,23 @@ def load_configuration() -> dict[str, Any]:
     return config
 
 
+def enable_clipboard_paste(entry: ttk.Entry) -> ttk.Entry:
+    """Make the standard Windows paste shortcuts reliable in every entry."""
+
+    def paste(event: tk.Event) -> str:
+        try:
+            value = event.widget.clipboard_get()
+        except tk.TclError:
+            return "break"
+        event.widget.insert(tk.INSERT, value)
+        return "break"
+
+    entry.bind("<Control-v>", paste)
+    entry.bind("<Control-V>", paste)
+    entry.bind("<Shift-Insert>", paste)
+    return entry
+
+
 class ServerControlApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -67,6 +84,8 @@ class ServerControlApp:
         self.user: dict[str, Any] | None = None
         self.server_log_after = 0
         self.minecraft_log_after = 0
+        self.server_logs_initialized = False
+        self.minecraft_logs_initialized = False
         self.polling = False
         self.closed = False
         self.user_cache: dict[str, dict[str, Any]] = {}
@@ -120,10 +139,10 @@ class ServerControlApp:
             row=1, column=0, columnspan=2, sticky="w", pady=(0, 24)
         )
         ttk.Label(frame, text="Логин").grid(row=2, column=0, sticky="w", pady=4)
-        self.login_username = ttk.Entry(frame, width=34)
+        self.login_username = enable_clipboard_paste(ttk.Entry(frame, width=34))
         self.login_username.grid(row=2, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text="Пароль").grid(row=3, column=0, sticky="w", pady=4)
-        self.login_password = ttk.Entry(frame, width=34, show="•")
+        self.login_password = enable_clipboard_paste(ttk.Entry(frame, width=34, show="•"))
         self.login_password.grid(row=3, column=1, sticky="ew", pady=4)
         self.login_password.bind("<Return>", lambda _event: self.login())
         self.login_button = ttk.Button(frame, text="Войти", command=self.login)
@@ -160,7 +179,7 @@ class ServerControlApp:
         entries: list[ttk.Entry] = []
         for row, (label, sensitive) in enumerate(fields, start=2):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
-            entry = ttk.Entry(frame, width=42, show="•" if sensitive else "")
+            entry = enable_clipboard_paste(ttk.Entry(frame, width=42, show="•" if sensitive else ""))
             entry.grid(row=row, column=1, sticky="ew", pady=4)
             entries.append(entry)
 
@@ -202,6 +221,8 @@ class ServerControlApp:
         self.user = dict(result["user"])
         self.server_log_after = 0
         self.minecraft_log_after = 0
+        self.server_logs_initialized = False
+        self.minecraft_logs_initialized = False
         self.clear()
 
         header = ttk.Frame(self.root, padding=(18, 14, 18, 8))
@@ -270,7 +291,7 @@ class ServerControlApp:
         if self.has_permission("server_command"):
             entry_row = ttk.Frame(tab)
             entry_row.pack(fill="x", pady=(8, 0))
-            self.server_command_entry = ttk.Entry(entry_row)
+            self.server_command_entry = enable_clipboard_paste(ttk.Entry(entry_row))
             self.server_command_entry.pack(side="left", fill="x", expand=True)
             self.server_command_entry.bind("<Return>", lambda _event: self.send_server_command())
             ttk.Button(entry_row, text="Отправить", command=self.send_server_command).pack(side="left", padx=(8, 0))
@@ -296,7 +317,7 @@ class ServerControlApp:
         if self.has_permission("minecraft_command"):
             entry_row = ttk.Frame(tab)
             entry_row.pack(fill="x", pady=(8, 0))
-            self.minecraft_command_entry = ttk.Entry(entry_row)
+            self.minecraft_command_entry = enable_clipboard_paste(ttk.Entry(entry_row))
             self.minecraft_command_entry.pack(side="left", fill="x", expand=True)
             self.minecraft_command_entry.bind("<Return>", lambda _event: self.send_minecraft_command())
             ttk.Button(entry_row, text="Отправить", command=self.send_minecraft_command).pack(side="left", padx=(8, 0))
@@ -352,9 +373,13 @@ class ServerControlApp:
             if self.has_permission("server_view") or self.has_permission("minecraft_view"):
                 results["status"] = api.request("GET", "/v1/server/status")
             if self.has_permission("server_view"):
-                results["server_logs"] = api.request("GET", f"/v1/server/logs?after={self.server_log_after}")
+                latest = "&latest=1" if not self.server_logs_initialized else ""
+                results["server_logs"] = api.request("GET", f"/v1/server/logs?after={self.server_log_after}{latest}")
             if self.has_permission("minecraft_view"):
-                results["minecraft_logs"] = api.request("GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}")
+                latest = "&latest=1" if not self.minecraft_logs_initialized else ""
+                results["minecraft_logs"] = api.request(
+                    "GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}{latest}"
+                )
             return results
 
         def success(results: dict[str, Any]) -> None:
@@ -389,11 +414,13 @@ class ServerControlApp:
         if "server_logs" in results:
             logs = results["server_logs"]
             self.server_log_after = int(logs.get("next_after", self.server_log_after))
+            self.server_logs_initialized = True
             if hasattr(self, "server_console"):
                 self.append_events(self.server_console, logs.get("events", []))
         if "minecraft_logs" in results:
             logs = results["minecraft_logs"]
             self.minecraft_log_after = int(logs.get("next_after", self.minecraft_log_after))
+            self.minecraft_logs_initialized = True
             if hasattr(self, "minecraft_console"):
                 self.append_events(self.minecraft_console, logs.get("events", []))
 
@@ -560,7 +587,7 @@ class ServerControlApp:
         frame = ttk.Frame(dialog, padding=20)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=f"Новый пароль для {user.get('username')}").grid(row=0, column=0, sticky="w")
-        password = ttk.Entry(frame, width=34, show="•")
+        password = enable_clipboard_paste(ttk.Entry(frame, width=34, show="•"))
         password.grid(row=1, column=0, sticky="ew", pady=(8, 12))
 
         def submit() -> None:
@@ -582,7 +609,7 @@ class ServerControlApp:
     @staticmethod
     def labeled_entry(parent: ttk.Frame, row: int, label: str, secret: bool = False) -> ttk.Entry:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        entry = ttk.Entry(parent, width=34, show="•" if secret else "")
+        entry = enable_clipboard_paste(ttk.Entry(parent, width=34, show="•" if secret else ""))
         entry.grid(row=row, column=1, sticky="ew", pady=4)
         return entry
 
@@ -643,7 +670,13 @@ class ServerControlApp:
                 result = work()
             except Exception as error:  # return to Tk's main thread before touching UI
                 if not self.closed:
-                    self.root.after(0, lambda: failure(error) if failure else self.handle_error(error, context=context, quiet=quiet))
+                    def report(caught_error: Exception = error) -> None:
+                        if failure:
+                            failure(caught_error)
+                        else:
+                            self.handle_error(caught_error, context=context, quiet=quiet)
+
+                    self.root.after(0, report)
             else:
                 if not self.closed:
                     self.root.after(0, lambda: success(result))

@@ -1,7 +1,7 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-const PASSWORD_ITERATIONS = 150_000;
+const PASSWORD_ITERATIONS = 100_000;
 const ACCESS_TOKEN_TTL_SECONDS = 12 * 60 * 60;
 const AGENT_COMMAND_BATCH = 20;
 const MAX_CONSOLE_EVENTS_PER_PUSH = 100;
@@ -126,12 +126,12 @@ async function route(request, env) {
 
   if (method === "GET" && pathname === "/v1/server/logs") {
     requirePermission(session, "server_view");
-    return getConsoleEvents(env, "server", url.searchParams.get("after"));
+    return getConsoleEvents(env, "server", url.searchParams.get("after"), url.searchParams.get("latest") === "1");
   }
 
   if (method === "GET" && pathname === "/v1/minecraft/logs") {
     requirePermission(session, "minecraft_view");
-    return getConsoleEvents(env, "minecraft", url.searchParams.get("after"));
+    return getConsoleEvents(env, "minecraft", url.searchParams.get("after"), url.searchParams.get("latest") === "1");
   }
 
   if (method === "POST" && pathname === "/v1/server/command") {
@@ -518,8 +518,25 @@ async function resetPassword(request, env, session, targetId) {
   return json({ ok: true });
 }
 
-async function getConsoleEvents(env, kind, afterValue) {
+async function getConsoleEvents(env, kind, afterValue, latest = false) {
   const after = Math.max(0, Math.min(Number.parseInt(afterValue || "0", 10) || 0, Number.MAX_SAFE_INTEGER));
+  if (latest && after === 0) {
+    const result = await env.DB.prepare(
+      `SELECT id, kind, message, created_at
+       FROM (
+         SELECT id, kind, message, created_at
+         FROM console_events
+         WHERE kind = ?
+         ORDER BY id DESC
+         LIMIT 100
+       )
+       ORDER BY id ASC`,
+    )
+      .bind(kind)
+      .all();
+    const events = result.results || [];
+    return json({ events, next_after: events.length ? events[events.length - 1].id : after });
+  }
   const result = await env.DB.prepare(
     "SELECT id, kind, message, created_at FROM console_events WHERE kind = ? AND id > ? ORDER BY id ASC LIMIT 100",
   )
