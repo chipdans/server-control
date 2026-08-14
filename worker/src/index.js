@@ -5,6 +5,9 @@ const PASSWORD_ITERATIONS = 100_000;
 const ACCESS_TOKEN_TTL_SECONDS = 12 * 60 * 60;
 const AGENT_COMMAND_BATCH = 20;
 const COMMAND_CLAIM_STALE_AFTER_MS = 15 * 60 * 1000;
+const AGENT_ONLINE_MAX_AGE_MS = 10 * 1000;
+const POWER_STATUS_CACHE_MAX_AGE_MS = 3 * 1000;
+const YANDEX_REQUEST_TIMEOUT_MS = 5 * 1000;
 const MAX_CONSOLE_EVENTS_PER_PUSH = 100;
 const MAX_CONSOLE_MESSAGE_LENGTH = 8_000;
 const MAX_SHELL_COMMAND_LENGTH = 512;
@@ -118,10 +121,12 @@ async function route(request, env) {
       return json({ online: false, status: null, updated_at: null });
     }
     const updatedAt = Number(record.updated_at);
+    const ageMs = Math.max(0, Date.now() - updatedAt);
     return json({
-      online: Date.now() - updatedAt < 45_000,
+      online: ageMs < AGENT_ONLINE_MAX_AGE_MS,
       status: safeJson(record.status, {}),
       updated_at: updatedAt,
+      age_ms: ageMs,
     });
   }
 
@@ -640,6 +645,23 @@ async function completeAgentCommand(request, env, commandId) {
 }
 
 async function getYandexPowerStatus(env) {
+  const cached = await getCachedPowerStatus(env);
+  if (cached && Date.now() - cached.updated_at < POWER_STATUS_CACHE_MAX_AGE_MS) {
+    return { ...cached, stale: false };
+  }
+
+  try {
+    const fresh = await getLiveYandexPowerStatus(env);
+    await saveCachedPowerStatus(env, fresh);
+    return { ...fresh, stale: false };
+  } catch (error) {
+    if (!cached) throw error;
+    console.warn("Yandex Smart Home is unavailable; returning cached power status");
+    return { ...cached, stale: true };
+  }
+}
+
+async function getLiveYandexPowerStatus(env) {
   const response = await yandexRequest(env, `devices/${encodeURIComponent(requiredSecret(env, "YANDEX_DEVICE_ID"))}`, {
     method: "GET",
   });
@@ -656,6 +678,32 @@ async function getYandexPowerStatus(env) {
     online: typeof device.state === "string" ? device.state === "online" : null,
     updated_at: Date.now(),
   };
+}
+
+async function getCachedPowerStatus(env) {
+  const row = await env.DB.prepare(
+    "SELECT name, on_state, online_state, updated_at FROM power_status WHERE id = 'primary'",
+  ).first();
+  if (!row) return null;
+  return {
+    name: row.name || "Питание сервера",
+    device_id: requiredSecret(env, "YANDEX_DEVICE_ID"),
+    on: row.on_state === null || row.on_state === undefined ? null : Boolean(row.on_state),
+    online: row.online_state === null || row.online_state === undefined ? null : Boolean(row.online_state),
+    updated_at: Number(row.updated_at) || 0,
+  };
+}
+
+async function saveCachedPowerStatus(env, power) {
+  const onState = power.on === true ? 1 : power.on === false ? 0 : null;
+  const onlineState = power.online === true ? 1 : power.online === false ? 0 : null;
+  await env.DB.prepare(
+    `INSERT INTO power_status (id, name, on_state, online_state, updated_at) VALUES ('primary', ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET name = excluded.name, on_state = excluded.on_state,
+       online_state = excluded.online_state, updated_at = excluded.updated_at`,
+  )
+    .bind(String(power.name || "Питание сервера"), onState, onlineState, Number(power.updated_at) || Date.now())
+    .run();
 }
 
 async function setYandexPower(env, on) {
@@ -683,19 +731,44 @@ async function setYandexPower(env, on) {
   if (actionResult && actionResult.status !== "DONE") {
     throw new ApiError(502, "smart_home_action_failed", "Умная розетка не подтвердила изменение состояния.");
   }
-  return { on, accepted: true, response };
+  const power = { on, accepted: true, response };
+  try {
+    await saveCachedPowerStatus(env, {
+      name: "Питание сервера",
+      on,
+      online: true,
+      updated_at: Date.now(),
+    });
+  } catch (error) {
+    console.error("Could not cache Yandex power action", error);
+  }
+  return power;
 }
 
 async function yandexRequest(env, path, init) {
   const token = requiredSecret(env, "YANDEX_OAUTH_TOKEN");
-  const response = await fetch(`https://api.iot.yandex.net/v1.0/${path}`, {
-    ...init,
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      accept: "application/json",
-    },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), YANDEX_REQUEST_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`https://api.iot.yandex.net/v1.0/${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new ApiError(504, "smart_home_timeout", "Умная розетка не ответила вовремя.");
+    }
+    console.error("Yandex Smart Home request failed", error);
+    throw new ApiError(502, "smart_home_error", "Не удалось связаться с умной розеткой.");
+  } finally {
+    clearTimeout(timer);
+  }
   const raw = await response.text();
   const payload = raw ? safeJson(raw, {}) : {};
   if (!response.ok) {

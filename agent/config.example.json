@@ -1,8 +1,8 @@
 {
   "hub_url": "https://server-control-hub.YOUR-SUBDOMAIN.workers.dev",
   "agent_api_key": "REPLACE_WITH_THE_SAME_AGENT_API_KEY_AS_IN_CLOUDFLARE",
-  "poll_seconds": 6,
-  "heartbeat_seconds": 30,
+  "poll_seconds": 2,
+  "heartbeat_seconds": 2,
   "request_timeout_seconds": 20,
   "minecraft": {
     "service": "minecraft-dragonfyre.service",

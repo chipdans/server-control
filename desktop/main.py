@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -16,8 +17,10 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 APP_TITLE = "Server Control"
+STATUS_POLL_INTERVAL_MS = 1_000
+LOG_POLL_INTERVAL_SECONDS = 5
 ALL_PERMISSIONS = [
     ("power_view", "Видеть питание"),
     ("power_control", "Управлять питанием"),
@@ -98,7 +101,12 @@ class ServerControlApp:
         self.server_logs_initialized = False
         self.minecraft_logs_initialized = False
         self.safe_power_off_pending = False
-        self.polling = False
+        self.power_polling = False
+        self.status_polling = False
+        self.logs_polling = False
+        self.poll_after_id: str | None = None
+        self.next_log_poll_at = 0.0
+        self.update_in_progress = False
         self.closed = False
         self.user_cache: dict[str, dict[str, Any]] = {}
 
@@ -235,6 +243,10 @@ class ServerControlApp:
         self.minecraft_log_after = 0
         self.server_logs_initialized = False
         self.minecraft_logs_initialized = False
+        self.power_polling = False
+        self.status_polling = False
+        self.logs_polling = False
+        self.next_log_poll_at = 0.0
         self.clear()
 
         header = ttk.Frame(self.root, padding=(18, 14, 18, 8))
@@ -371,42 +383,109 @@ class ServerControlApp:
         return console
 
     def poll(self) -> None:
-        if self.closed or not self.user or self.polling:
-            if not self.closed:
-                self.root.after(10_000, self.poll)
+        """Refresh compact status cards each second without blocking on logs."""
+        if self.closed or not self.user:
             return
-        self.polling = True
+
+        self._poll_power()
+        self._poll_server_status()
+        now = time.monotonic()
+        if now >= self.next_log_poll_at:
+            self.next_log_poll_at = now + LOG_POLL_INTERVAL_SECONDS
+            self._poll_logs()
+        self._schedule_next_poll()
+
+    def _schedule_next_poll(self) -> None:
+        if self.closed or not self.user or self.poll_after_id is not None:
+            return
+        self.poll_after_id = self.root.after(STATUS_POLL_INTERVAL_MS, self._scheduled_poll)
+
+    def _scheduled_poll(self) -> None:
+        self.poll_after_id = None
+        self.poll()
+
+    def _poll_power(self) -> None:
+        if not self.has_permission("power_view") or self.power_polling:
+            return
+        self.power_polling = True
+
+        def success(result: dict[str, Any]) -> None:
+            self.power_polling = False
+            self.apply_poll_results({"power": result})
+
+        def failure(error: Exception) -> None:
+            self.power_polling = False
+            self.handle_poll_error(error, "Питание")
+
+        self.async_call(
+            lambda: self.require_api().request("GET", "/v1/power/status", timeout_seconds=7),
+            success,
+            failure,
+            context="Обновление питания",
+            quiet=True,
+        )
+
+    def _poll_server_status(self) -> None:
+        if not (self.has_permission("server_view") or self.has_permission("minecraft_view")) or self.status_polling:
+            return
+        self.status_polling = True
+
+        def success(result: dict[str, Any]) -> None:
+            self.status_polling = False
+            self.apply_poll_results({"status": result})
+
+        def failure(error: Exception) -> None:
+            self.status_polling = False
+            self.handle_poll_error(error, "Домашний сервер")
+
+        self.async_call(
+            lambda: self.require_api().request("GET", "/v1/server/status", timeout_seconds=7),
+            success,
+            failure,
+            context="Обновление состояния сервера",
+            quiet=True,
+        )
+
+    def _poll_logs(self) -> None:
+        if self.logs_polling:
+            return
+        needs_server_logs = self.has_permission("server_view")
+        needs_minecraft_logs = self.has_permission("minecraft_view")
+        if not needs_server_logs and not needs_minecraft_logs:
+            return
+        self.logs_polling = True
 
         def work() -> dict[str, Any]:
             api = self.require_api()
             results: dict[str, Any] = {}
-            if self.has_permission("power_view"):
-                results["power"] = api.request("GET", "/v1/power/status")
-            if self.has_permission("server_view") or self.has_permission("minecraft_view"):
-                results["status"] = api.request("GET", "/v1/server/status")
-            if self.has_permission("server_view"):
+            if needs_server_logs:
                 latest = "&latest=1" if not self.server_logs_initialized else ""
-                results["server_logs"] = api.request("GET", f"/v1/server/logs?after={self.server_log_after}{latest}")
-            if self.has_permission("minecraft_view"):
+                results["server_logs"] = api.request(
+                    "GET", f"/v1/server/logs?after={self.server_log_after}{latest}", timeout_seconds=10
+                )
+            if needs_minecraft_logs:
                 latest = "&latest=1" if not self.minecraft_logs_initialized else ""
                 results["minecraft_logs"] = api.request(
-                    "GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}{latest}"
+                    "GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}{latest}", timeout_seconds=10
                 )
             return results
 
         def success(results: dict[str, Any]) -> None:
-            self.polling = False
+            self.logs_polling = False
             self.apply_poll_results(results)
-            if not self.closed:
-                self.root.after(10_000, self.poll)
 
         def failure(error: Exception) -> None:
-            self.polling = False
-            self.handle_error(error, quiet=True)
-            if not self.closed:
-                self.root.after(15_000, self.poll)
+            self.logs_polling = False
+            self.handle_poll_error(error, "Консоль")
 
-        self.async_call(work, success, failure, context="Обновление статуса")
+        self.async_call(work, success, failure, context="Обновление консоли", quiet=True)
+
+    def handle_poll_error(self, error: Exception, source: str) -> None:
+        if isinstance(error, ApiError) and error.code in {"access_revoked", "invalid_session", "authentication_required"}:
+            self.handle_error(error, quiet=True)
+            return
+        if not self.closed:
+            self.status_var.set(f"{source}: временно нет ответа. Повторяю автоматически.")
 
     def apply_poll_results(self, results: dict[str, Any]) -> None:
         if "power" in results:
@@ -422,7 +501,11 @@ class ServerControlApp:
             data = status.get("status") or {}
             server = data.get("server") or {}
             minecraft = data.get("minecraft") or {}
-            self.server_state_var.set(f"Домашний сервер: {'онлайн' if online else 'нет связи'} · {server.get('hostname', '—')}")
+            age_seconds = max(0, round(float(status.get("age_ms", 0)) / 1000))
+            freshness = f" · обновлено {age_seconds} с назад" if online else ""
+            self.server_state_var.set(
+                f"Домашний сервер: {'онлайн' if online else 'нет связи'} · {server.get('hostname', '—')}{freshness}"
+            )
             mc_state = "запущен" if minecraft.get("active") else "остановлен"
             self.minecraft_state_var.set(f"Minecraft: {mc_state}" if online else "Minecraft: нет связи с агентом")
         if "server_logs" in results:
@@ -666,6 +749,8 @@ class ServerControlApp:
         return self.user_cache.get(selection[0])
 
     def check_for_updates(self) -> None:
+        if self.update_in_progress:
+            return
         update_config = self.config.get("update", {}) if isinstance(self.config.get("update"), dict) else {}
         if not update_config.get("enabled") or not getattr(sys, "frozen", False):
             return
@@ -687,6 +772,7 @@ class ServerControlApp:
             )
             if not install:
                 return
+            self.update_in_progress = True
             self.status_var.set(f"Скачивание обновления {release['tag']}…")
 
             def apply() -> None:
@@ -695,9 +781,13 @@ class ServerControlApp:
 
             def applied(_value: Any) -> None:
                 self.status_var.set("Обновление скачано. Перезапуск…")
-                self.root.after(500, self.close)
+                self.root.after(0, self.close)
 
-            self.async_call(apply, applied, context="Установка обновления")
+            def failed(error: Exception) -> None:
+                self.update_in_progress = False
+                self.handle_error(error, context="Установка обновления")
+
+            self.async_call(apply, applied, failed, context="Установка обновления")
 
         self.async_call(work, success, context="Проверка обновлений", quiet=True)
 
@@ -766,13 +856,24 @@ class ServerControlApp:
         if self.api:
             self.api.token = None
         self.user = None
-        self.polling = False
+        if self.poll_after_id is not None:
+            try:
+                self.root.after_cancel(self.poll_after_id)
+            except tk.TclError:
+                pass
+            self.poll_after_id = None
         if show_message:
             self.status_var.set("Вы вышли из аккаунта.")
         self.show_login()
 
     def close(self) -> None:
         self.closed = True
+        if self.poll_after_id is not None:
+            try:
+                self.root.after_cancel(self.poll_after_id)
+            except tk.TclError:
+                pass
+            self.poll_after_id = None
         self.root.destroy()
 
 

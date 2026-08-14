@@ -27,6 +27,8 @@ class ApiClient:
         path: str,
         payload: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
+        *,
+        timeout_seconds: float = 25,
     ) -> dict[str, Any]:
         headers = {"Accept": "application/json", "User-Agent": "ServerControlDesktop/1.0"}
         if payload is not None:
@@ -39,9 +41,11 @@ class ApiClient:
         request = urllib.request.Request(f"{self.base_url}{path}", data=body, method=method, headers=headers)
 
         try:
-            with urllib.request.urlopen(request, timeout=25) as response:
+            with urllib.request.urlopen(request, timeout=max(1, timeout_seconds)) as response:
                 raw = response.read().decode("utf-8")
                 status = response.status
+        except TimeoutError as error:
+            raise ApiError(0, "network_timeout", "Время ожидания ответа истекло.") from error
         except urllib.error.HTTPError as error:
             raw = error.read().decode("utf-8", "replace")
             parsed = self._parse_json(raw)

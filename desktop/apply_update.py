@@ -15,6 +15,8 @@ from pathlib import Path
 
 
 def wait_for_process(pid: int) -> None:
+    if pid <= 0:
+        return
     if sys.platform == "win32":
         synchronize = 0x00100000
         handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)
@@ -28,6 +30,32 @@ def wait_for_process(pid: int) -> None:
         except OSError:
             return
         time.sleep(0.2)
+
+
+def replace_executable(replacement: Path, target: Path) -> None:
+    """Retry while Windows releases the old executable file handle."""
+    temporary_target = target.with_name(f"{target.stem}.new{target.suffix}")
+    deadline = time.monotonic() + 60
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        try:
+            shutil.copy2(replacement, temporary_target)
+            os.replace(temporary_target, target)
+            return
+        except OSError as error:
+            last_error = error
+            time.sleep(0.5)
+    raise RuntimeError(f"Не удалось заменить {target.name} за 60 секунд: {last_error}")
+
+
+def write_error_log(target: Path, error: Exception) -> None:
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "ServerControl-update-error.log").write_text(
+            f"{type(error).__name__}: {error}\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
@@ -56,11 +84,12 @@ def main() -> int:
         if not replacement.is_file():
             raise RuntimeError(f"В архиве нет {args.restart.name}")
         args.target.mkdir(parents=True, exist_ok=True)
-        temporary_target = args.target / f"{args.restart.stem}.new{args.restart.suffix}"
-        shutil.copy2(replacement, temporary_target)
-        os.replace(temporary_target, args.restart)
+        replace_executable(replacement, args.restart)
         subprocess.Popen([str(args.restart)], cwd=str(args.target), close_fds=True)
         return 0
+    except Exception as error:
+        write_error_log(args.target, error)
+        return 1
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 

@@ -54,8 +54,11 @@ class Config:
         return cls(
             hub_url=str(raw["hub_url"]).rstrip("/"),
             agent_api_key=str(raw["agent_api_key"]),
-            poll_seconds=max(3, int(raw.get("poll_seconds", 6))),
-            heartbeat_seconds=max(10, int(raw.get("heartbeat_seconds", 30))),
+            # The desktop refreshes its cards every second.  Two-second agent
+            # heartbeats keep those cards live without exhausting a free D1
+            # write quota with one write per second.
+            poll_seconds=max(1, min(2, int(raw.get("poll_seconds", 2)))),
+            heartbeat_seconds=max(1, min(2, int(raw.get("heartbeat_seconds", 2)))),
             request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
             minecraft=dict(raw["minecraft"]),
             commands=dict(raw["commands"]),

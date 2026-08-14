@@ -9,6 +9,7 @@ delivery.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -73,7 +74,7 @@ def launch_updater(update_zip: Path, current_executable: Path) -> None:
     command = [
         str(updater),
         "--wait-pid",
-        "0",
+        str(os.getpid()),
         "--zip",
         str(update_zip),
         "--target",
@@ -82,14 +83,13 @@ def launch_updater(update_zip: Path, current_executable: Path) -> None:
         str(current_executable),
     ]
     if sys.platform == "win32":
-        # Closing a Tk window does not always end the packaged process at once.
-        # Start the updater after a short delay instead of making it wait for up
-        # to a minute on a process handle.  The delay gives this app time to exit.
-        delayed_command = "timeout /t 2 /nobreak >NUL && " + subprocess.list2cmdline(command)
+        # The companion waits for this exact process before replacing the EXE.
+        # It is detached so closing the Tk window cannot terminate the updater.
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
         subprocess.Popen(
-            ["cmd.exe", "/d", "/c", delayed_command],
+            command,
             close_fds=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=creationflags,
         )
         return
     subprocess.Popen(command, close_fds=True)
