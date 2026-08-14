@@ -4,6 +4,7 @@ const decoder = new TextDecoder();
 const PASSWORD_ITERATIONS = 100_000;
 const ACCESS_TOKEN_TTL_SECONDS = 12 * 60 * 60;
 const AGENT_COMMAND_BATCH = 20;
+const COMMAND_CLAIM_STALE_AFTER_MS = 15 * 60 * 1000;
 const MAX_CONSOLE_EVENTS_PER_PUSH = 100;
 const MAX_CONSOLE_MESSAGE_LENGTH = 8_000;
 const MAX_SHELL_COMMAND_LENGTH = 512;
@@ -353,7 +354,21 @@ async function powerAction(request, env, session) {
     return json({ ok: true, mode: "forced", power });
   }
 
-  const command = await enqueueCommand(env, "safe_power_off", {}, session.user.id);
+  let command = await getActiveSafePowerOff(env);
+  if (command) {
+    await addAudit(env, session.user.id, "power.off.safe_already_requested", { command_id: command.id });
+    return json({ ok: true, mode: "safe", command, already_pending: true }, 202);
+  }
+
+  try {
+    command = await enqueueCommand(env, "safe_power_off", {}, session.user.id);
+  } catch (error) {
+    // The partial unique index protects two clicks that arrive at the same time.
+    command = await getActiveSafePowerOff(env);
+    if (!command) throw error;
+    await addAudit(env, session.user.id, "power.off.safe_already_requested", { command_id: command.id });
+    return json({ ok: true, mode: "safe", command, already_pending: true }, 202);
+  }
   await addAudit(env, session.user.id, "power.off.safe_requested", { command_id: command.id });
   return json({ ok: true, mode: "safe", command }, 202);
 }
@@ -563,8 +578,15 @@ async function enqueueCommand(env, type, payload, requestedBy) {
   return command;
 }
 
+async function getActiveSafePowerOff(env) {
+  return env.DB.prepare(
+    "SELECT id, type, payload, requested_by, status, created_at, claimed_at FROM command_queue " +
+      "WHERE type = 'safe_power_off' AND status IN ('pending', 'claimed') ORDER BY created_at DESC LIMIT 1",
+  ).first();
+}
+
 async function claimAgentCommands(env) {
-  const staleBefore = Date.now() - 60_000;
+  const staleBefore = Date.now() - COMMAND_CLAIM_STALE_AFTER_MS;
   const result = await env.DB.prepare(
     `SELECT id, type, payload, requested_by, created_at
      FROM command_queue

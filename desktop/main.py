@@ -16,7 +16,7 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 APP_TITLE = "Server Control"
 ALL_PERMISSIONS = [
     ("power_view", "Видеть питание"),
@@ -54,18 +54,29 @@ def load_configuration() -> dict[str, Any]:
 
 
 def enable_clipboard_paste(entry: ttk.Entry) -> ttk.Entry:
-    """Make the standard Windows paste shortcuts reliable in every entry."""
+    """Make Windows paste shortcuts work even with a non-English keyboard layout."""
 
     def paste(event: tk.Event) -> str:
         try:
             value = event.widget.clipboard_get()
         except tk.TclError:
             return "break"
+        try:
+            event.widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
         event.widget.insert(tk.INSERT, value)
         return "break"
 
-    entry.bind("<Control-v>", paste)
-    entry.bind("<Control-V>", paste)
+    def paste_from_ctrl(event: tk.Event) -> str | None:
+        # On a Russian layout Tk can report Ctrl+V as Cyrillic "м".  Windows
+        # still supplies virtual-key code 86, which is the physical V key.
+        if event.keycode == 86 or str(event.keysym).lower() in {"v", "cyrillic_em"}:
+            return paste(event)
+        return None
+
+    entry.bind("<<Paste>>", paste)
+    entry.bind("<Control-KeyPress>", paste_from_ctrl, add="+")
     entry.bind("<Shift-Insert>", paste)
     return entry
 
@@ -86,6 +97,7 @@ class ServerControlApp:
         self.minecraft_log_after = 0
         self.server_logs_initialized = False
         self.minecraft_logs_initialized = False
+        self.safe_power_off_pending = False
         self.polling = False
         self.closed = False
         self.user_cache: dict[str, dict[str, Any]] = {}
@@ -402,6 +414,8 @@ class ServerControlApp:
             state = power.get("on")
             readable = "включено" if state is True else "выключено" if state is False else "не удалось определить"
             self.power_var.set(f"Питание сервера: {readable}")
+            if state is False:
+                self.safe_power_off_pending = False
         if "status" in results:
             status = results["status"]
             online = bool(status.get("online"))
@@ -439,11 +453,42 @@ class ServerControlApp:
         console.configure(state="disabled")
 
     def power_action(self, state: str) -> None:
-        if state == "off" and not messagebox.askyesno(
-            "Безопасное выключение", "Minecraft будет остановлен, данные синхронизированы, затем розетка отключит питание. Продолжить?"
+        if state == "on":
+            self.command_request("POST", "/v1/power/action", {"state": state}, "Команда питания отправлена")
+            return
+
+        if self.safe_power_off_pending:
+            messagebox.showinfo(
+                "Безопасное выключение",
+                "Оно уже запрошено. Не нажимайте кнопку повторно: Minecraft может останавливаться до трёх минут.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Безопасное выключение",
+            "Minecraft будет остановлен, данные синхронизированы, затем розетка отключит питание. Продолжить?",
         ):
             return
-        self.command_request("POST", "/v1/power/action", {"state": state}, "Команда питания отправлена")
+
+        self.safe_power_off_pending = True
+        self.status_var.set("Безопасное выключение начато. Minecraft может останавливаться до трёх минут…")
+
+        def success(result: dict[str, Any]) -> None:
+            if result.get("already_pending"):
+                self.status_var.set("Безопасное выключение уже выполняется. Повторная команда не создана.")
+            else:
+                self.status_var.set("Безопасное выключение начато. Не нажимайте кнопку повторно.")
+            self.poll()
+
+        def failure(error: Exception) -> None:
+            self.safe_power_off_pending = False
+            self.handle_error(error, context="Безопасное выключение")
+
+        self.async_call(
+            lambda: self.require_api().request("POST", "/v1/power/action", {"state": "off"}),
+            success,
+            failure,
+            context="Безопасное выключение",
+        )
 
     def force_power_off(self) -> None:
         if not messagebox.askyesno(

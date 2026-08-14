@@ -393,13 +393,19 @@ class Agent:
         return {"output": output[:6000]}
 
     def _minecraft_service_action(self, action: str) -> dict[str, Any]:
-        self._sudo_systemctl(action, self.minecraft_service)
+        # dragonfyre.service is allowed 120 seconds for a clean stop.  The
+        # control agent must wait longer than systemd instead of failing after
+        # its normal 45-second command timeout.
+        timeout_seconds = 150 if action == "stop" else 45
+        self._sudo_systemctl(action, self.minecraft_service, timeout_seconds)
         time.sleep(1)
         return self._minecraft_status()
 
     def _prepare_safe_power_off(self) -> dict[str, Any]:
         save_output = ""
+        self.events.add("server", "[safe off] Начинаю безопасное выключение.")
         if self._minecraft_status()["active"]:
+            self.events.add("server", "[safe off] Сохраняю мир и останавливаю Minecraft.")
             try:
                 save_output = self._minecraft_command("save-all flush")
                 self._minecraft_command("stop")
@@ -411,6 +417,7 @@ class Agent:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if not self._minecraft_status()["active"]:
+                self.events.add("server", "[safe off] Minecraft остановлен, синхронизирую данные.")
                 self._run(["sync"], timeout=15)
                 return {"ready_for_power_off": True, "save_output": save_output[:1000]}
             time.sleep(2)
@@ -428,12 +435,12 @@ class Agent:
             return "Команда отправлена в Minecraft-консоль."
         raise RuntimeError(f"Неизвестный console_mode: {self.console_mode}")
 
-    def _sudo_systemctl(self, action: str, service: str | None = None) -> None:
+    def _sudo_systemctl(self, action: str, service: str | None = None, timeout_seconds: int = 45) -> None:
         if service is None:
             args = ["sudo", "-n", "/usr/bin/systemctl", action]
         else:
             args = ["sudo", "-n", "/usr/bin/systemctl", action, service]
-        result = self._run(args, timeout=45)
+        result = self._run(args, timeout=timeout_seconds)
         if result["returncode"] != 0:
             raise RuntimeError(result["stderr"].strip() or "Команда systemctl не выполнена")
 
