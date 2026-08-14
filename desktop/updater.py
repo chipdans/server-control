@@ -9,7 +9,6 @@ delivery.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -66,22 +65,31 @@ def download_update(asset_url: str) -> Path:
 
 
 def launch_updater(update_zip: Path, current_executable: Path) -> None:
-    """Launch a sibling updater and let it replace this app after exit."""
+    """Launch a sibling updater after this graphical process has exited."""
     updater_name = "ServerControlUpdater.exe" if sys.platform == "win32" else "ServerControlUpdater"
     updater = current_executable.with_name(updater_name)
     if not updater.exists():
         raise RuntimeError("Не найден ServerControlUpdater рядом с программой.")
-    subprocess.Popen(
-        [
-            str(updater),
-            "--wait-pid",
-            str(os.getpid()),
-            "--zip",
-            str(update_zip),
-            "--target",
-            str(current_executable.parent),
-            "--restart",
-            str(current_executable),
-        ],
-        close_fds=True,
-    )
+    command = [
+        str(updater),
+        "--wait-pid",
+        "0",
+        "--zip",
+        str(update_zip),
+        "--target",
+        str(current_executable.parent),
+        "--restart",
+        str(current_executable),
+    ]
+    if sys.platform == "win32":
+        # Closing a Tk window does not always end the packaged process at once.
+        # Start the updater after a short delay instead of making it wait for up
+        # to a minute on a process handle.  The delay gives this app time to exit.
+        delayed_command = "timeout /t 2 /nobreak >NUL && " + subprocess.list2cmdline(command)
+        subprocess.Popen(
+            ["cmd.exe", "/d", "/c", delayed_command],
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return
+    subprocess.Popen(command, close_fds=True)

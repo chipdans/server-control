@@ -16,7 +16,7 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 APP_TITLE = "Server Control"
 ALL_PERMISSIONS = [
     ("power_view", "Видеть питание"),
