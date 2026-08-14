@@ -1,0 +1,19 @@
+[Unit]
+Description=Dragonfyre Minecraft Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/opt/minecraft/dragonfyre
+ExecStart=/bin/bash /opt/minecraft/dragonfyre/start.sh
+ExecStop=/bin/kill -SIGINT $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

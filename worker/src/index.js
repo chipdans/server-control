@@ -1,0 +1,897 @@
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+const PASSWORD_ITERATIONS = 150_000;
+const ACCESS_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const AGENT_COMMAND_BATCH = 20;
+const MAX_CONSOLE_EVENTS_PER_PUSH = 100;
+const MAX_CONSOLE_MESSAGE_LENGTH = 8_000;
+const MAX_SHELL_COMMAND_LENGTH = 512;
+const MAX_MINECRAFT_COMMAND_LENGTH = 256;
+
+const PERMISSIONS = new Set([
+  "power_view",
+  "power_control",
+  "server_view",
+  "server_command",
+  "minecraft_view",
+  "minecraft_command",
+  "user_manage",
+]);
+
+const ROLE_PERMISSIONS = {
+  owner: [
+    "power_view",
+    "power_control",
+    "server_view",
+    "server_command",
+    "minecraft_view",
+    "minecraft_command",
+    "user_manage",
+  ],
+  admin: [
+    "power_view",
+    "power_control",
+    "server_view",
+    "server_command",
+    "minecraft_view",
+    "minecraft_command",
+  ],
+  user: ["minecraft_view", "minecraft_command"],
+};
+
+class ApiError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-methods": "GET, POST, PATCH, OPTIONS",
+          "access-control-allow-headers": "authorization, content-type, x-bootstrap-key, x-agent-key",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
+    try {
+      return await route(request, env);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return json({ error: error.code, message: error.message }, error.status);
+      }
+      console.error("Unhandled request error", error);
+      return json({ error: "internal_error", message: "Внутренняя ошибка сервиса." }, 500);
+    }
+  },
+};
+
+async function route(request, env) {
+  const url = new URL(request.url);
+  const { pathname } = url;
+  const { method } = request;
+
+  if (method === "GET" && pathname === "/health") {
+    return json({ ok: true, service: "server-control-hub", time: Date.now() });
+  }
+
+  if (method === "POST" && pathname === "/v1/setup") {
+    return setupOwner(request, env);
+  }
+
+  if (method === "POST" && pathname === "/v1/login") {
+    return login(request, env);
+  }
+
+  if (pathname.startsWith("/v1/agent/")) {
+    return routeAgent(request, env, pathname);
+  }
+
+  const session = await requireSession(request, env);
+
+  if (method === "GET" && pathname === "/v1/me") {
+    return json({ user: publicUser(session.user) });
+  }
+
+  if (method === "GET" && pathname === "/v1/power/status") {
+    requirePermission(session, "power_view");
+    return json({ power: await getYandexPowerStatus(env) });
+  }
+
+  if (method === "POST" && pathname === "/v1/power/action") {
+    requirePermission(session, "power_control");
+    return powerAction(request, env, session);
+  }
+
+  if (method === "GET" && pathname === "/v1/server/status") {
+    requireAnyPermission(session, ["server_view", "minecraft_view"]);
+    const record = await env.DB.prepare("SELECT status, updated_at FROM agent_status WHERE id = 'primary'").first();
+    if (!record) {
+      return json({ online: false, status: null, updated_at: null });
+    }
+    const updatedAt = Number(record.updated_at);
+    return json({
+      online: Date.now() - updatedAt < 45_000,
+      status: safeJson(record.status, {}),
+      updated_at: updatedAt,
+    });
+  }
+
+  if (method === "GET" && pathname === "/v1/server/logs") {
+    requirePermission(session, "server_view");
+    return getConsoleEvents(env, "server", url.searchParams.get("after"));
+  }
+
+  if (method === "GET" && pathname === "/v1/minecraft/logs") {
+    requirePermission(session, "minecraft_view");
+    return getConsoleEvents(env, "minecraft", url.searchParams.get("after"));
+  }
+
+  if (method === "POST" && pathname === "/v1/server/command") {
+    requirePermission(session, "server_command");
+    return queueShellCommand(request, env, session);
+  }
+
+  if (method === "POST" && pathname === "/v1/server/action") {
+    requirePermission(session, "server_command");
+    return queueServerAction(request, env, session);
+  }
+
+  if (method === "POST" && pathname === "/v1/minecraft/command") {
+    requirePermission(session, "minecraft_command");
+    return queueMinecraftCommand(request, env, session);
+  }
+
+  if (method === "POST" && pathname === "/v1/minecraft/action") {
+    requirePermission(session, "minecraft_command");
+    return queueMinecraftAction(request, env, session);
+  }
+
+  if (method === "GET" && pathname === "/v1/admin/users") {
+    requirePermission(session, "user_manage");
+    return listUsers(env);
+  }
+
+  if (method === "POST" && pathname === "/v1/admin/users") {
+    requirePermission(session, "user_manage");
+    return createUser(request, env, session);
+  }
+
+  const userMatch = pathname.match(/^\/v1\/admin\/users\/([^/]+)$/);
+  if (userMatch && method === "PATCH") {
+    requirePermission(session, "user_manage");
+    return updateUser(request, env, session, decodeURIComponent(userMatch[1]));
+  }
+
+  const passwordMatch = pathname.match(/^\/v1\/admin\/users\/([^/]+)\/password$/);
+  if (passwordMatch && method === "POST") {
+    requirePermission(session, "user_manage");
+    return resetPassword(request, env, session, decodeURIComponent(passwordMatch[1]));
+  }
+
+  throw new ApiError(404, "not_found", "Маршрут не найден.");
+}
+
+async function setupOwner(request, env) {
+  const configuredKey = requiredSecret(env, "BOOTSTRAP_KEY");
+  const submittedKey = request.headers.get("x-bootstrap-key") || "";
+  if (!constantTimeTextEqual(submittedKey, configuredKey)) {
+    throw new ApiError(401, "invalid_bootstrap_key", "Неверный ключ первоначальной настройки.");
+  }
+
+  const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM users").first();
+  if (Number(count.count) !== 0) {
+    throw new ApiError(409, "already_configured", "Владелец уже создан.");
+  }
+
+  const body = await readJson(request);
+  const username = validateUsername(body.username);
+  const password = validatePassword(body.password);
+  const passwordRecord = await createPasswordRecord(password);
+  const now = Date.now();
+  const user = {
+    id: crypto.randomUUID(),
+    username,
+    role: "owner",
+    permissions: ROLE_PERMISSIONS.owner,
+    enabled: 1,
+    token_version: 1,
+    created_at: now,
+    updated_at: now,
+  };
+
+  await env.DB.prepare(
+    `INSERT INTO users (
+      id, username, password_salt, password_hash, password_iterations,
+      role, permissions, enabled, token_version, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      user.id,
+      user.username,
+      passwordRecord.salt,
+      passwordRecord.hash,
+      passwordRecord.iterations,
+      user.role,
+      JSON.stringify(user.permissions),
+      user.enabled,
+      user.token_version,
+      user.created_at,
+      user.updated_at,
+    )
+    .run();
+
+  await addAudit(env, user.id, "owner.bootstrap", { username });
+  const token = await issueAccessToken(env, user);
+  return json({ token, user: publicUser(user) }, 201);
+}
+
+async function login(request, env) {
+  const body = await readJson(request);
+  const username = validateUsername(body.username);
+  const password = typeof body.password === "string" ? body.password : "";
+  const row = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
+  const now = Date.now();
+
+  // Do not reveal whether the username exists, is disabled or has a bad password.
+  const invalid = () => new ApiError(401, "invalid_credentials", "Неверный логин или пароль.");
+  if (!row || !Number(row.enabled)) {
+    throw invalid();
+  }
+  if (row.locked_until && Number(row.locked_until) > now) {
+    throw new ApiError(429, "temporarily_locked", "Слишком много попыток. Повторите позже.");
+  }
+
+  const verified = await verifyPassword(password, row);
+  if (!verified) {
+    const failures = Number(row.failed_logins || 0) + 1;
+    const lockedUntil = failures >= 6 ? now + 10 * 60 * 1000 : null;
+    await env.DB.prepare(
+      "UPDATE users SET failed_logins = ?, locked_until = ?, updated_at = ? WHERE id = ?",
+    )
+      .bind(failures, lockedUntil, now, row.id)
+      .run();
+    throw invalid();
+  }
+
+  await env.DB.prepare(
+    "UPDATE users SET failed_logins = 0, locked_until = NULL, last_login_at = ?, updated_at = ? WHERE id = ?",
+  )
+    .bind(now, now, row.id)
+    .run();
+
+  const user = normalizeDbUser({ ...row, last_login_at: now, updated_at: now });
+  const token = await issueAccessToken(env, user);
+  await addAudit(env, user.id, "user.login", {});
+  return json({ token, user: publicUser(user) });
+}
+
+async function routeAgent(request, env, pathname) {
+  requireAgent(request, env);
+
+  if (request.method === "POST" && pathname === "/v1/agent/heartbeat") {
+    const body = await readJson(request);
+    const status = {
+      server: isObject(body.server) ? body.server : {},
+      minecraft: isObject(body.minecraft) ? body.minecraft : {},
+      agent_version: typeof body.agent_version === "string" ? body.agent_version.slice(0, 64) : "unknown",
+    };
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO agent_status (id, status, updated_at) VALUES ('primary', ?, ?)
+       ON CONFLICT(id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
+    )
+      .bind(JSON.stringify(status), now)
+      .run();
+    return json({ ok: true, server_time: now });
+  }
+
+  if (request.method === "POST" && pathname === "/v1/agent/events") {
+    const body = await readJson(request);
+    const events = Array.isArray(body.events) ? body.events : [];
+    if (events.length > MAX_CONSOLE_EVENTS_PER_PUSH) {
+      throw new ApiError(400, "too_many_events", "Слишком много событий за один запрос.");
+    }
+    const now = Date.now();
+    const statements = [];
+    for (const event of events) {
+      if (!isObject(event) || !["server", "minecraft"].includes(event.kind) || typeof event.message !== "string") {
+        continue;
+      }
+      const message = event.message.trim().slice(0, MAX_CONSOLE_MESSAGE_LENGTH);
+      if (!message) continue;
+      statements.push(
+        env.DB.prepare("INSERT INTO console_events (kind, message, created_at) VALUES (?, ?, ?)").bind(
+          event.kind,
+          message,
+          now,
+        ),
+      );
+    }
+    if (statements.length) await env.DB.batch(statements);
+    return json({ ok: true, accepted: statements.length });
+  }
+
+  if (request.method === "GET" && pathname === "/v1/agent/commands") {
+    return claimAgentCommands(env);
+  }
+
+  const resultMatch = pathname.match(/^\/v1\/agent\/commands\/([^/]+)\/result$/);
+  if (request.method === "POST" && resultMatch) {
+    return completeAgentCommand(request, env, decodeURIComponent(resultMatch[1]));
+  }
+
+  throw new ApiError(404, "not_found", "Маршрут агента не найден.");
+}
+
+async function powerAction(request, env, session) {
+  const body = await readJson(request);
+  const state = body.state;
+  if (!["on", "off"].includes(state)) {
+    throw new ApiError(400, "invalid_state", "Укажите состояние on или off.");
+  }
+
+  if (state === "on") {
+    const power = await setYandexPower(env, true);
+    await addAudit(env, session.user.id, "power.on", {});
+    return json({ ok: true, mode: "direct", power });
+  }
+
+  if (body.force === true) {
+    if (session.user.role !== "owner") {
+      throw new ApiError(403, "owner_required", "Принудительное отключение доступно только владельцу.");
+    }
+    const power = await setYandexPower(env, false);
+    await addAudit(env, session.user.id, "power.off.force", {});
+    return json({ ok: true, mode: "forced", power });
+  }
+
+  const command = await enqueueCommand(env, "safe_power_off", {}, session.user.id);
+  await addAudit(env, session.user.id, "power.off.safe_requested", { command_id: command.id });
+  return json({ ok: true, mode: "safe", command }, 202);
+}
+
+async function queueShellCommand(request, env, session) {
+  const body = await readJson(request);
+  if (typeof body.command !== "string" || !body.command.trim() || body.command.length > MAX_SHELL_COMMAND_LENGTH) {
+    throw new ApiError(400, "invalid_command", `Команда должна быть не длиннее ${MAX_SHELL_COMMAND_LENGTH} символов.`);
+  }
+  const command = await enqueueCommand(env, "shell_command", { command: body.command.trim() }, session.user.id);
+  await addAudit(env, session.user.id, "server.command", { command_id: command.id });
+  return json({ ok: true, command }, 202);
+}
+
+async function queueServerAction(request, env, session) {
+  const body = await readJson(request);
+  const allowed = new Set(["status", "reboot", "shutdown", "backup"]);
+  if (!allowed.has(body.action)) {
+    throw new ApiError(400, "invalid_action", "Недопустимое действие сервера.");
+  }
+  if (["reboot", "shutdown"].includes(body.action) && session.user.role !== "owner") {
+    throw new ApiError(403, "owner_required", "Перезагрузка и выключение доступны только владельцу.");
+  }
+  const command = await enqueueCommand(env, `server_${body.action}`, {}, session.user.id);
+  await addAudit(env, session.user.id, `server.${body.action}`, { command_id: command.id });
+  return json({ ok: true, command }, 202);
+}
+
+async function queueMinecraftCommand(request, env, session) {
+  const body = await readJson(request);
+  if (typeof body.command !== "string" || !body.command.trim() || body.command.length > MAX_MINECRAFT_COMMAND_LENGTH) {
+    throw new ApiError(400, "invalid_command", `Команда Minecraft должна быть не длиннее ${MAX_MINECRAFT_COMMAND_LENGTH} символов.`);
+  }
+  const command = await enqueueCommand(env, "minecraft_command", { command: body.command.trim() }, session.user.id);
+  await addAudit(env, session.user.id, "minecraft.command", { command_id: command.id });
+  return json({ ok: true, command }, 202);
+}
+
+async function queueMinecraftAction(request, env, session) {
+  const body = await readJson(request);
+  const allowed = new Set(["start", "stop", "restart", "status"]);
+  if (!allowed.has(body.action)) {
+    throw new ApiError(400, "invalid_action", "Недопустимое действие Minecraft.");
+  }
+  const command = await enqueueCommand(env, `minecraft_${body.action}`, {}, session.user.id);
+  await addAudit(env, session.user.id, `minecraft.${body.action}`, { command_id: command.id });
+  return json({ ok: true, command }, 202);
+}
+
+async function listUsers(env) {
+  const result = await env.DB.prepare(
+    `SELECT id, username, role, permissions, enabled, token_version, created_at, updated_at, last_login_at
+     FROM users ORDER BY created_at ASC`,
+  ).all();
+  return json({ users: result.results.map((row) => publicUser(normalizeDbUser(row))) });
+}
+
+async function createUser(request, env, session) {
+  const body = await readJson(request);
+  const username = validateUsername(body.username);
+  const password = validatePassword(body.password);
+  const role = body.role === "admin" ? "admin" : "user";
+  const permissions = sanitizePermissions(body.permissions, ROLE_PERMISSIONS[role]);
+  const passwordRecord = await createPasswordRecord(password);
+  const now = Date.now();
+  const user = {
+    id: crypto.randomUUID(),
+    username,
+    role,
+    permissions,
+    enabled: 1,
+    token_version: 1,
+    created_at: now,
+    updated_at: now,
+    last_login_at: null,
+  };
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO users (
+        id, username, password_salt, password_hash, password_iterations,
+        role, permissions, enabled, token_version, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        user.id,
+        username,
+        passwordRecord.salt,
+        passwordRecord.hash,
+        passwordRecord.iterations,
+        role,
+        JSON.stringify(permissions),
+        1,
+        1,
+        now,
+        now,
+      )
+      .run();
+  } catch (error) {
+    if (String(error.message || error).includes("UNIQUE")) {
+      throw new ApiError(409, "username_taken", "Этот логин уже используется.");
+    }
+    throw error;
+  }
+
+  await addAudit(env, session.user.id, "user.create", { user_id: user.id, username, role });
+  return json({ user: publicUser(user) }, 201);
+}
+
+async function updateUser(request, env, session, targetId) {
+  const body = await readJson(request);
+  const targetRow = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(targetId).first();
+  if (!targetRow) throw new ApiError(404, "user_not_found", "Пользователь не найден.");
+  const target = normalizeDbUser(targetRow);
+  if (target.role === "owner") {
+    throw new ApiError(403, "owner_protected", "Аккаунт владельца нельзя изменить этим способом.");
+  }
+
+  const role = body.role === "admin" ? "admin" : body.role === "user" ? "user" : target.role;
+  const permissions = Object.prototype.hasOwnProperty.call(body, "permissions")
+    ? sanitizePermissions(body.permissions, ROLE_PERMISSIONS[role])
+    : target.permissions;
+  const enabled = Object.prototype.hasOwnProperty.call(body, "enabled") ? (body.enabled ? 1 : 0) : target.enabled ? 1 : 0;
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE users
+     SET role = ?, permissions = ?, enabled = ?, token_version = token_version + 1, updated_at = ?
+     WHERE id = ?`,
+  )
+    .bind(role, JSON.stringify(permissions), enabled, now, targetId)
+    .run();
+
+  const updated = { ...target, role, permissions, enabled, token_version: target.token_version + 1, updated_at: now };
+  await addAudit(env, session.user.id, enabled ? "user.update" : "user.disable", {
+    user_id: targetId,
+    username: target.username,
+    role,
+    permissions,
+  });
+  return json({ user: publicUser(updated) });
+}
+
+async function resetPassword(request, env, session, targetId) {
+  const body = await readJson(request);
+  const password = validatePassword(body.password);
+  const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE id = ?").bind(targetId).first();
+  if (!target) throw new ApiError(404, "user_not_found", "Пользователь не найден.");
+  if (target.role === "owner" && target.id !== session.user.id) {
+    throw new ApiError(403, "owner_protected", "Пароль владельца нельзя сбросить этим способом.");
+  }
+  const passwordRecord = await createPasswordRecord(password);
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE users
+     SET password_salt = ?, password_hash = ?, password_iterations = ?, token_version = token_version + 1,
+         failed_logins = 0, locked_until = NULL, updated_at = ?
+     WHERE id = ?`,
+  )
+    .bind(passwordRecord.salt, passwordRecord.hash, passwordRecord.iterations, now, targetId)
+    .run();
+  await addAudit(env, session.user.id, "user.password_reset", { user_id: targetId, username: target.username });
+  return json({ ok: true });
+}
+
+async function getConsoleEvents(env, kind, afterValue) {
+  const after = Math.max(0, Math.min(Number.parseInt(afterValue || "0", 10) || 0, Number.MAX_SAFE_INTEGER));
+  const result = await env.DB.prepare(
+    "SELECT id, kind, message, created_at FROM console_events WHERE kind = ? AND id > ? ORDER BY id ASC LIMIT 100",
+  )
+    .bind(kind, after)
+    .all();
+  const events = result.results || [];
+  return json({ events, next_after: events.length ? events[events.length - 1].id : after });
+}
+
+async function enqueueCommand(env, type, payload, requestedBy) {
+  const command = {
+    id: crypto.randomUUID(),
+    type,
+    payload,
+    requested_by: requestedBy,
+    status: "pending",
+    created_at: Date.now(),
+  };
+  await env.DB.prepare(
+    "INSERT INTO command_queue (id, type, payload, requested_by, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+  )
+    .bind(command.id, command.type, JSON.stringify(command.payload), command.requested_by, command.status, command.created_at)
+    .run();
+  return command;
+}
+
+async function claimAgentCommands(env) {
+  const staleBefore = Date.now() - 60_000;
+  const result = await env.DB.prepare(
+    `SELECT id, type, payload, requested_by, created_at
+     FROM command_queue
+     WHERE status = 'pending' OR (status = 'claimed' AND claimed_at < ?)
+     ORDER BY created_at ASC LIMIT ?`,
+  )
+    .bind(staleBefore, AGENT_COMMAND_BATCH)
+    .all();
+  const commands = result.results || [];
+  const claimedAt = Date.now();
+  if (commands.length) {
+    await env.DB.batch(
+      commands.map((command) =>
+        env.DB.prepare("UPDATE command_queue SET status = 'claimed', claimed_at = ? WHERE id = ?").bind(claimedAt, command.id),
+      ),
+    );
+  }
+  return json({
+    commands: commands.map((command) => ({ ...command, payload: safeJson(command.payload, {}) })),
+    server_time: claimedAt,
+  });
+}
+
+async function completeAgentCommand(request, env, commandId) {
+  const body = await readJson(request);
+  const status = body.status === "completed" ? "completed" : "failed";
+  const resultPayload = isObject(body.result) ? body.result : { message: String(body.result || "") };
+  const command = await env.DB.prepare("SELECT * FROM command_queue WHERE id = ?").bind(commandId).first();
+  if (!command) throw new ApiError(404, "command_not_found", "Команда не найдена.");
+  if (command.status === "completed" || command.status === "failed") {
+    return json({ ok: true, already_finished: true });
+  }
+
+  if (status === "completed" && command.type === "safe_power_off" && resultPayload.ready_for_power_off === true) {
+    try {
+      resultPayload.power = await setYandexPower(env, false);
+    } catch (error) {
+      resultPayload.power_error = "Не удалось отключить умную розетку.";
+      await addAudit(env, command.requested_by, "power.off.safe_failed", { command_id: commandId });
+    }
+  }
+
+  const now = Date.now();
+  await env.DB.prepare(
+    "UPDATE command_queue SET status = ?, result = ?, completed_at = ? WHERE id = ?",
+  )
+    .bind(status, JSON.stringify(resultPayload), now, commandId)
+    .run();
+  await addAudit(env, command.requested_by, `agent.${command.type}.${status}`, { command_id: commandId });
+  return json({ ok: true });
+}
+
+async function getYandexPowerStatus(env) {
+  const response = await yandexRequest(env, `devices/${encodeURIComponent(requiredSecret(env, "YANDEX_DEVICE_ID"))}`, {
+    method: "GET",
+  });
+  const device = response.device || response;
+  const capability = Array.isArray(device.capabilities)
+    ? device.capabilities.find(
+        (item) => item && item.type === "devices.capabilities.on_off" && item.state && item.state.instance === "on",
+      )
+    : null;
+  return {
+    name: device.name || "Питание сервера",
+    device_id: requiredSecret(env, "YANDEX_DEVICE_ID"),
+    on: capability ? Boolean(capability.state.value) : null,
+    online: typeof device.state === "string" ? device.state === "online" : null,
+    updated_at: Date.now(),
+  };
+}
+
+async function setYandexPower(env, on) {
+  const deviceId = requiredSecret(env, "YANDEX_DEVICE_ID");
+  const response = await yandexRequest(env, "devices/actions", {
+    method: "POST",
+    body: JSON.stringify({
+      devices: [
+        {
+          id: deviceId,
+          actions: [
+            {
+              type: "devices.capabilities.on_off",
+              state: { instance: "on", value: on },
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const deviceResult = Array.isArray(response.devices) ? response.devices.find((device) => device && device.id === deviceId) : null;
+  const actionResult = Array.isArray(deviceResult?.capabilities)
+    ? deviceResult.capabilities.find((capability) => capability?.type === "devices.capabilities.on_off")?.state?.action_result
+    : null;
+  if (actionResult && actionResult.status !== "DONE") {
+    throw new ApiError(502, "smart_home_action_failed", "Умная розетка не подтвердила изменение состояния.");
+  }
+  return { on, accepted: true, response };
+}
+
+async function yandexRequest(env, path, init) {
+  const token = requiredSecret(env, "YANDEX_OAUTH_TOKEN");
+  const response = await fetch(`https://api.iot.yandex.net/v1.0/${path}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+  });
+  const raw = await response.text();
+  const payload = raw ? safeJson(raw, {}) : {};
+  if (!response.ok) {
+    console.error("Yandex Smart Home response", response.status, raw.slice(0, 512));
+    throw new ApiError(502, "smart_home_error", "Не удалось связаться с умной розеткой.");
+  }
+  return payload;
+}
+
+async function requireSession(request, env) {
+  const authorization = request.headers.get("authorization") || "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) throw new ApiError(401, "authentication_required", "Требуется вход в приложение.");
+  const claims = await verifyJwt(match[1], requiredSecret(env, "JWT_SECRET"));
+  if (!claims || !claims.sub || !claims.exp || Number(claims.exp) <= Math.floor(Date.now() / 1000)) {
+    throw new ApiError(401, "invalid_session", "Сеанс истёк. Войдите снова.");
+  }
+  const row = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(String(claims.sub)).first();
+  if (!row || !Number(row.enabled) || Number(row.token_version) !== Number(claims.v)) {
+    throw new ApiError(403, "access_revoked", "Доступ к программе отключён владельцем.");
+  }
+  return { user: normalizeDbUser(row), claims };
+}
+
+function requirePermission(session, permission) {
+  if (!session.user.permissions.includes(permission)) {
+    throw new ApiError(403, "permission_denied", "У вас нет прав для этого действия.");
+  }
+}
+
+function requireAnyPermission(session, permissions) {
+  if (!permissions.some((permission) => session.user.permissions.includes(permission))) {
+    throw new ApiError(403, "permission_denied", "У вас нет прав для этого действия.");
+  }
+}
+
+function requireAgent(request, env) {
+  const received = request.headers.get("x-agent-key") || "";
+  if (!constantTimeTextEqual(received, requiredSecret(env, "AGENT_API_KEY"))) {
+    throw new ApiError(401, "invalid_agent", "Агент не авторизован.");
+  }
+}
+
+function requiredSecret(env, name) {
+  if (!env[name] || typeof env[name] !== "string") {
+    throw new ApiError(503, "not_configured", `Сервис не настроен: отсутствует ${name}.`);
+  }
+  return env[name];
+}
+
+function normalizeDbUser(row) {
+  return {
+    ...row,
+    id: String(row.id),
+    username: String(row.username),
+    role: String(row.role),
+    permissions: sanitizePermissions(safeJson(row.permissions, ROLE_PERMISSIONS.user), ROLE_PERMISSIONS.user),
+    enabled: Number(row.enabled) === 1,
+    token_version: Number(row.token_version),
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+    last_login_at: row.last_login_at ? Number(row.last_login_at) : null,
+  };
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    permissions: user.permissions,
+    enabled: Boolean(user.enabled),
+    created_at: user.created_at,
+    updated_at: user.updated_at,
+    last_login_at: user.last_login_at || null,
+  };
+}
+
+function validateUsername(value) {
+  if (typeof value !== "string") throw new ApiError(400, "invalid_username", "Введите логин.");
+  const username = value.trim();
+  if (!/^[\p{L}\p{N}_.-]{3,32}$/u.test(username)) {
+    throw new ApiError(400, "invalid_username", "Логин: от 3 до 32 букв, цифр, _, . или -.");
+  }
+  return username;
+}
+
+function validatePassword(value) {
+  if (typeof value !== "string" || value.length < 12 || value.length > 128) {
+    throw new ApiError(400, "weak_password", "Пароль должен содержать от 12 до 128 символов.");
+  }
+  return value;
+}
+
+function sanitizePermissions(value, fallback) {
+  if (!Array.isArray(value)) return [...fallback];
+  return [...new Set(value.filter((item) => typeof item === "string" && PERMISSIONS.has(item)))];
+}
+
+async function createPasswordRecord(password) {
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const hashBytes = await derivePassword(password, saltBytes, PASSWORD_ITERATIONS);
+  return {
+    salt: bytesToBase64Url(saltBytes),
+    hash: bytesToBase64Url(hashBytes),
+    iterations: PASSWORD_ITERATIONS,
+  };
+}
+
+async function verifyPassword(password, row) {
+  if (typeof password !== "string") return false;
+  const iterations = Math.max(1, Math.min(Number(row.password_iterations), 1_000_000));
+  const calculated = await derivePassword(password, base64UrlToBytes(String(row.password_salt)), iterations);
+  return constantTimeBytesEqual(calculated, base64UrlToBytes(String(row.password_hash)));
+}
+
+async function derivePassword(password, salt, iterations) {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    key,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+async function issueAccessToken(env, user) {
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt(
+    {
+      sub: user.id,
+      usr: user.username,
+      v: Number(user.token_version),
+      iat: now,
+      exp: now + ACCESS_TOKEN_TTL_SECONDS,
+    },
+    requiredSecret(env, "JWT_SECRET"),
+  );
+}
+
+async function signJwt(payload, secret) {
+  const header = bytesToBase64Url(encoder.encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+  const body = bytesToBase64Url(encoder.encode(JSON.stringify(payload)));
+  const value = `${header}.${body}`;
+  const signature = await hmac(value, secret);
+  return `${value}.${bytesToBase64Url(signature)}`;
+}
+
+async function verifyJwt(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [headerPart, payloadPart, signaturePart] = parts;
+  const header = safeJson(decoder.decode(base64UrlToBytes(headerPart)), null);
+  if (!header || header.alg !== "HS256") return null;
+  const expected = await hmac(`${headerPart}.${payloadPart}`, secret);
+  if (!constantTimeBytesEqual(expected, base64UrlToBytes(signaturePart))) return null;
+  return safeJson(decoder.decode(base64UrlToBytes(payloadPart)), null);
+}
+
+async function hmac(value, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value)));
+}
+
+async function addAudit(env, actorId, action, details) {
+  await env.DB.prepare("INSERT INTO audit_log (actor_id, action, details, created_at) VALUES (?, ?, ?, ?)")
+    .bind(actorId || null, action, JSON.stringify(details || {}), Date.now())
+    .run();
+}
+
+async function readJson(request) {
+  const contentLength = Number(request.headers.get("content-length") || "0");
+  if (contentLength > 32_768) {
+    throw new ApiError(413, "payload_too_large", "Слишком большой запрос.");
+  }
+  try {
+    const body = await request.json();
+    if (!isObject(body)) throw new Error("not an object");
+    return body;
+  } catch {
+    throw new ApiError(400, "invalid_json", "Некорректный JSON-запрос.");
+  }
+}
+
+function json(value, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeJson(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToBytes(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]*$/.test(value)) return new Uint8Array();
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (value.length % 4)) % 4);
+  try {
+    const binary = atob(normalized);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  } catch {
+    return new Uint8Array();
+  }
+}
+
+function constantTimeBytesEqual(left, right) {
+  let difference = left.length ^ right.length;
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    difference |= (left[index] || 0) ^ (right[index] || 0);
+  }
+  return difference === 0;
+}
+
+function constantTimeTextEqual(left, right) {
+  return constantTimeBytesEqual(encoder.encode(left), encoder.encode(right));
+}

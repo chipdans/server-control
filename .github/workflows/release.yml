@@ -1,0 +1,68 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install builder
+        run: python -m pip install --upgrade pip; python -m pip install -r desktop/requirements-build.txt
+
+      - name: Build Windows client
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name ServerControl desktop/main.py
+
+      - name: Build updater
+        run: >-
+          pyinstaller --noconfirm --clean --onefile
+          --name ServerControlUpdater desktop/apply_update.py
+
+      - name: Package setup and update archives
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          New-Item -ItemType Directory -Force update | Out-Null
+          Copy-Item dist/ServerControl.exe package/ServerControl.exe
+          Copy-Item dist/ServerControlUpdater.exe package/ServerControlUpdater.exe
+          Copy-Item desktop/server-control.json.example package/server-control.json
+          Copy-Item dist/ServerControl.exe update/ServerControl.exe
+          Compress-Archive -Path package/* -DestinationPath ServerControl-Setup.zip -Force
+          Compress-Archive -Path update/* -DestinationPath ServerControl-Update.zip -Force
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_REPOSITORY_TOKEN || github.token }}
+        run: |
+          $tag = "${{ inputs.tag }}"
+          if ($tag -eq "") { $tag = "${{ github.ref_name }}" }
+          if (-not $tag.StartsWith("v")) { throw "Release tag must start with v" }
+          $releaseRepository = "${{ vars.RELEASE_REPOSITORY }}"
+          if ($releaseRepository -eq "") { $releaseRepository = "${{ github.repository }}" }
+          gh release view $tag --repo $releaseRepository 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag ServerControl-Setup.zip ServerControl-Update.zip --repo $releaseRepository --clobber
+          } else {
+            gh release create $tag ServerControl-Setup.zip ServerControl-Update.zip --repo $releaseRepository --title $tag --generate-notes
+          }

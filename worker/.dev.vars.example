@@ -1,0 +1,10 @@
+# Generate long random values. Never commit the real .dev.vars file.
+JWT_SECRET=replace-with-at-least-32-random-bytes
+BOOTSTRAP_KEY=replace-with-a-one-time-bootstrap-key
+AGENT_API_KEY=replace-with-a-long-random-agent-key
+
+# Yandex Smart Home credentials. The device ID must be the socket which powers
+# ChipdanServer.
+YANDEX_OAUTH_TOKEN=replace-with-yandex-oauth-token
+YANDEX_DEVICE_ID=replace-with-yandex-device-id
+

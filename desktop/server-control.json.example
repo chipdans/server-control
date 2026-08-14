@@ -1,0 +1,9 @@
+{
+  "api_base_url": "https://server-control-hub.YOUR-SUBDOMAIN.workers.dev",
+  "update": {
+    "enabled": true,
+    "install_automatically": true,
+    "repository": "YOUR-GITHUB-ACCOUNT/server-control-releases",
+    "asset_name": "ServerControl-Update.zip"
+  }
+}

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.spec
+
+# Node / Cloudflare
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Local app configuration and secrets
+config.json
+agent-config.json
+*.key
+*.pem
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+

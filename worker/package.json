@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test ../tests/worker_auth.test.mjs",
+    "check": "node --check src/index.js"
+  }
+}
