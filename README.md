@@ -54,3 +54,6 @@ installation.
   writes first. A forced cut is available only to the owner.
 
 Read [the setup guide](docs/SETUP.md) before deployment.
+
+For the Minecraft console, command hints and the startup-progress stages, see
+[the live-console guide](docs/MINECRAFT_CONSOLE.md).

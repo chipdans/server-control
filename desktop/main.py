@@ -17,10 +17,11 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.2.0"
 APP_TITLE = "Server Control"
 STATUS_POLL_INTERVAL_MS = 1_000
-LOG_POLL_INTERVAL_SECONDS = 5
+SERVER_LOG_POLL_INTERVAL_SECONDS = 5
+MINECRAFT_LOG_POLL_INTERVAL_SECONDS = 1
 ALL_PERMISSIONS = [
     ("power_view", "Видеть питание"),
     ("power_control", "Управлять питанием"),
@@ -84,6 +85,252 @@ def enable_clipboard_paste(entry: ttk.Entry) -> ttk.Entry:
     return entry
 
 
+# Minecraft's RCON protocol does not expose the game client's Brigadier tab
+# completion API.  These high-value fallbacks make the remote console feel
+# close to the in-game chat: command names, online players, selectors and the
+# most useful vanilla arguments.  The agent additionally learns root commands
+# from ``help`` so commands supplied by the current modpack also appear.
+DEFAULT_MINECRAFT_COMMANDS = (
+    "advancement", "attribute", "ban", "ban-ip", "banlist", "bossbar", "clear", "clone", "damage", "data",
+    "datapack", "debug", "defaultgamemode", "difficulty", "effect", "enchant", "execute", "experience", "fill",
+    "fillbiome", "forceload", "function", "gamemode", "gamerule", "give", "help", "item", "jfr", "kick", "kill",
+    "list", "locate", "loot", "me", "msg", "op", "pardon", "pardon-ip", "particle", "place", "playsound",
+    "publish", "random", "recipe", "reload", "ride", "save-all", "save-off", "save-on", "say", "schedule",
+    "scoreboard", "seed", "setblock", "setidletimeout", "setworldspawn", "spawnpoint", "spectate", "spreadplayers",
+    "stop", "stopsound", "summon", "tag", "team", "teammsg", "teleport", "tell", "tellraw", "time", "title", "tm",
+    "tp", "trigger", "weather", "whitelist", "worldborder", "xp",
+)
+MINECRAFT_SELECTORS = ("@a", "@e", "@p", "@r", "@s")
+MINECRAFT_GAMERULES = (
+    "announceAdvancements", "commandBlockOutput", "disableElytraMovementCheck", "disableRaids", "doDaylightCycle",
+    "doEntityDrops", "doFireTick", "doImmediateRespawn", "doInsomnia", "doLimitedCrafting", "doMobLoot", "doMobSpawning",
+    "doPatrolSpawning", "doTileDrops", "doTraderSpawning", "doWeatherCycle", "drowningDamage", "fallDamage", "fireDamage",
+    "forgiveDeadPlayers", "freezeDamage", "keepInventory", "lavaSourceConversion", "logAdminCommands", "maxCommandChainLength",
+    "maxEntityCramming", "mobExplosionDropDecay", "mobGriefing", "naturalRegeneration", "playersSleepingPercentage",
+    "projectilesCanBreakBlocks", "randomTickSpeed", "reducedDebugInfo", "sendCommandFeedback", "showDeathMessages",
+    "snowAccumulationHeight", "spawnRadius", "spectatorsGenerateChunks", "tntExplosionDropDecay", "universalAnger",
+    "waterSourceConversion",
+)
+
+
+def _unique_sorted(values: list[str] | tuple[str, ...]) -> list[str]:
+    return sorted({str(value).strip() for value in values if str(value).strip()}, key=str.casefold)
+
+
+def minecraft_completion_candidates(value: str, command_names: list[str], players: list[str]) -> list[str]:
+    """Return context-aware suggestions for the remote Minecraft command field."""
+
+    text = value.lstrip()
+    has_slash = text.startswith("/")
+    raw = text[1:] if has_slash else text
+    ends_with_space = raw.endswith(" ")
+    tokens = raw.split()
+
+    # Completing the root command.
+    if not tokens or (len(tokens) == 1 and not ends_with_space):
+        partial = tokens[0] if tokens else ""
+        roots = _unique_sorted([*DEFAULT_MINECRAFT_COMMANDS, *command_names])
+        prefix = "/" if has_slash else ""
+        return [f"{prefix}{name}" for name in roots if name.casefold().startswith(partial.casefold())][:12]
+
+    command = tokens[0].casefold()
+    arguments = tokens[1:]
+    index = len(arguments) if ends_with_space else len(arguments) - 1
+    partial = "" if ends_with_space else arguments[-1]
+    targets = _unique_sorted([*players, *MINECRAFT_SELECTORS])
+
+    options: list[str] = []
+    if command in {"ban", "clear", "deop", "effect", "enchant", "experience", "give", "kick", "kill", "msg", "op", "pardon", "recipe", "spawnpoint", "spectate", "tag", "teammsg", "teleport", "tell", "tp", "xp"}:
+        options = targets
+    if command in {"gamemode", "defaultgamemode"}:
+        options = ["survival", "creative", "adventure", "spectator"] if index == 0 else targets
+    elif command == "difficulty":
+        options = ["peaceful", "easy", "normal", "hard"]
+    elif command == "weather":
+        options = ["clear", "rain", "thunder"]
+    elif command == "time":
+        options = ["set", "add", "query"] if index == 0 else ["day", "night", "noon", "midnight"]
+    elif command in {"tell", "msg", "w", "teammsg"}:
+        options = targets if index == 0 else []
+    elif command == "whitelist":
+        options = ["on", "off", "list", "add", "remove", "reload"] if index == 0 else targets
+    elif command == "gamerule":
+        options = list(MINECRAFT_GAMERULES) if index == 0 else ["true", "false"]
+    elif command == "execute":
+        options = ["as", "at", "positioned", "rotated", "facing", "align", "anchored", "in", "if", "unless", "store", "run"]
+    elif command == "scoreboard":
+        options = ["objectives", "players"] if index == 0 else ["add", "remove", "setdisplay", "list"]
+    elif command == "team":
+        options = ["add", "empty", "join", "leave", "list", "modify", "remove"] if index == 0 else []
+    elif command == "datapack":
+        options = ["enable", "disable", "list"]
+    elif command == "save-all":
+        options = ["flush"]
+
+    return [option for option in _unique_sorted(options) if option.casefold().startswith(partial.casefold())][:12]
+
+
+def replace_minecraft_completion(value: str, completion: str) -> str:
+    """Replace only the word under the caret; command field has no mid-text edits."""
+
+    if not value or value.endswith(" "):
+        return f"{value}{completion}"
+    before, separator, _current = value.rpartition(" ")
+    return f"{before}{separator}{completion}" if separator else completion
+
+
+class MinecraftCommandInput(ttk.Frame):
+    """Entry with Minecraft-like Tab completion, list navigation and history."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        candidates: Callable[[str], list[str]],
+        submit: Callable[[str], None],
+    ) -> None:
+        super().__init__(parent)
+        self._candidates = candidates
+        self._submit = submit
+        self._matches: list[str] = []
+        self._history: list[str] = []
+        self._history_index: int | None = None
+        self._suggestions_visible = False
+
+        row = ttk.Frame(self)
+        row.pack(fill="x")
+        ttk.Label(row, text=">").pack(side="left", padx=(0, 6))
+        self.entry = enable_clipboard_paste(ttk.Entry(row))
+        self.entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Отправить", command=self.submit).pack(side="left", padx=(8, 0))
+
+        self.listbox = tk.Listbox(
+            self,
+            height=6,
+            exportselection=False,
+            activestyle="none",
+            background="#1a2229",
+            foreground="#e6eef5",
+            selectbackground="#315a7d",
+            selectforeground="#ffffff",
+            relief="solid",
+            borderwidth=1,
+        )
+        self.listbox.bind("<ButtonRelease-1>", self._choose_with_mouse)
+        self.entry.bind("<KeyRelease>", self._on_key_release, add="+")
+        self.entry.bind("<Tab>", self._on_tab)
+        self.entry.bind("<Return>", self._on_return)
+        self.entry.bind("<Up>", self._on_up)
+        self.entry.bind("<Down>", self._on_down)
+        self.entry.bind("<Escape>", lambda _event: self._hide_suggestions() or "break")
+
+    def focus_set(self) -> None:
+        self.entry.focus_set()
+
+    def submit(self) -> None:
+        value = self.entry.get().strip()
+        if not value:
+            return
+        if not self._history or self._history[-1] != value:
+            self._history.append(value)
+            self._history = self._history[-100:]
+        self._history_index = None
+        self.entry.delete(0, "end")
+        self._hide_suggestions()
+        self._submit(value)
+        self.entry.focus_set()
+
+    def _on_key_release(self, event: tk.Event) -> None:
+        if event.keysym in {"Tab", "Return", "Up", "Down", "Escape", "Shift_L", "Shift_R", "Control_L", "Control_R"}:
+            return
+        self._history_index = None
+        self._refresh_suggestions()
+
+    def _on_tab(self, _event: tk.Event) -> str:
+        if not self._suggestions_visible:
+            self._refresh_suggestions()
+        if self._matches:
+            selection = self.listbox.curselection()
+            index = int(selection[0]) if selection else 0
+            self._apply_completion(index)
+        return "break"
+
+    def _on_return(self, _event: tk.Event) -> str:
+        self.submit()
+        return "break"
+
+    def _on_up(self, _event: tk.Event) -> str:
+        if self._suggestions_visible:
+            self._move_selection(-1)
+        else:
+            self._move_history(-1)
+        return "break"
+
+    def _on_down(self, _event: tk.Event) -> str:
+        if self._suggestions_visible:
+            self._move_selection(1)
+        else:
+            self._move_history(1)
+        return "break"
+
+    def _refresh_suggestions(self) -> None:
+        self._matches = self._candidates(self.entry.get())
+        if not self._matches:
+            self._hide_suggestions()
+            return
+        self.listbox.delete(0, "end")
+        for value in self._matches:
+            self.listbox.insert("end", value)
+        self.listbox.selection_set(0)
+        self.listbox.activate(0)
+        if not self._suggestions_visible:
+            self.listbox.pack(fill="x", pady=(4, 0))
+            self._suggestions_visible = True
+
+    def _hide_suggestions(self) -> None:
+        if self._suggestions_visible:
+            self.listbox.pack_forget()
+        self._suggestions_visible = False
+        self._matches = []
+
+    def _move_selection(self, offset: int) -> None:
+        if not self._matches:
+            return
+        selection = self.listbox.curselection()
+        current = int(selection[0]) if selection else 0
+        next_index = (current + offset) % len(self._matches)
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(next_index)
+        self.listbox.activate(next_index)
+        self.listbox.see(next_index)
+
+    def _move_history(self, offset: int) -> None:
+        if not self._history:
+            return
+        if self._history_index is None:
+            self._history_index = len(self._history)
+        self._history_index = max(0, min(len(self._history), self._history_index + offset))
+        value = "" if self._history_index == len(self._history) else self._history[self._history_index]
+        self.entry.delete(0, "end")
+        self.entry.insert(0, value)
+        self.entry.icursor("end")
+
+    def _choose_with_mouse(self, _event: tk.Event) -> None:
+        selection = self.listbox.curselection()
+        if selection:
+            self._apply_completion(int(selection[0]))
+        self.entry.focus_set()
+
+    def _apply_completion(self, index: int) -> None:
+        if not (0 <= index < len(self._matches)):
+            return
+        current = self.entry.get()
+        self.entry.delete(0, "end")
+        self.entry.insert(0, replace_minecraft_completion(current, self._matches[index]))
+        self.entry.icursor("end")
+        self._refresh_suggestions()
+
+
 class ServerControlApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -103,12 +350,16 @@ class ServerControlApp:
         self.safe_power_off_pending = False
         self.power_polling = False
         self.status_polling = False
-        self.logs_polling = False
+        self.server_logs_polling = False
+        self.minecraft_logs_polling = False
         self.poll_after_id: str | None = None
-        self.next_log_poll_at = 0.0
+        self.next_server_log_poll_at = 0.0
+        self.next_minecraft_log_poll_at = 0.0
         self.update_in_progress = False
         self.closed = False
         self.user_cache: dict[str, dict[str, Any]] = {}
+        self.minecraft_command_names: list[str] = []
+        self.minecraft_players: list[str] = []
 
         self.status_var = tk.StringVar(value="Подготовка…")
         self.power_var = tk.StringVar(value="Питание сервера: неизвестно")
@@ -245,8 +496,12 @@ class ServerControlApp:
         self.minecraft_logs_initialized = False
         self.power_polling = False
         self.status_polling = False
-        self.logs_polling = False
-        self.next_log_poll_at = 0.0
+        self.server_logs_polling = False
+        self.minecraft_logs_polling = False
+        self.next_server_log_poll_at = 0.0
+        self.next_minecraft_log_poll_at = 0.0
+        self.minecraft_command_names = []
+        self.minecraft_players = []
         self.clear()
 
         header = ttk.Frame(self.root, padding=(18, 14, 18, 8))
@@ -332,19 +587,47 @@ class ServerControlApp:
             ttk.Label(tab, text="У вас нет доступа к Minecraft-консоли.", style="Subtle.TLabel").pack(anchor="w")
             return
 
+        startup = ttk.LabelFrame(tab, text="Запуск Minecraft", style="Card.TLabelframe")
+        startup.pack(fill="x", pady=(0, 8))
+        startup_header = ttk.Frame(startup)
+        startup_header.pack(fill="x")
+        self.minecraft_startup_label_var = tk.StringVar(value="Ожидаю состояние Minecraft…")
+        self.minecraft_startup_detail_var = tk.StringVar(value="Прогресс появится при следующем запуске сервера.")
+        self.minecraft_startup_progress_var = tk.IntVar(value=0)
+        ttk.Label(startup_header, textvariable=self.minecraft_startup_label_var, font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Label(startup_header, textvariable=self.minecraft_startup_detail_var, style="Subtle.TLabel").pack(side="right")
+        self.minecraft_startup_progress = ttk.Progressbar(
+            startup,
+            maximum=100,
+            mode="determinate",
+            variable=self.minecraft_startup_progress_var,
+        )
+        self.minecraft_startup_progress.pack(fill="x", pady=(8, 0))
+
         controls = ttk.Frame(tab)
         controls.pack(fill="x", pady=(0, 8))
         if self.has_permission("minecraft_command"):
             for label, action in (("Запустить", "start"), ("Остановить", "stop"), ("Перезапустить", "restart"), ("Статус", "status")):
                 ttk.Button(controls, text=label, command=lambda action=action: self.minecraft_action(action)).pack(side="left", padx=(0, 6))
+        ttk.Label(
+            controls,
+            text="Живая консоль · обновление раз в секунду",
+            style="Subtle.TLabel",
+        ).pack(side="right")
         self.minecraft_console = self.console_widget(tab)
         if self.has_permission("minecraft_command"):
-            entry_row = ttk.Frame(tab)
-            entry_row.pack(fill="x", pady=(8, 0))
-            self.minecraft_command_entry = enable_clipboard_paste(ttk.Entry(entry_row))
-            self.minecraft_command_entry.pack(side="left", fill="x", expand=True)
-            self.minecraft_command_entry.bind("<Return>", lambda _event: self.send_minecraft_command())
-            ttk.Button(entry_row, text="Отправить", command=self.send_minecraft_command).pack(side="left", padx=(8, 0))
+            self.minecraft_command_input = MinecraftCommandInput(
+                tab,
+                candidates=self.minecraft_command_suggestions,
+                submit=self.send_minecraft_command,
+            )
+            self.minecraft_command_input.pack(fill="x", pady=(8, 0))
+            ttk.Label(
+                tab,
+                text="Tab — подсказки; ↑/↓ — выбрать подсказку или историю; Enter — отправить. Слэш в начале команды можно писать или не писать.",
+                style="Subtle.TLabel",
+                wraplength=950,
+            ).pack(anchor="w", pady=(6, 0))
 
     def build_users_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=12)
@@ -376,6 +659,9 @@ class ServerControlApp:
         container = ttk.Frame(parent)
         container.pack(fill="both", expand=True)
         console = tk.Text(container, wrap="word", background="#101418", foreground="#d7e3ed", insertbackground="#ffffff")
+        console.tag_configure("warning", foreground="#f2c14e")
+        console.tag_configure("error", foreground="#ff7777")
+        console.tag_configure("command", foreground="#8bd5a2")
         scrollbar = ttk.Scrollbar(container, orient="vertical", command=console.yview)
         console.configure(yscrollcommand=scrollbar.set, state="disabled")
         console.pack(side="left", fill="both", expand=True)
@@ -390,9 +676,12 @@ class ServerControlApp:
         self._poll_power()
         self._poll_server_status()
         now = time.monotonic()
-        if now >= self.next_log_poll_at:
-            self.next_log_poll_at = now + LOG_POLL_INTERVAL_SECONDS
-            self._poll_logs()
+        if now >= self.next_server_log_poll_at:
+            self.next_server_log_poll_at = now + SERVER_LOG_POLL_INTERVAL_SECONDS
+            self._poll_server_logs()
+        if now >= self.next_minecraft_log_poll_at:
+            self.next_minecraft_log_poll_at = now + MINECRAFT_LOG_POLL_INTERVAL_SECONDS
+            self._poll_minecraft_logs()
         self._schedule_next_poll()
 
     def _schedule_next_poll(self) -> None:
@@ -446,39 +735,53 @@ class ServerControlApp:
             quiet=True,
         )
 
-    def _poll_logs(self) -> None:
-        if self.logs_polling:
+    def _poll_server_logs(self) -> None:
+        if not self.has_permission("server_view") or self.server_logs_polling:
             return
-        needs_server_logs = self.has_permission("server_view")
-        needs_minecraft_logs = self.has_permission("minecraft_view")
-        if not needs_server_logs and not needs_minecraft_logs:
-            return
-        self.logs_polling = True
+        self.server_logs_polling = True
+        latest = "&latest=1" if not self.server_logs_initialized else ""
 
-        def work() -> dict[str, Any]:
-            api = self.require_api()
-            results: dict[str, Any] = {}
-            if needs_server_logs:
-                latest = "&latest=1" if not self.server_logs_initialized else ""
-                results["server_logs"] = api.request(
-                    "GET", f"/v1/server/logs?after={self.server_log_after}{latest}", timeout_seconds=10
-                )
-            if needs_minecraft_logs:
-                latest = "&latest=1" if not self.minecraft_logs_initialized else ""
-                results["minecraft_logs"] = api.request(
-                    "GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}{latest}", timeout_seconds=10
-                )
-            return results
-
-        def success(results: dict[str, Any]) -> None:
-            self.logs_polling = False
-            self.apply_poll_results(results)
+        def success(result: dict[str, Any]) -> None:
+            self.server_logs_polling = False
+            self.apply_poll_results({"server_logs": result})
 
         def failure(error: Exception) -> None:
-            self.logs_polling = False
-            self.handle_poll_error(error, "Консоль")
+            self.server_logs_polling = False
+            self.handle_poll_error(error, "Linux-консоль")
 
-        self.async_call(work, success, failure, context="Обновление консоли", quiet=True)
+        self.async_call(
+            lambda: self.require_api().request(
+                "GET", f"/v1/server/logs?after={self.server_log_after}{latest}", timeout_seconds=7
+            ),
+            success,
+            failure,
+            context="Обновление Linux-консоли",
+            quiet=True,
+        )
+
+    def _poll_minecraft_logs(self) -> None:
+        if not self.has_permission("minecraft_view") or self.minecraft_logs_polling:
+            return
+        self.minecraft_logs_polling = True
+        latest = "&latest=1" if not self.minecraft_logs_initialized else ""
+
+        def success(result: dict[str, Any]) -> None:
+            self.minecraft_logs_polling = False
+            self.apply_poll_results({"minecraft_logs": result})
+
+        def failure(error: Exception) -> None:
+            self.minecraft_logs_polling = False
+            self.handle_poll_error(error, "Minecraft-консоль")
+
+        self.async_call(
+            lambda: self.require_api().request(
+                "GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}{latest}", timeout_seconds=7
+            ),
+            success,
+            failure,
+            context="Обновление Minecraft-консоли",
+            quiet=True,
+        )
 
     def handle_poll_error(self, error: Exception, source: str) -> None:
         if isinstance(error, ApiError) and error.code in {"access_revoked", "invalid_session", "authentication_required"}:
@@ -506,8 +809,7 @@ class ServerControlApp:
             self.server_state_var.set(
                 f"Домашний сервер: {'онлайн' if online else 'нет связи'} · {server.get('hostname', '—')}{freshness}"
             )
-            mc_state = "запущен" if minecraft.get("active") else "остановлен"
-            self.minecraft_state_var.set(f"Minecraft: {mc_state}" if online else "Minecraft: нет связи с агентом")
+            self.apply_minecraft_status(online, minecraft)
         if "server_logs" in results:
             logs = results["server_logs"]
             self.server_log_after = int(logs.get("next_after", self.server_log_after))
@@ -521,18 +823,75 @@ class ServerControlApp:
             if hasattr(self, "minecraft_console"):
                 self.append_events(self.minecraft_console, logs.get("events", []))
 
+    def apply_minecraft_status(self, online: bool, minecraft: dict[str, Any]) -> None:
+        startup = minecraft.get("startup") if isinstance(minecraft.get("startup"), dict) else {}
+        command_names = minecraft.get("command_names")
+        players = minecraft.get("players") if isinstance(minecraft.get("players"), dict) else {}
+        if isinstance(command_names, list):
+            self.minecraft_command_names = [str(name) for name in command_names if isinstance(name, str)]
+        names = players.get("names") if isinstance(players.get("names"), list) else []
+        self.minecraft_players = [str(name) for name in names if isinstance(name, str)]
+
+        if not online:
+            self.minecraft_state_var.set("Minecraft: нет связи с агентом")
+            if hasattr(self, "minecraft_startup_label_var"):
+                self.minecraft_startup_label_var.set("Нет связи с домашним сервером")
+                self.minecraft_startup_detail_var.set("Ожидаю новый статус от агента")
+            return
+
+        active = bool(minecraft.get("active"))
+        phase = str(startup.get("phase", ""))
+        ready = bool(startup.get("ready"))
+        try:
+            progress = max(0, min(100, int(startup.get("progress", 100 if active else 0))))
+        except (TypeError, ValueError):
+            progress = 100 if active else 0
+        label = str(startup.get("label", "Сервер готов" if active else "Сервер остановлен"))
+        detail = str(startup.get("detail", ""))
+
+        if phase == "failed":
+            self.minecraft_state_var.set("Minecraft: ошибка запуска")
+        elif active and ready:
+            self.minecraft_state_var.set("Minecraft: запущен")
+        elif active:
+            self.minecraft_state_var.set(f"Minecraft: запускается · {progress}%")
+        else:
+            self.minecraft_state_var.set("Minecraft: остановлен")
+
+        if hasattr(self, "minecraft_startup_label_var"):
+            self.minecraft_startup_progress_var.set(progress)
+            self.minecraft_startup_label_var.set(f"{label} · {progress}%")
+            self.minecraft_startup_detail_var.set(detail or "Ожидаю следующую строку запуска")
+
+    def minecraft_command_suggestions(self, value: str) -> list[str]:
+        return minecraft_completion_candidates(value, self.minecraft_command_names, self.minecraft_players)
+
     @staticmethod
     def append_events(console: tk.Text, events: Any) -> None:
         if not isinstance(events, list) or not events:
             return
+        try:
+            was_at_bottom = float(console.yview()[1]) >= 0.995
+        except tk.TclError:
+            was_at_bottom = True
         console.configure(state="normal")
         for event in events:
             if isinstance(event, dict):
-                console.insert("end", f"{event.get('message', '')}\n")
+                message = str(event.get("message", ""))
+                lower = message.casefold()
+                tag = ""
+                if any(marker in lower for marker in ("[error]", "exception", "failed", "ошибка")):
+                    tag = "error"
+                elif any(marker in lower for marker in ("[warn]", "warning", "предупреж")):
+                    tag = "warning"
+                elif message.startswith((">", "▶", "[RCON]")):
+                    tag = "command"
+                console.insert("end", f"{message}\n", tag)
         line_count = int(console.index("end-1c").split(".")[0])
         if line_count > 1_500:
             console.delete("1.0", f"{line_count - 1_000}.0")
-        console.see("end")
+        if was_at_bottom:
+            console.see("end")
         console.configure(state="disabled")
 
     def power_action(self, state: str) -> None:
@@ -596,6 +955,10 @@ class ServerControlApp:
             "Подтвердите действие", f"{action.capitalize()} Minecraft-сервер?", icon="warning"
         ):
             return
+        if action in {"start", "restart"} and hasattr(self, "minecraft_startup_label_var"):
+            self.minecraft_startup_progress_var.set(1)
+            self.minecraft_startup_label_var.set("Запуск запрошен · 1%")
+            self.minecraft_startup_detail_var.set("Ожидаю первые строки Forge")
         self.command_request("POST", "/v1/minecraft/action", {"action": action}, "Команда Minecraft поставлена в очередь")
 
     def send_server_command(self) -> None:
@@ -605,12 +968,26 @@ class ServerControlApp:
         self.server_command_entry.delete(0, "end")
         self.command_request("POST", "/v1/server/command", {"command": command}, "Linux-команда поставлена в очередь")
 
-    def send_minecraft_command(self) -> None:
-        command = self.minecraft_command_entry.get().strip()
+    def send_minecraft_command(self, command: str | None = None) -> None:
+        command = (command or "").strip()
         if not command:
             return
-        self.minecraft_command_entry.delete(0, "end")
-        self.command_request("POST", "/v1/minecraft/command", {"command": command}, "Команда Minecraft поставлена в очередь")
+        normalized = command.lstrip("/").strip()
+        if not normalized:
+            return
+        if hasattr(self, "minecraft_console"):
+            self.append_events(self.minecraft_console, [{"message": f"▶ /{normalized}"}])
+        self.status_var.set("Команда отправлена в быструю очередь Minecraft…")
+
+        def success(_result: dict[str, Any]) -> None:
+            self.status_var.set("Команда принята. Ответ появится в живой консоли.")
+            self._poll_minecraft_logs()
+
+        self.async_call(
+            lambda: self.require_api().request("POST", "/v1/minecraft/command", {"command": normalized}, timeout_seconds=7),
+            success,
+            context="Команда Minecraft",
+        )
 
     def command_request(self, method: str, path: str, payload: dict[str, Any], success_message: str) -> None:
         self.status_var.set("Отправка команды…")

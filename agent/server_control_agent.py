@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import struct
@@ -26,8 +27,10 @@ from pathlib import Path
 from typing import Any
 
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 MAX_EVENT_MESSAGE = 8000
+RCON_STATUS_INTERVAL_SECONDS = 2.0
+COMMAND_LIST_REFRESH_SECONDS = 15 * 60
 
 
 class HubError(RuntimeError):
@@ -38,7 +41,7 @@ class HubError(RuntimeError):
 class Config:
     hub_url: str
     agent_api_key: str
-    poll_seconds: int
+    poll_seconds: float
     heartbeat_seconds: int
     request_timeout_seconds: int
     minecraft: dict[str, Any]
@@ -54,10 +57,10 @@ class Config:
         return cls(
             hub_url=str(raw["hub_url"]).rstrip("/"),
             agent_api_key=str(raw["agent_api_key"]),
-            # The desktop refreshes its cards every second.  Two-second agent
-            # heartbeats keep those cards live without exhausting a free D1
-            # write quota with one write per second.
-            poll_seconds=max(1, min(2, int(raw.get("poll_seconds", 2)))),
+            # Commands are fetched every second.  This is the shortest useful
+            # delay without a permanently connected paid relay, while the
+            # heartbeat itself remains less frequent.
+            poll_seconds=max(0.5, min(1.0, float(raw.get("poll_seconds", 1)))),
             heartbeat_seconds=max(1, min(2, int(raw.get("heartbeat_seconds", 2)))),
             request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
             minecraft=dict(raw["minecraft"]),
@@ -179,6 +182,142 @@ class LogTail:
         return [line.rstrip() for line in data.splitlines() if line.strip()]
 
 
+class MinecraftStartupTracker:
+    """Turns the noisy Forge/Minecraft startup log into a small useful state.
+
+    Forge and modpacks do not expose a universal numeric startup percentage.
+    The stages below are deliberately conservative: a percentage only advances
+    when a real log marker is observed, and RCON confirms the final ``ready``
+    state.  This works for Dragonfyre and remains understandable for a future
+    Forge 1.20.1 pack.
+    """
+
+    _SPAWN_PERCENT = re.compile(r"preparing (?:spawn area|start region).*?(\d{1,3})%", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        self._service_active = False
+        self.phase = "stopped"
+        self.progress = 0
+        self.label = "Сервер остановлен"
+        self.detail = "Minecraft-служба не запущена"
+        self.ready = False
+        self.started_at: int | None = None
+        self.last_log_at: int | None = None
+
+    def set_service_active(self, active: bool) -> None:
+        if active and not self._service_active:
+            self.phase = "starting_java"
+            self.progress = 3
+            self.label = "Запускаю Java и Forge"
+            self.detail = "Ожидаю первые строки запуска"
+            self.ready = False
+            self.started_at = int(time.time() * 1000)
+        elif not active:
+            self.phase = "stopped"
+            self.progress = 0
+            self.label = "Сервер остановлен"
+            self.detail = "Minecraft-служба не запущена"
+            self.ready = False
+            self.started_at = None
+        self._service_active = active
+
+    def observe(self, line: str) -> None:
+        self.last_log_at = int(time.time() * 1000)
+        text = line.lower()
+
+        if "done (" in text and "for help, type \"help\"" in text:
+            self.mark_ready("Minecraft полностью запущен")
+            return
+        if "for help, type \"help\"" in text:
+            self.mark_ready("Minecraft полностью запущен")
+            return
+        if any(marker in text for marker in ("crash report", "exception in server tick loop", "fatal", "could not load", "failed to start")):
+            self._set("failed", self.progress, "Ошибка запуска", line[-240:], force=True)
+            self.ready = False
+            return
+        if any(marker in text for marker in ("stopping server", "stopping the server", "server shutting down")):
+            self._set("stopping", self.progress, "Останавливаю Minecraft", "Жду завершения службы", force=True)
+            self.ready = False
+            return
+
+        # Forge bootstrapping and mod discovery.
+        if any(marker in text for marker in ("modlauncher running", "modlauncher", "loading minecraft", "fml loader")):
+            self._set("starting_java", 10, "Запускаю Java и Forge", "Forge подготавливает загрузчик")
+            return
+        if any(marker in text for marker in ("found mod file", "moddiscoverer", "found valid mod file", "loading mod list")):
+            self._set("loading_mods", 28, "Сканирую моды", "Forge находит моды сборки")
+            return
+        if any(marker in text for marker in ("constructing mods", "loading mod", "common_setup", "modloading")):
+            self._set("initializing_mods", 50, "Инициализирую моды", "Загружаю рецепты, механики и зависимости")
+            return
+        if any(marker in text for marker in ("gamedata", "registries", "registering", "registry")):
+            self._set("registering_content", 68, "Регистрирую содержимое", "Подготавливаю блоки, предметы и рецепты")
+            return
+
+        # Vanilla dedicated-server world startup.
+        if "preparing level" in text or "loading level" in text:
+            self._set("loading_world", 78, "Загружаю мир", "Открываю сохранение и измерения")
+            return
+        spawn_match = self._SPAWN_PERCENT.search(line)
+        if spawn_match:
+            percent = max(0, min(100, int(spawn_match.group(1))))
+            self._set(
+                "preparing_spawn",
+                84 + round(percent * 0.14),
+                "Подготавливаю спавн",
+                f"Подготовка стартовой области: {percent}%",
+            )
+            return
+        if any(marker in text for marker in ("starting rcon", "rcon running", "starting minecraft server version", "starting minecraft server")):
+            self._set("starting_services", 97, "Запускаю службы Minecraft", "Открываю сеть и RCON-консоль")
+
+    def wait_for_rcon(self) -> None:
+        if not self.ready and self._service_active:
+            self._set("starting_services", max(97, self.progress), "Запускаю службы Minecraft", "Жду готовности RCON-консоли")
+
+    def mark_ready(self, detail: str) -> None:
+        self._set("ready", 100, "Сервер готов", detail, force=True)
+        self.ready = True
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "progress": self.progress,
+            "label": self.label,
+            "detail": self.detail,
+            "ready": self.ready,
+            "started_at": self.started_at,
+            "last_log_at": self.last_log_at,
+        }
+
+    def _set(self, phase: str, progress: int, label: str, detail: str, *, force: bool = False) -> None:
+        if self.ready and not force:
+            return
+        if not force and progress < self.progress:
+            return
+        self.phase = phase
+        self.progress = max(0, min(100, int(progress)))
+        self.label = label
+        self.detail = detail[:240]
+
+
+def parse_minecraft_player_list(output: str) -> tuple[int | None, int | None, list[str]]:
+    """Parse the standard Java-server answer to the RCON ``list`` command."""
+
+    match = re.search(r"There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online:\s*(.*)", output, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None, None, []
+    names = [name.strip() for name in match.group(3).replace("\n", " ").split(",") if name.strip()]
+    return int(match.group(1)), int(match.group(2)), names
+
+
+def parse_help_command_names(output: str) -> list[str]:
+    """Extract root commands from Minecraft's ``help`` text when available."""
+
+    names = {name.lower() for name in re.findall(r"/(?:minecraft:)?([a-z][a-z0-9_:-]*)", output, re.IGNORECASE)}
+    return sorted(names)[:512]
+
+
 class RconClient:
     """Small, local-only implementation of the Minecraft RCON protocol."""
 
@@ -248,9 +387,17 @@ class Agent:
             str(minecraft.get("rcon_host", "127.0.0.1")),
             int(minecraft.get("rcon_port", 25575)),
             str(minecraft.get("rcon_password", "")),
+            timeout=4.0,
         )
         self.tmux_session = str(minecraft.get("tmux_session", "dragonfyre"))
         self.last_heartbeat = 0.0
+        self.startup = MinecraftStartupTracker()
+        self.last_rcon_probe = 0.0
+        self.last_command_list_refresh = 0.0
+        self.online_players: list[str] = []
+        self.player_count: int | None = None
+        self.player_limit: int | None = None
+        self.command_names: list[str] = []
 
     def run(self) -> None:
         self.events.add("server", f"Server Control agent {AGENT_VERSION} started.")
@@ -278,6 +425,7 @@ class Agent:
 
     def _collect_minecraft_logs(self) -> None:
         for line in self.log_tail.read_new_lines():
+            self.startup.observe(line)
             self.events.add("minecraft", line)
 
     def _flush_events(self) -> None:
@@ -333,11 +481,13 @@ class Agent:
         if command_type == "minecraft_status":
             return self._minecraft_status()
         if command_type == "minecraft_command":
-            command = str(payload.get("command", "")).strip()
+            command = str(payload.get("command", "")).strip().lstrip("/")
             if not command or len(command) > 256:
                 raise ValueError("Некорректная команда Minecraft")
             output = self._minecraft_command(command)
-            self.events.add("minecraft", f"> {command}\n{output}".strip())
+            # The desktop prints the submitted command immediately.  Other
+            # clients still receive the result through this shared console.
+            self.events.add("minecraft", f"[RCON] {output or 'Команда выполнена.'}".strip())
             return {"command": command, "output": output[:4000]}
         if command_type == "safe_power_off":
             return self._prepare_safe_power_off()
@@ -356,13 +506,59 @@ class Agent:
     def _minecraft_status(self) -> dict[str, Any]:
         result = self._run(["systemctl", "is-active", self.minecraft_service], timeout=5)
         active = result["stdout"].strip() == "active"
+        self.startup.set_service_active(active)
+        if active:
+            self._refresh_rcon_runtime()
+        else:
+            self.online_players = []
+            self.player_count = None
+            self.player_limit = None
         return {
             "service": self.minecraft_service,
             "active": active,
             "state": result["stdout"].strip() or result["stderr"].strip(),
             "log_file": str(self.log_tail.path),
             "console_mode": self.console_mode,
+            "startup": self.startup.snapshot(),
+            "players": {
+                "online": self.player_count,
+                "max": self.player_limit,
+                "names": self.online_players,
+            },
+            # ``help`` discovers additional commands supplied by this exact
+            # modpack.  The desktop merges it with a safe vanilla fallback.
+            "command_names": self.command_names,
         }
+
+    def _refresh_rcon_runtime(self) -> None:
+        """Confirm readiness and gather data used by the desktop console."""
+
+        if self.console_mode != "rcon" or not self.rcon.password or self.rcon.password.startswith("REPLACE_"):
+            return
+        now = time.monotonic()
+        if now - self.last_rcon_probe >= RCON_STATUS_INTERVAL_SECONDS:
+            self.last_rcon_probe = now
+            try:
+                player_output = self.rcon.command("list")
+            except Exception as error:
+                self.startup.wait_for_rcon()
+                self._stderr(f"RCON readiness check failed: {error}")
+            else:
+                self.player_count, self.player_limit, self.online_players = parse_minecraft_player_list(player_output)
+                if self.player_count is None:
+                    self.startup.mark_ready("RCON-консоль подключена")
+                else:
+                    self.startup.mark_ready(f"RCON подключён · игроков: {self.player_count}/{self.player_limit}")
+
+        if self.startup.ready and now - self.last_command_list_refresh >= COMMAND_LIST_REFRESH_SECONDS:
+            self.last_command_list_refresh = now
+            try:
+                discovered = parse_help_command_names(self.rcon.command("help"))
+            except Exception as error:
+                self._stderr(f"RCON help refresh failed: {error}")
+            else:
+                if discovered:
+                    self.command_names = discovered
 
     def _run_allowed_shell_command(self, command: str) -> dict[str, Any]:
         if not command or len(command) > 512:
