@@ -48,6 +48,16 @@ def replace_executable(replacement: Path, target: Path) -> None:
     raise RuntimeError(f"Не удалось заменить {target.name} за 60 секунд: {last_error}")
 
 
+def save_rollback_copy(target: Path) -> Path | None:
+    """Keep one known-good client EXE until the next successful update."""
+
+    if not target.is_file():
+        return None
+    backup = target.with_name(f"{target.stem}.previous{target.suffix}")
+    shutil.copy2(target, backup)
+    return backup
+
+
 def write_error_log(target: Path, error: Exception) -> None:
     try:
         target.mkdir(parents=True, exist_ok=True)
@@ -73,6 +83,7 @@ def main() -> int:
     parser.add_argument("--zip", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--restart", type=Path, required=True)
+    parser.add_argument("--updater-target", type=Path)
     args = parser.parse_args()
 
     wait_for_process(args.wait_pid)
@@ -84,8 +95,18 @@ def main() -> int:
         if not replacement.is_file():
             raise RuntimeError(f"В архиве нет {args.restart.name}")
         args.target.mkdir(parents=True, exist_ok=True)
+        backup = save_rollback_copy(args.restart)
         replace_executable(replacement, args.restart)
-        subprocess.Popen([str(args.restart)], cwd=str(args.target), close_fds=True)
+        if args.updater_target:
+            updater_replacement = staging / args.updater_target.name
+            if updater_replacement.is_file():
+                replace_executable(updater_replacement, args.updater_target)
+        try:
+            subprocess.Popen([str(args.restart)], cwd=str(args.target), close_fds=True)
+        except OSError:
+            if backup and backup.is_file():
+                os.replace(backup, args.restart)
+            raise
         return 0
     except Exception as error:
         write_error_log(args.target, error)

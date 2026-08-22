@@ -48,6 +48,7 @@ jobs:
           Copy-Item dist/ServerControlUpdater.exe package/ServerControlUpdater.exe
           Copy-Item desktop/server-control.json.example package/server-control.json
           Copy-Item dist/ServerControl.exe update/ServerControl.exe
+          Copy-Item dist/ServerControlUpdater.exe update/ServerControlUpdater.exe
           Compress-Archive -Path package/* -DestinationPath ServerControl-Setup.zip -Force
           Compress-Archive -Path update/* -DestinationPath ServerControl-Update.zip -Force
 

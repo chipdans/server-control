@@ -3,8 +3,8 @@
 Server Control is a self-hosted control system for a home server and a Minecraft
 server. It has three components:
 
-- **Desktop client**: Windows app for sign-in, server status, power, Linux
-  commands, Minecraft console and user administration.
+- **Desktop client**: Windows app for sign-in, power, a live resource dashboard,
+  safe server diagnostics, Minecraft console and user administration.
 - **Cloudflare Worker**: a free, small public API that authenticates users,
   enforces blocks and permissions, and calls the Yandex Smart Home API for the
   `Питание сервера` socket.
@@ -47,9 +47,9 @@ installation.
 - Only the initial owner can create, edit, disable or reset other users.
 - User permissions are checked by the Worker and again before the agent runs a
   command.
-- Arbitrary Linux commands are restricted to users with `server_command` and
-  are run by a low-privilege system account. Configure the allow-list before
-  enabling this permission for anyone else.
+- The client deliberately has no full SSH terminal. A low-privilege agent runs
+  only exact diagnostic commands from its local allow-list; configure it before
+  enabling `server_command` for anyone else.
 - A normal socket-off request asks the agent to stop Minecraft and sync disk
   writes first. A forced cut is available only to the owner.
 

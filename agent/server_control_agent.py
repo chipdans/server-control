@@ -13,10 +13,12 @@ import json
 import os
 import re
 import shlex
+import signal
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,8 +29,11 @@ from pathlib import Path
 from typing import Any
 
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 MAX_EVENT_MESSAGE = 8000
+MAX_EVENT_BUFFER_EVENTS = 2_000
+MAX_EVENT_BUFFER_BYTES = 2 * 1024 * 1024
+MAX_SUBPROCESS_OUTPUT_BYTES = 128 * 1024
 RCON_STATUS_INTERVAL_SECONDS = 2.0
 COMMAND_LIST_REFRESH_SECONDS = 15 * 60
 
@@ -128,27 +133,262 @@ class HubClient:
         )
 
 
-class EventBuffer:
+def parse_proc_stat_cpu(text: str) -> tuple[int, int] | None:
+    """Return total and idle CPU ticks from a Linux ``/proc/stat`` sample."""
+
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "cpu":
+            continue
+        try:
+            values = [int(value) for value in parts[1:]]
+        except ValueError:
+            return None
+        if len(values) < 4:
+            return None
+        total = sum(values)
+        # Linux reports iowait separately, but it is still time when the CPU
+        # is not doing useful work, so include it in the idle side.
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return total, idle
+    return None
+
+
+def parse_meminfo(text: str) -> dict[str, int]:
+    """Parse the useful memory counters from Linux ``/proc/meminfo``."""
+
+    raw: dict[str, int] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        match = re.search(r"(\d+)", value)
+        if match:
+            raw[key] = int(match.group(1)) * 1024
+    total = raw.get("MemTotal", 0)
+    available = raw.get("MemAvailable", raw.get("MemFree", 0) + raw.get("Buffers", 0) + raw.get("Cached", 0))
+    used = max(0, total - available)
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "used_bytes": used,
+        "swap_total_bytes": raw.get("SwapTotal", 0),
+        "swap_free_bytes": raw.get("SwapFree", 0),
+    }
+
+
+def parse_proc_net_dev(text: str) -> tuple[int, int]:
+    """Return aggregate non-loopback receive/transmit bytes."""
+
+    received = 0
+    transmitted = 0
+    for line in text.splitlines():
+        interface, separator, payload = line.partition(":")
+        if not separator or interface.strip() == "lo":
+            continue
+        fields = payload.split()
+        if len(fields) < 9:
+            continue
+        try:
+            received += int(fields[0])
+            transmitted += int(fields[8])
+        except ValueError:
+            continue
+    return received, transmitted
+
+
+def parse_proc_diskstats(text: str) -> tuple[int, int]:
+    """Return aggregate physical-disk read/write bytes from ``/proc/diskstats``.
+
+    Loop devices, device-mapper volumes and partitions are skipped to avoid
+    double-counting.  The root filesystem usage below remains available even
+    on hosts where the underlying device is not visible in this list.
+    """
+
+    read_sectors = 0
+    written_sectors = 0
+    physical_name = re.compile(r"(?:sd|vd|xvd)[a-z]+$|nvme\d+n\d+$|mmcblk\d+$")
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or not physical_name.fullmatch(fields[2]):
+            continue
+        try:
+            read_sectors += int(fields[5])
+            written_sectors += int(fields[9])
+        except ValueError:
+            continue
+    return read_sectors * 512, written_sectors * 512
+
+
+class SystemMonitor:
+    """Collect small, dependency-free Linux resource snapshots for the UI."""
+
     def __init__(self) -> None:
+        self._last_cpu: tuple[int, int] | None = None
+        self._last_network: tuple[int, int, float] | None = None
+        self._last_disk_io: tuple[int, int, float] | None = None
+
+    @staticmethod
+    def _read_text(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _rate(previous: tuple[int, int, float] | None, current: tuple[int, int], now: float) -> tuple[float | None, float | None]:
+        if previous is None:
+            return None, None
+        old_first, old_second, old_time = previous
+        elapsed = now - old_time
+        if elapsed <= 0:
+            return None, None
+        return max(0.0, (current[0] - old_first) / elapsed), max(0.0, (current[1] - old_second) / elapsed)
+
+    @staticmethod
+    def _temperature_celsius() -> float | None:
+        for path in sorted(Path("/sys/class/thermal").glob("thermal_zone*/temp")):
+            try:
+                raw = float(path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                continue
+            value = raw / 1000 if raw > 1_000 else raw
+            if -20 <= value <= 150:
+                return round(value, 1)
+        return None
+
+    def sample(self) -> dict[str, Any]:
+        now = time.monotonic()
+        cpu_ticks = parse_proc_stat_cpu(self._read_text(Path("/proc/stat")))
+        cpu_percent: float | None = None
+        if cpu_ticks and self._last_cpu:
+            total_delta = cpu_ticks[0] - self._last_cpu[0]
+            idle_delta = cpu_ticks[1] - self._last_cpu[1]
+            if total_delta > 0:
+                cpu_percent = round(max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta)), 1)
+        if cpu_ticks:
+            self._last_cpu = cpu_ticks
+
+        memory = parse_meminfo(self._read_text(Path("/proc/meminfo")))
+        memory_total = memory.get("total_bytes", 0)
+        memory["percent"] = round((memory.get("used_bytes", 0) * 100 / memory_total), 1) if memory_total else None
+
+        try:
+            filesystem = os.statvfs("/")
+            total_bytes = filesystem.f_blocks * filesystem.f_frsize
+            available_bytes = filesystem.f_bavail * filesystem.f_frsize
+            used_bytes = max(0, total_bytes - available_bytes)
+            disk = {
+                "mount": "/",
+                "total_bytes": total_bytes,
+                "available_bytes": available_bytes,
+                "used_bytes": used_bytes,
+                "percent": round(used_bytes * 100 / total_bytes, 1) if total_bytes else None,
+            }
+        except OSError:
+            disk = {}
+
+        network = parse_proc_net_dev(self._read_text(Path("/proc/net/dev")))
+        rx_per_second, tx_per_second = self._rate(self._last_network, network, now)
+        self._last_network = (*network, now)
+
+        disk_io = parse_proc_diskstats(self._read_text(Path("/proc/diskstats")))
+        read_per_second, write_per_second = self._rate(self._last_disk_io, disk_io, now)
+        self._last_disk_io = (*disk_io, now)
+
+        try:
+            uptime_seconds = max(0, int(float(self._read_text(Path("/proc/uptime")).split()[0])))
+        except (IndexError, ValueError):
+            uptime_seconds = None
+        try:
+            load_average = [round(float(value), 2) for value in os.getloadavg()]
+        except OSError:
+            load_average = []
+
+        return {
+            "cpu": {"percent": cpu_percent, "load_average": load_average},
+            "memory": memory,
+            "filesystem": disk,
+            "network": {"rx_bytes": network[0], "tx_bytes": network[1], "rx_per_second": rx_per_second, "tx_per_second": tx_per_second},
+            "disk_io": {"read_bytes": disk_io[0], "write_bytes": disk_io[1], "read_per_second": read_per_second, "write_per_second": write_per_second},
+            "temperature_celsius": self._temperature_celsius(),
+            "uptime_seconds": uptime_seconds,
+            "collected_at": int(time.time() * 1000),
+        }
+
+
+class EventBuffer:
+    """A bounded outage buffer so an unavailable hub cannot consume all RAM."""
+
+    def __init__(self, max_events: int = MAX_EVENT_BUFFER_EVENTS, max_bytes: int = MAX_EVENT_BUFFER_BYTES) -> None:
         self._events: deque[dict[str, str]] = deque()
+        self._max_events = max(1, max_events)
+        self._max_bytes = max(256, max_bytes)
+        self._size_bytes = 0
+        self._dropped_events = 0
+
+    @staticmethod
+    def _event_size(event: dict[str, str]) -> int:
+        return 64 + len(event["kind"].encode("utf-8")) + len(event["message"].encode("utf-8"))
+
+    def _drop_oldest(self) -> None:
+        event = self._events.popleft()
+        self._size_bytes -= self._event_size(event)
+        self._dropped_events += 1
+
+    def _make_room(self, size: int, *, from_left: bool) -> None:
+        while self._events and (len(self._events) >= self._max_events or self._size_bytes + size > self._max_bytes):
+            if from_left:
+                self._drop_oldest()
+            else:
+                event = self._events.pop()
+                self._size_bytes -= self._event_size(event)
+                self._dropped_events += 1
 
     def add(self, kind: str, message: str) -> None:
         clean = message.strip()
-        if clean:
-            self._events.append({"kind": kind, "message": clean[:MAX_EVENT_MESSAGE]})
+        if not clean:
+            return
+        clean = clean[:MAX_EVENT_MESSAGE]
+        max_message_bytes = max(1, self._max_bytes - 96)
+        encoded = clean.encode("utf-8")
+        if len(encoded) > max_message_bytes:
+            clean = encoded[:max_message_bytes].decode("utf-8", "ignore")
+        event = {"kind": kind, "message": clean}
+        size = self._event_size(event)
+        self._make_room(size, from_left=True)
+        self._events.append(event)
+        self._size_bytes += size
 
     def take(self, count: int = 100) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         while self._events and len(result) < count:
-            result.append(self._events.popleft())
+            event = self._events.popleft()
+            self._size_bytes -= self._event_size(event)
+            result.append(event)
         return result
 
     def restore_front(self, events: list[dict[str, str]]) -> None:
         for event in reversed(events):
+            if not isinstance(event, dict) or not isinstance(event.get("kind"), str) or not isinstance(event.get("message"), str):
+                continue
+            size = self._event_size(event)
+            self._make_room(size, from_left=False)
             self._events.appendleft(event)
+            self._size_bytes += size
+
+    def take_overflow_notice(self) -> dict[str, str] | None:
+        if not self._dropped_events:
+            return None
+        dropped = self._dropped_events
+        self._dropped_events = 0
+        return {
+            "kind": "server",
+            "message": f"[agent] Буфер событий был переполнен: пропущено строк: {dropped}. Проверьте доступность Control Hub.",
+        }
 
     def __bool__(self) -> bool:
-        return bool(self._events)
+        return bool(self._events) or self._dropped_events > 0
 
 
 class LogTail:
@@ -361,16 +601,34 @@ class RconClient:
     def command(self, command: str) -> str:
         with socket.create_connection((self.host, self.port), timeout=self.timeout) as connection:
             connection.settimeout(self.timeout)
-            request_id = int(time.time() * 1000) & 0x7FFFFFFF
+            # Reserve two following signed-int IDs for command completion.
+            request_id = int(time.time() * 1000) & 0x7FFFFFFC
             connection.sendall(self._packet(request_id, self.AUTH, self.password))
             authenticated_id, _, _ = self._read_packet(connection)
             if authenticated_id == -1:
                 raise RuntimeError("RCON authentication failed")
-            connection.sendall(self._packet(request_id + 1, self.COMMAND, command))
-            response_id, _, payload = self._read_packet(connection)
-            if response_id == -1:
-                raise RuntimeError("RCON command failed")
-            return payload
+            command_id = request_id + 1
+            terminator_id = request_id + 2
+            connection.sendall(self._packet(command_id, self.COMMAND, command))
+            # Long RCON results are allowed to arrive as several packets.  A
+            # second, empty command gives us a deterministic end marker while
+            # keeping the connection local to the Minecraft machine.
+            connection.sendall(self._packet(terminator_id, self.COMMAND, ""))
+            chunks: list[str] = []
+            while True:
+                try:
+                    response_id, _, payload = self._read_packet(connection)
+                except socket.timeout:
+                    if chunks:
+                        break
+                    raise RuntimeError("RCON command timed out") from None
+                if response_id == -1:
+                    raise RuntimeError("RCON command failed")
+                if response_id == terminator_id:
+                    break
+                if response_id == command_id:
+                    chunks.append(payload)
+            return "".join(chunks)
 
 
 class Agent:
@@ -379,7 +637,7 @@ class Agent:
         self.hub = HubClient(config)
         self.events = EventBuffer()
         minecraft = config.minecraft
-        self.minecraft_service = str(minecraft.get("service", "minecraft-dragonfyre.service"))
+        self.minecraft_service = str(minecraft.get("service", "dragonfyre.service"))
         self.minecraft_directory = Path(str(minecraft.get("directory", "/opt/minecraft/dragonfyre")))
         self.log_tail = LogTail(Path(str(minecraft.get("log_file", self.minecraft_directory / "logs/latest.log"))))
         self.console_mode = str(minecraft.get("console_mode", "rcon"))
@@ -398,6 +656,7 @@ class Agent:
         self.player_count: int | None = None
         self.player_limit: int | None = None
         self.command_names: list[str] = []
+        self.system_monitor = SystemMonitor()
 
     def run(self) -> None:
         self.events.add("server", f"Server Control agent {AGENT_VERSION} started.")
@@ -430,7 +689,13 @@ class Agent:
 
     def _flush_events(self) -> None:
         while self.events:
-            batch = self.events.take()
+            batch: list[dict[str, str]] = []
+            overflow_notice = self.events.take_overflow_notice()
+            if overflow_notice:
+                batch.append(overflow_notice)
+            batch.extend(self.events.take(100 - len(batch)))
+            if not batch:
+                return
             try:
                 self.hub.push_events(batch)
             except HubError:
@@ -494,12 +759,16 @@ class Agent:
         raise ValueError(f"Неизвестная команда: {command_type}")
 
     def _server_status(self) -> dict[str, Any]:
-        uptime = self._run(["uptime"], timeout=5)
-        disk = self._run(["df", "-h", "/"], timeout=5)
+        metrics = self.system_monitor.sample()
+        filesystem = metrics.get("filesystem") if isinstance(metrics.get("filesystem"), dict) else {}
+        uptime_seconds = metrics.get("uptime_seconds")
         return {
             "hostname": socket.gethostname(),
-            "uptime": uptime["stdout"].strip(),
-            "disk": disk["stdout"].strip(),
+            # Keep compact fields for older desktop clients.  Newer versions
+            # use the structured metrics block below.
+            "uptime": f"{uptime_seconds or 0} seconds",
+            "disk": f"{filesystem.get('percent', '—')}% used on /",
+            "metrics": metrics,
             "agent_time": int(time.time()),
         }
 
@@ -565,11 +834,17 @@ class Agent:
             raise ValueError("Некорректная команда")
         if any(character in command for character in (";", "|", "&", ">", "<", "`", "$", "\n", "\r")):
             raise PermissionError("Командные цепочки и перенаправления запрещены")
-        allowed_prefixes = self.config.commands.get("allow_shell_prefixes", [])
-        if not isinstance(allowed_prefixes, list) or not any(
-            command == prefix or command.startswith(f"{prefix} ") for prefix in allowed_prefixes if isinstance(prefix, str)
-        ):
-            raise PermissionError("Эта команда не внесена в allow-list агента")
+        allowed_commands = self.config.commands.get("allow_shell_commands")
+        # ``allow_shell_prefixes`` is accepted only for backwards-compatible
+        # configuration loading.  It now means an *exact* command too: a
+        # prefix such as ``tail -n`` must no longer unlock arbitrary paths.
+        if not isinstance(allowed_commands, list):
+            allowed_commands = self.config.commands.get("allow_shell_prefixes", [])
+        normalized_allowed = {
+            item.strip() for item in allowed_commands if isinstance(item, str) and item.strip()
+        } if isinstance(allowed_commands, list) else set()
+        if command not in normalized_allowed:
+            raise PermissionError("Разрешены только точные диагностические команды из allow-list агента")
         try:
             args = shlex.split(command)
         except ValueError as error:
@@ -645,15 +920,99 @@ class Agent:
 
     @staticmethod
     def _run(args: list[str], timeout: int) -> dict[str, Any]:
-        completed = subprocess.run(
+        """Run one fixed executable with bounded output and a killable process group.
+
+        ``shell=True`` is never used.  A timed-out backup or diagnostic may
+        spawn children, so a process group is terminated rather than leaving
+        orphan processes alive.  Output is read on two small background
+        readers to avoid a noisy process filling a pipe or agent memory.
+        """
+
+        if not args or not all(isinstance(item, str) and item for item in args):
+            raise ValueError("Некорректный список аргументов команды")
+        environment = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TERM": "dumb",
+            "HOME": "/tmp",
+        }
+        process = subprocess.Popen(
             args,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", **os.environ},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/",
+            env=environment,
+            start_new_session=True,
         )
-        return {"returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
+
+        def read_stream(stream: Any, capture: dict[str, Any]) -> None:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                remaining = MAX_SUBPROCESS_OUTPUT_BYTES - len(capture["data"])
+                if remaining > 0:
+                    capture["data"].extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    capture["truncated"] = True
+
+        stdout_capture: dict[str, Any] = {"data": bytearray(), "truncated": False}
+        stderr_capture: dict[str, Any] = {"data": bytearray(), "truncated": False}
+        stdout_reader = threading.Thread(target=read_stream, args=(process.stdout, stdout_capture), daemon=True)
+        stderr_reader = threading.Thread(target=read_stream, args=(process.stderr, stderr_capture), daemon=True)
+        stdout_reader.start()
+        stderr_reader.start()
+
+        timed_out = False
+        try:
+            process.wait(timeout=max(1, timeout))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            Agent._terminate_process_group(process)
+        finally:
+            stdout_reader.join(timeout=2)
+            stderr_reader.join(timeout=2)
+
+        def decode(capture: dict[str, Any]) -> str:
+            output = bytes(capture["data"]).decode("utf-8", "replace")
+            if capture["truncated"]:
+                output += "\n[Вывод ограничен 128 КиБ]"
+            return output
+
+        stderr = decode(stderr_capture)
+        if timed_out:
+            stderr = f"{stderr}\n[Команда превысила лимит {timeout} с и была остановлена]".strip()
+        return {
+            "returncode": 124 if timed_out else int(process.returncode or 0),
+            "stdout": decode(stdout_capture),
+            "stderr": stderr,
+            "timed_out": timed_out,
+        }
+
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            return
+        process.wait(timeout=3)
 
     @staticmethod
     def _stderr(message: str) -> None:

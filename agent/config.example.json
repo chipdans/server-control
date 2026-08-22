@@ -5,7 +5,7 @@
   "heartbeat_seconds": 2,
   "request_timeout_seconds": 20,
   "minecraft": {
-    "service": "minecraft-dragonfyre.service",
+    "service": "dragonfyre.service",
     "directory": "/opt/minecraft/dragonfyre",
     "log_file": "/opt/minecraft/dragonfyre/logs/latest.log",
     "console_mode": "rcon",
@@ -15,14 +15,11 @@
     "tmux_session": "dragonfyre"
   },
   "commands": {
-    "allow_shell_prefixes": [
+    "allow_shell_commands": [
       "uptime",
       "free -h",
       "df -h",
-      "lsblk",
-      "systemctl status minecraft-dragonfyre.service",
-      "journalctl -u minecraft-dragonfyre.service",
-      "tail -n"
+      "lsblk"
     ],
     "backup_command": "/usr/local/bin/minecraft-backup.sh"
   }

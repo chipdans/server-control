@@ -65,10 +65,41 @@ def download_update(asset_url: str) -> Path:
     return destination
 
 
+def prepare_bootstrap_updater(update_zip: Path, current_executable: Path) -> Path:
+    """Extract the updater bundled with a release before the GUI exits.
+
+    The normal updater EXE is often the executable that is currently running,
+    so it cannot safely replace itself.  A short-lived ``.bootstrap`` copy is
+    launched instead; it can update both the client and the persistent updater
+    before it starts the new client.
+    """
+
+    updater_name = "ServerControlUpdater.exe" if sys.platform == "win32" else "ServerControlUpdater"
+    bootstrap = current_executable.with_name(f"{Path(updater_name).stem}.bootstrap{Path(updater_name).suffix}")
+    try:
+        with zipfile.ZipFile(update_zip) as archive:
+            member = archive.getinfo(updater_name)
+            contents = archive.read(member)
+    except (KeyError, OSError, zipfile.BadZipFile):
+        # Compatibility with releases from before the updater was bundled.
+        return current_executable.with_name(updater_name)
+    temporary = bootstrap.with_name(f"{bootstrap.name}.new")
+    try:
+        temporary.write_bytes(contents)
+        os.replace(temporary, bootstrap)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"Не удалось подготовить программу обновления: {error}") from error
+    return bootstrap
+
+
 def launch_updater(update_zip: Path, current_executable: Path) -> None:
     """Launch a sibling updater after this graphical process has exited."""
     updater_name = "ServerControlUpdater.exe" if sys.platform == "win32" else "ServerControlUpdater"
-    updater = current_executable.with_name(updater_name)
+    updater = prepare_bootstrap_updater(update_zip, current_executable)
     if not updater.exists():
         raise RuntimeError("Не найден ServerControlUpdater рядом с программой.")
     command = [
@@ -81,6 +112,8 @@ def launch_updater(update_zip: Path, current_executable: Path) -> None:
         str(current_executable.parent),
         "--restart",
         str(current_executable),
+        "--updater-target",
+        str(current_executable.with_name(updater_name)),
     ]
     if sys.platform == "win32":
         # The companion waits for this exact process before replacing the EXE.

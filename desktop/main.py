@@ -17,7 +17,7 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 APP_TITLE = "Server Control"
 STATUS_POLL_INTERVAL_MS = 1_000
 SERVER_LOG_POLL_INTERVAL_SECONDS = 5
@@ -83,6 +83,57 @@ def enable_clipboard_paste(entry: ttk.Entry) -> ttk.Entry:
     entry.bind("<Control-KeyPress>", paste_from_ctrl, add="+")
     entry.bind("<Shift-Insert>", paste)
     return entry
+
+
+def numeric_value(value: Any) -> float | None:
+    """Return a finite UI number without letting malformed agent data crash Tk."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None
+
+
+def display_bytes(value: Any, *, per_second: bool = False) -> str:
+    amount = numeric_value(value)
+    if amount is None:
+        return "—"
+    suffix = "/с" if per_second else ""
+    units = ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ")
+    index = 0
+    while amount >= 1024 and index < len(units) - 1:
+        amount /= 1024
+        index += 1
+    precision = 0 if index == 0 or amount >= 100 else 1
+    return f"{amount:.{precision}f} {units[index]}{suffix}"
+
+
+def display_duration(value: Any) -> str:
+    seconds = numeric_value(value)
+    if seconds is None:
+        return "—"
+    total = int(seconds)
+    days, remainder = divmod(total, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days} д {hours} ч"
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {seconds} с"
+    return f"{seconds} с"
+
+
+def display_percent(value: Any) -> tuple[float, str]:
+    number = numeric_value(value)
+    if number is None:
+        return 0.0, "—"
+    bounded = max(0.0, min(100.0, number))
+    return bounded, f"{bounded:.1f}%"
 
 
 # Minecraft's RCON protocol does not expose the game client's Brigadier tab
@@ -365,6 +416,19 @@ class ServerControlApp:
         self.power_var = tk.StringVar(value="Питание сервера: неизвестно")
         self.server_state_var = tk.StringVar(value="Домашний сервер: неизвестно")
         self.minecraft_state_var = tk.StringVar(value="Minecraft: неизвестно")
+        self.dashboard_server_info_var = tk.StringVar(value="Ожидаю первый отчёт агента…")
+        self.dashboard_cpu_var = tk.StringVar(value="CPU: —")
+        self.dashboard_memory_var = tk.StringVar(value="Память: —")
+        self.dashboard_disk_var = tk.StringVar(value="Диск /: —")
+        self.dashboard_network_var = tk.StringVar(value="Сеть: —")
+        self.dashboard_disk_io_var = tk.StringVar(value="Диск I/O: —")
+        self.dashboard_temperature_var = tk.StringVar(value="Температура: —")
+        self.dashboard_minecraft_var = tk.StringVar(value="Minecraft: ожидаю состояние…")
+        self.dashboard_players_var = tk.StringVar(value="Игроки: —")
+        self.dashboard_cpu_progress_var = tk.DoubleVar(value=0)
+        self.dashboard_memory_progress_var = tk.DoubleVar(value=0)
+        self.dashboard_disk_progress_var = tk.DoubleVar(value=0)
+        self.dashboard_minecraft_progress_var = tk.DoubleVar(value=0)
 
         self._configure_style()
         try:
@@ -519,6 +583,7 @@ class ServerControlApp:
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        self.build_dashboard_tab()
         self.build_server_tab()
         self.build_minecraft_tab()
         if self.has_permission("user_manage"):
@@ -551,6 +616,62 @@ class ServerControlApp:
         ttk.Label(card, textvariable=self.server_state_var).pack(anchor="w")
         ttk.Label(card, textvariable=self.minecraft_state_var).pack(anchor="w", pady=(6, 0))
 
+    def build_dashboard_tab(self) -> None:
+        """The first tab is intentionally compact: it remains useful on 900px-wide screens."""
+
+        tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(tab, text="Главная")
+
+        summary = ttk.LabelFrame(tab, text="Домашний сервер", style="Card.TLabelframe")
+        summary.pack(fill="x", pady=(0, 10))
+        ttk.Label(summary, textvariable=self.dashboard_server_info_var, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(
+            summary,
+            text="Показатели снимает агент на самом сервере; они не берутся из Windows-клиента.",
+            style="Subtle.TLabel",
+            wraplength=900,
+        ).pack(anchor="w", pady=(5, 0))
+
+        resources = ttk.LabelFrame(tab, text="Ресурсы", style="Card.TLabelframe")
+        resources.pack(fill="x", pady=(0, 10))
+        self.dashboard_metric(resources, 0, 0, "Процессор", self.dashboard_cpu_var, self.dashboard_cpu_progress_var)
+        self.dashboard_metric(resources, 0, 1, "Оперативная память", self.dashboard_memory_var, self.dashboard_memory_progress_var)
+        self.dashboard_metric(resources, 1, 0, "Диск", self.dashboard_disk_var, self.dashboard_disk_progress_var)
+        self.dashboard_metric(resources, 1, 1, "Сеть", self.dashboard_network_var)
+        self.dashboard_metric(resources, 2, 0, "Дисковые операции", self.dashboard_disk_io_var)
+        self.dashboard_metric(resources, 2, 1, "Температура", self.dashboard_temperature_var)
+        resources.columnconfigure(0, weight=1)
+        resources.columnconfigure(1, weight=1)
+
+        minecraft = ttk.LabelFrame(tab, text="Minecraft", style="Card.TLabelframe")
+        minecraft.pack(fill="x")
+        header = ttk.Frame(minecraft)
+        header.pack(fill="x")
+        ttk.Label(header, textvariable=self.dashboard_minecraft_var, font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Label(header, textvariable=self.dashboard_players_var).pack(side="right")
+        ttk.Progressbar(
+            minecraft,
+            maximum=100,
+            mode="determinate",
+            variable=self.dashboard_minecraft_progress_var,
+        ).pack(fill="x", pady=(8, 0))
+
+    @staticmethod
+    def dashboard_metric(
+        parent: ttk.LabelFrame,
+        row: int,
+        column: int,
+        label: str,
+        value: tk.StringVar,
+        progress: tk.DoubleVar | None = None,
+    ) -> None:
+        cell = ttk.Frame(parent, padding=(0, 0, 18 if column == 0 else 0, 10))
+        cell.grid(row=row, column=column, sticky="nsew")
+        ttk.Label(cell, text=label, style="Subtle.TLabel").pack(anchor="w")
+        ttk.Label(cell, textvariable=value, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(2, 0))
+        if progress is not None:
+            ttk.Progressbar(cell, maximum=100, mode="determinate", variable=progress).pack(fill="x", pady=(5, 0))
+
     def build_server_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(tab, text="Домашний сервер")
@@ -570,14 +691,22 @@ class ServerControlApp:
         if self.has_permission("server_command"):
             entry_row = ttk.Frame(tab)
             entry_row.pack(fill="x", pady=(8, 0))
-            self.server_command_entry = enable_clipboard_paste(ttk.Entry(entry_row))
-            self.server_command_entry.pack(side="left", fill="x", expand=True)
-            self.server_command_entry.bind("<Return>", lambda _event: self.send_server_command())
-            ttk.Button(entry_row, text="Отправить", command=self.send_server_command).pack(side="left", padx=(8, 0))
+            ttk.Label(entry_row, text="Диагностика:").pack(side="left")
+            self.server_diagnostic_command = tk.StringVar(value="uptime")
+            self.server_diagnostic_box = ttk.Combobox(
+                entry_row,
+                textvariable=self.server_diagnostic_command,
+                values=("uptime", "free -h", "df -h", "lsblk"),
+                state="readonly",
+                width=20,
+            )
+            self.server_diagnostic_box.pack(side="left", padx=(8, 0))
+            ttk.Button(entry_row, text="Запустить", command=self.send_server_command).pack(side="left", padx=(8, 0))
             ttk.Label(
                 tab,
-                text="Разрешены только команды из allow-list агента. Цепочки, sudo и перенаправления заблокированы.",
+                text="Полный SSH-терминал специально не встроен. Разрешены только точные диагностические команды из allow-list агента; sudo, цепочки и перенаправления заблокированы.",
                 style="Subtle.TLabel",
+                wraplength=950,
             ).pack(anchor="w", pady=(6, 0))
 
     def build_minecraft_tab(self) -> None:
@@ -809,6 +938,7 @@ class ServerControlApp:
             self.server_state_var.set(
                 f"Домашний сервер: {'онлайн' if online else 'нет связи'} · {server.get('hostname', '—')}{freshness}"
             )
+            self.apply_server_metrics(server)
             self.apply_minecraft_status(online, minecraft)
         if "server_logs" in results:
             logs = results["server_logs"]
@@ -823,6 +953,53 @@ class ServerControlApp:
             if hasattr(self, "minecraft_console"):
                 self.append_events(self.minecraft_console, logs.get("events", []))
 
+    def apply_server_metrics(self, server: dict[str, Any]) -> None:
+        metrics = server.get("metrics") if isinstance(server.get("metrics"), dict) else None
+        if not metrics:
+            self.dashboard_server_info_var.set(
+                "Агент предыдущей версии: показатели появятся после обновления агента до 1.2.0."
+            )
+            return
+
+        hostname = str(server.get("hostname") or "домашний сервер")
+        uptime = display_duration(metrics.get("uptime_seconds"))
+        self.dashboard_server_info_var.set(f"{hostname} · работает {uptime}")
+
+        cpu = metrics.get("cpu") if isinstance(metrics.get("cpu"), dict) else {}
+        cpu_progress, cpu_text = display_percent(cpu.get("percent"))
+        self.dashboard_cpu_progress_var.set(cpu_progress)
+        loads = cpu.get("load_average") if isinstance(cpu.get("load_average"), list) else []
+        load_text = " · ".join(str(value) for value in loads[:3])
+        cpu_suffix = f" · load {load_text}" if load_text else ""
+        self.dashboard_cpu_var.set(f"{cpu_text}{cpu_suffix}")
+
+        memory = metrics.get("memory") if isinstance(metrics.get("memory"), dict) else {}
+        memory_progress, memory_text = display_percent(memory.get("percent"))
+        self.dashboard_memory_progress_var.set(memory_progress)
+        self.dashboard_memory_var.set(
+            f"{memory_text} · {display_bytes(memory.get('used_bytes'))} из {display_bytes(memory.get('total_bytes'))}"
+        )
+
+        filesystem = metrics.get("filesystem") if isinstance(metrics.get("filesystem"), dict) else {}
+        disk_progress, disk_text = display_percent(filesystem.get("percent"))
+        self.dashboard_disk_progress_var.set(disk_progress)
+        self.dashboard_disk_var.set(
+            f"{disk_text} · {display_bytes(filesystem.get('used_bytes'))} из {display_bytes(filesystem.get('total_bytes'))}"
+        )
+
+        network = metrics.get("network") if isinstance(metrics.get("network"), dict) else {}
+        self.dashboard_network_var.set(
+            f"↓ {display_bytes(network.get('rx_per_second'), per_second=True)} · ↑ {display_bytes(network.get('tx_per_second'), per_second=True)}"
+        )
+        disk_io = metrics.get("disk_io") if isinstance(metrics.get("disk_io"), dict) else {}
+        self.dashboard_disk_io_var.set(
+            f"чтение {display_bytes(disk_io.get('read_per_second'), per_second=True)} · запись {display_bytes(disk_io.get('write_per_second'), per_second=True)}"
+        )
+        temperature = numeric_value(metrics.get("temperature_celsius"))
+        self.dashboard_temperature_var.set(
+            f"{temperature:.1f} °C" if temperature is not None else "Датчик недоступен"
+        )
+
     def apply_minecraft_status(self, online: bool, minecraft: dict[str, Any]) -> None:
         startup = minecraft.get("startup") if isinstance(minecraft.get("startup"), dict) else {}
         command_names = minecraft.get("command_names")
@@ -834,6 +1011,9 @@ class ServerControlApp:
 
         if not online:
             self.minecraft_state_var.set("Minecraft: нет связи с агентом")
+            self.dashboard_minecraft_var.set("Minecraft: нет связи с агентом")
+            self.dashboard_players_var.set("Игроки: —")
+            self.dashboard_minecraft_progress_var.set(0)
             if hasattr(self, "minecraft_startup_label_var"):
                 self.minecraft_startup_label_var.set("Нет связи с домашним сервером")
                 self.minecraft_startup_detail_var.set("Ожидаю новый статус от агента")
@@ -857,6 +1037,15 @@ class ServerControlApp:
             self.minecraft_state_var.set(f"Minecraft: запускается · {progress}%")
         else:
             self.minecraft_state_var.set("Minecraft: остановлен")
+
+        player_online = players.get("online")
+        player_maximum = players.get("max")
+        if isinstance(player_online, int) and isinstance(player_maximum, int):
+            self.dashboard_players_var.set(f"Игроки: {player_online}/{player_maximum}")
+        else:
+            self.dashboard_players_var.set("Игроки: RCON ещё не ответил")
+        self.dashboard_minecraft_var.set(self.minecraft_state_var.get())
+        self.dashboard_minecraft_progress_var.set(progress)
 
         if hasattr(self, "minecraft_startup_label_var"):
             self.minecraft_startup_progress_var.set(progress)
@@ -962,10 +1151,9 @@ class ServerControlApp:
         self.command_request("POST", "/v1/minecraft/action", {"action": action}, "Команда Minecraft поставлена в очередь")
 
     def send_server_command(self) -> None:
-        command = self.server_command_entry.get().strip()
+        command = self.server_diagnostic_command.get().strip() if hasattr(self, "server_diagnostic_command") else ""
         if not command:
             return
-        self.server_command_entry.delete(0, "end")
         self.command_request("POST", "/v1/server/command", {"command": command}, "Linux-команда поставлена в очередь")
 
     def send_minecraft_command(self, command: str | None = None) -> None:

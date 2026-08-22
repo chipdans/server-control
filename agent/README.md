@@ -23,9 +23,12 @@ again.
 
 - The agent runs as a dedicated `servercontrol` account, not as root.
 - It only receives commands from the Worker using `AGENT_API_KEY`.
-- Linux terminal commands are not shell-executed. They must match the
-  `allow_shell_prefixes` in the configuration and are passed to `subprocess`
-  without `shell=True`.
+- Linux diagnostics are not shell-executed. They must exactly match one item
+  in `allow_shell_commands` in the configuration and are passed to
+  `subprocess` without `shell=True`. A legacy `allow_shell_prefixes` setting is
+  read as exact commands too; it no longer unlocks arbitrary arguments.
+- If the Worker or home network is unavailable, the console buffer is bounded;
+  the agent reports how many old lines had to be skipped after reconnecting.
 - Its only privileged operations are the explicit commands in the sudoers file.
 
 See `../docs/SETUP.md` for the exact deployment sequence.
