@@ -57,3 +57,6 @@ Read [the setup guide](docs/SETUP.md) before deployment.
 
 For the Minecraft console, command hints and the startup-progress stages, see
 [the live-console guide](docs/MINECRAFT_CONSOLE.md).
+
+For the compatible 1.2.0 home-agent update used by desktop 0.3.0, see
+[the agent update guide](docs/AGENT_1.2_UPDATE.md).
