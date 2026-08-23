@@ -116,9 +116,11 @@ class DashboardPage(BasePage):
         temperature = metrics.get("temperature_celsius")
         self.temperature.set(f"{temperature} °C" if temperature is not None else "недоступно", detail="датчик CPU" if temperature is not None else "Linux не предоставил датчик", progress=float(temperature) if isinstance(temperature, (int, float)) else None)
         addresses = server.get("system", {}).get("ip_addresses", []) if isinstance(server.get("system"), dict) else []
+        age_ms = self.panel.state.server.get("age_ms")
+        agent_age = "—" if age_ms is None else str(max(0, int(age_ms / 1000)))
         self.connection.set(
             f"{self.panel.state.latency_ms} мс" if self.panel.state.latency_ms is not None else "—",
-            detail=f"Agent: {int((self.panel.state.server.get('age_ms') or 0) / 1000)} с назад" + (f" · {', '.join(addresses)}" if addresses else ""),
+            detail=f"Agent: {agent_age} с назад" + (f" · {', '.join(addresses)}" if addresses else ""),
             progress=None,
         )
         instance = state.selected_instance()

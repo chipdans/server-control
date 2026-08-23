@@ -1,8 +1,8 @@
 {
   "hub_url": "https://server-control-hub.YOUR-SUBDOMAIN.workers.dev",
   "agent_api_key": "REPLACE_WITH_THE_SAME_AGENT_API_KEY_AS_IN_CLOUDFLARE",
-  "poll_seconds": 1,
-  "heartbeat_seconds": 2,
+  "poll_seconds": 3,
+  "heartbeat_seconds": 15,
   "request_timeout_seconds": 20,
   "state_directory": "/var/lib/server-control",
   "minecraft_root": "/opt/minecraft",

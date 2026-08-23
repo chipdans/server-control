@@ -60,6 +60,21 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_agent_config_enforces_free_tier_safe_polling_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent.json"
+            path.write_text(json.dumps({
+                "hub_url": "https://example.invalid",
+                "agent_api_key": "test-key",
+                "poll_seconds": 1,
+                "heartbeat_seconds": 2,
+                "minecraft": {"directory": "/tmp/minecraft"},
+                "commands": {"allow_shell_commands": []},
+            }), encoding="utf-8")
+            config = Config.load(path)
+            self.assertEqual(config.poll_seconds, 3.0)
+            self.assertEqual(config.heartbeat_seconds, 15)
+
     def test_debian_release_files_use_posix_line_endings(self) -> None:
         release_files = [
             ROOT / "agent" / "install-agent.sh",

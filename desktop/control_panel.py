@@ -266,7 +266,7 @@ class ControlPanel(ttk.Frame):
             for item in changes.get("notifications", []):
                 if item.get("severity") in {"warning", "error"}:
                     self.toast(str(item.get("message") or item.get("title")), error=item.get("severity") == "error")
-            self._schedule_sync(1000)
+            self._schedule_sync(self._normal_sync_interval())
 
         def failure(error: Exception) -> None:
             self.sync_inflight = False
@@ -291,6 +291,19 @@ class ControlPanel(ttk.Frame):
             except tk.TclError:
                 pass
         self.sync_after = self.after(milliseconds, self.sync)
+
+    def _normal_sync_interval(self) -> int:
+        """Stay responsive without exhausting the Workers Free daily quota."""
+
+        try:
+            window_state = self.winfo_toplevel().state()
+        except tk.TclError:
+            window_state = "normal"
+        if window_state in {"iconic", "withdrawn"}:
+            return 15_000
+        if self.current_page == "console":
+            return 2_000
+        return 3_000
 
     def refresh_now(self) -> None:
         if self.sync_after:

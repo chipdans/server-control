@@ -35,7 +35,7 @@ from sc_agent.instances import InstanceProfile
 from sc_agent.security import atomic_write_bytes, secure_path_within, validate_instance_id
 
 
-AGENT_VERSION = "2.0.1"
+AGENT_VERSION = "2.0.2"
 PROTOCOL_VERSION = 2
 MAX_EVENT_MESSAGE = 8000
 MAX_EVENT_BUFFER_EVENTS = 2_000
@@ -95,11 +95,11 @@ class Config:
         return cls(
             hub_url=str(raw["hub_url"]).rstrip("/"),
             agent_api_key=str(raw["agent_api_key"]),
-            # Commands are fetched every second.  This is the shortest useful
-            # delay without a permanently connected paid relay, while the
-            # heartbeat itself remains less frequent.
-            poll_seconds=max(0.5, min(1.0, float(raw.get("poll_seconds", 1)))),
-            heartbeat_seconds=max(1, min(2, int(raw.get("heartbeat_seconds", 2)))),
+            # Cloudflare Workers Free permits 100,000 requests per day.  Keep
+            # polling responsive without allowing an old config to force the
+            # Agent alone above that account-wide quota.
+            poll_seconds=max(3.0, float(raw.get("poll_seconds", 3))),
+            heartbeat_seconds=max(15, int(raw.get("heartbeat_seconds", 15))),
             request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
             minecraft=dict(raw["minecraft"]),
             commands=dict(raw["commands"]),
@@ -1247,7 +1247,11 @@ class Agent:
         elif now - self.last_hub_error_log_at >= HUB_ERROR_LOG_INTERVAL_SECONDS:
             self.last_hub_error_log_at = now
             self._stderr(f"Control Hub is still unavailable; suppressed failures: {self.hub_failure_count - 1}")
-        delay = min(HUB_RETRY_MAX_SECONDS, float(2 ** min(self.hub_failure_count - 1, 4)))
+        # Error 1027 is Cloudflare's exhausted daily Workers Free allowance.
+        # Hammering the edge cannot recover it and only creates more noise;
+        # retry slowly until the quota resets at 00:00 UTC.
+        quota_exhausted = "HTTP 429" in str(error) or "1027" in str(error)
+        delay = 300.0 if quota_exhausted else min(HUB_RETRY_MAX_SECONDS, float(2 ** min(self.hub_failure_count - 1, 4)))
         self.hub_retry_not_before = now + delay
 
     def _record_hub_recovered(self) -> None:
