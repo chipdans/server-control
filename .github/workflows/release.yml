@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.1"
+        description: "Release tag, for example v1.0.0"
         required: true
         type: string
 
@@ -15,7 +15,30 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate source and migrations
+        run: |
+          python -m compileall -q agent desktop tests
+          node --check worker/src/index.js
+          node --check worker/src/control_plane.js
+          sh -n agent/install-agent.sh
+          python -m unittest discover -s tests -p "test_*.py" -v
+          node --test tests/worker_auth.test.mjs
+
   build:
+    needs: validate
     runs-on: windows-latest
     defaults:
       run:
@@ -27,8 +50,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate release identity
+        run: |
+          $tag = "${{ inputs.tag }}"
+          if ($tag -eq "") { $tag = "${{ github.ref_name }}" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') { throw "Release tag is not semantic: $tag" }
+          $source = Get-Content desktop/main.py -Raw
+          $clientVersion = [regex]::Match($source, 'APP_VERSION\s*=\s*"([^"]+)"').Groups[1].Value
+          if ($tag -ne "v$clientVersion") { throw "Release tag $tag does not match desktop APP_VERSION $clientVersion" }
+
       - name: Install builder
         run: python -m pip install --upgrade pip; python -m pip install -r desktop/requirements-build.txt
+
+      - name: Run Python and Worker tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+          node --test tests/worker_auth.test.mjs
+          node --check worker/src/index.js
+          node --check worker/src/control_plane.js
 
       - name: Build Windows client
         run: >-
@@ -51,6 +90,40 @@ jobs:
           Copy-Item dist/ServerControlUpdater.exe update/ServerControlUpdater.exe
           Compress-Archive -Path package/* -DestinationPath ServerControl-Setup.zip -Force
           Compress-Archive -Path update/* -DestinationPath ServerControl-Update.zip -Force
+          $setupHash = (Get-FileHash ServerControl-Setup.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $updateHash = (Get-FileHash ServerControl-Update.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path ServerControl-Setup.zip.sha256 -Value "$setupHash  ServerControl-Setup.zip" -Encoding ascii
+          Set-Content -Path ServerControl-Update.zip.sha256 -Value "$updateHash  ServerControl-Update.zip" -Encoding ascii
+
+      - name: Package verified Debian Agent
+        run: |
+          $tag = "${{ inputs.tag }}"
+          if ($tag -eq "") { $tag = "${{ github.ref_name }}" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') { throw "Release tag is not semantic" }
+          New-Item -ItemType Directory -Force agent-package/sc_agent | Out-Null
+          Copy-Item agent/server_control_agent.py agent-package/server_control_agent.py
+          Copy-Item agent/agent_update_helper.py agent-package/agent_update_helper.py
+          Copy-Item agent/service_control_helper.py agent-package/service_control_helper.py
+          Copy-Item agent/instance_runner.py agent-package/instance_runner.py
+          Copy-Item agent/install-agent.sh agent-package/install-agent.sh
+          Copy-Item agent/server-control-agent.service agent-package/server-control-agent.service
+          Copy-Item agent/server-control-minecraft@.service agent-package/server-control-minecraft@.service
+          Copy-Item agent/servercontrol-sudoers.example agent-package/servercontrol-sudoers.example
+          Copy-Item agent/config.example.json agent-package/config.example.json
+          Copy-Item agent/sc_agent/*.py agent-package/sc_agent/
+          $source = Get-Content agent/server_control_agent.py -Raw
+          $version = [regex]::Match($source, 'AGENT_VERSION\s*=\s*"([^"]+)"').Groups[1].Value
+          if ($version -eq "") { throw "Could not determine AGENT_VERSION" }
+          $files = [ordered]@{}
+          Get-ChildItem agent-package -File -Recurse | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath((Resolve-Path agent-package), $_.FullName).Replace('\', '/')
+            $files[$relative] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $manifest = [ordered]@{ schema = 1; agent_version = $version; release_tag = $tag; files = $files }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content agent-package/manifest.json -Encoding utf8
+          Compress-Archive -Path agent-package/* -DestinationPath ServerControl-Agent.zip -Force
+          $agentHash = (Get-FileHash ServerControl-Agent.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path ServerControl-Agent.zip.sha256 -Value "$agentHash  ServerControl-Agent.zip" -Encoding ascii
 
       - name: Create or update GitHub Release
         env:
@@ -58,12 +131,12 @@ jobs:
         run: |
           $tag = "${{ inputs.tag }}"
           if ($tag -eq "") { $tag = "${{ github.ref_name }}" }
-          if (-not $tag.StartsWith("v")) { throw "Release tag must start with v" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') { throw "Release tag must be semantic" }
           $releaseRepository = "${{ vars.RELEASE_REPOSITORY }}"
           if ($releaseRepository -eq "") { $releaseRepository = "${{ github.repository }}" }
           gh release view $tag --repo $releaseRepository 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag ServerControl-Setup.zip ServerControl-Update.zip --repo $releaseRepository --clobber
+            gh release upload $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --clobber
           } else {
-            gh release create $tag ServerControl-Setup.zip ServerControl-Update.zip --repo $releaseRepository --title $tag --generate-notes
+            gh release create $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --title $tag --generate-notes
           }

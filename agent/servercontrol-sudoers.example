@@ -1,9 +1,10 @@
 # Install as /etc/sudoers.d/servercontrol with mode 0440 after checking paths.
 # It deliberately grants only the operations used by the agent.  If your
 # Minecraft service has a different name, replace every occurrence below.
-Cmnd_Alias SERVER_CONTROL_MINECRAFT = \
-  /usr/bin/systemctl start dragonfyre.service, \
-  /usr/bin/systemctl stop dragonfyre.service, \
-  /usr/bin/systemctl restart dragonfyre.service
+# The wildcard only reaches a root-owned helper. The helper requires exactly
+# ACTION + UNIT and independently checks the local config/profile allow-list,
+# avoiding sudoers wildcards over arbitrary systemctl argument strings.
+Cmnd_Alias SERVER_CONTROL_SERVICES = /usr/local/sbin/server-control-service-control *
 Cmnd_Alias SERVER_CONTROL_POWER = /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff
-servercontrol ALL=(root) NOPASSWD: SERVER_CONTROL_MINECRAFT, SERVER_CONTROL_POWER
+Cmnd_Alias SERVER_CONTROL_UPDATE = /usr/local/sbin/server-control-agent-update --version *
+servercontrol ALL=(root) NOPASSWD: SERVER_CONTROL_SERVICES, SERVER_CONTROL_POWER, SERVER_CONTROL_UPDATE

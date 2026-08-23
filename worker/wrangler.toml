@@ -2,9 +2,18 @@ name = "server-control-hub"
 main = "src/index.js"
 compatibility_date = "2026-08-14"
 
+[triggers]
+crons = ["* * * * *"]
+
 # Create a D1 database named server-control and replace the placeholder below.
 [[d1_databases]]
 binding = "DB"
 database_name = "server-control"
-database_id = "111c6398-9f08-4109-b510-1c799078c6c0"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
 
+# Required by the chunked upload/download manager. The bucket keeps large
+# archives out of D1 and is private; every transfer is authorized by Worker.
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "server-control-files"
+preview_bucket_name = "server-control-files-preview"

@@ -7,14 +7,18 @@ After=network-online.target
 Type=simple
 User=servercontrol
 Group=servercontrol
-ExecStart=/usr/bin/python3 /opt/server-control/server_control_agent.py --config /etc/server-control/agent-config.json
+UMask=0007
+ExecStart=/usr/bin/python3 /opt/server-control/current/server_control_agent.py --config /etc/server-control/agent-config.json
 Restart=always
 RestartSec=5
-NoNewPrivileges=true
+# The Agent can elevate only the exact commands listed in
+# /etc/sudoers.d/servercontrol. Enabling NoNewPrivileges would also block that
+# allow-list and make safe stop/reboot/update silently fail.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/opt/minecraft/dragonfyre/logs
+ReadWritePaths=/opt/minecraft /srv/server-control/backups /var/lib/server-control /opt/server-control
 
 [Install]
 WantedBy=multi-user.target

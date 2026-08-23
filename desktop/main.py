@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
-"""Windows desktop client for Server Control."""
+"""Server Control desktop entry point.
+
+Authentication and self-update stay deliberately small here. The connected
+control panel and its pages live in separate modules so background work never
+blocks Tk's main thread.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
+import tempfile
 import threading
-import time
+import queue
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
-from api import ApiClient, ApiError
+from api import ApiClient
+from control_panel import ControlPanel
+from state import LocalPreferences
 from updater import download_update, is_newer, latest_release, launch_updater
+from widgets import (
+    display_bytes,
+    display_duration,
+    display_percent,
+    enable_clipboard_paste,
+    is_legacy_agent_network_error,
+    is_rcon_lifecycle_message,
+    minecraft_completion_candidates,
+    numeric_value,
+    replace_minecraft_completion,
+)
 
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "1.0.0"
 APP_TITLE = "Server Control"
-STATUS_POLL_INTERVAL_MS = 1_000
-SERVER_LOG_POLL_INTERVAL_SECONDS = 5
-MINECRAFT_LOG_POLL_INTERVAL_SECONDS = 1
-ALL_PERMISSIONS = [
-    ("power_view", "Видеть питание"),
-    ("power_control", "Управлять питанием"),
-    ("server_view", "Видеть Linux-консоль"),
-    ("server_command", "Отправлять Linux-команды"),
-    ("minecraft_view", "Видеть консоль Minecraft"),
-    ("minecraft_command", "Управлять Minecraft"),
-]
 
 
 class ConfigurationError(RuntimeError):
@@ -40,1438 +48,315 @@ def application_directory() -> Path:
     return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
 
+def preferences_path() -> Path:
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or application_directory()) / "ServerControl"
+    else:
+        root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "server-control"
+    return root / "ui-preferences.json"
+
+
 def load_configuration() -> dict[str, Any]:
     path = application_directory() / "server-control.json"
     if not path.is_file():
         raise ConfigurationError(
-            "Не найден файл server-control.json рядом с программой. "
-            "Скопируйте server-control.json.example и укажите адрес Worker."
+            "Не найден server-control.json рядом с программой. "
+            "Скопируйте server-control.json.example и укажите HTTPS-адрес Worker."
         )
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ConfigurationError(f"Не удалось прочитать server-control.json: {error}") from error
     url = config.get("api_base_url")
     if not isinstance(url, str) or not url.startswith("https://") or "YOUR-SUBDOMAIN" in url:
-        raise ConfigurationError("В server-control.json укажите реальный HTTPS-адрес Cloudflare Worker.")
+        raise ConfigurationError("В server-control.json нужен реальный HTTPS-адрес Cloudflare Worker.")
     return config
-
-
-def enable_clipboard_paste(entry: ttk.Entry) -> ttk.Entry:
-    """Make Windows paste shortcuts work even with a non-English keyboard layout."""
-
-    def paste(event: tk.Event) -> str:
-        try:
-            value = event.widget.clipboard_get()
-        except tk.TclError:
-            return "break"
-        try:
-            event.widget.delete("sel.first", "sel.last")
-        except tk.TclError:
-            pass
-        event.widget.insert(tk.INSERT, value)
-        return "break"
-
-    def paste_from_ctrl(event: tk.Event) -> str | None:
-        # On a Russian layout Tk can report Ctrl+V as Cyrillic "м".  Windows
-        # still supplies virtual-key code 86, which is the physical V key.
-        if event.keycode == 86 or str(event.keysym).lower() in {"v", "cyrillic_em"}:
-            return paste(event)
-        return None
-
-    entry.bind("<<Paste>>", paste)
-    entry.bind("<Control-KeyPress>", paste_from_ctrl, add="+")
-    entry.bind("<Shift-Insert>", paste)
-    return entry
-
-
-def numeric_value(value: Any) -> float | None:
-    """Return a finite UI number without letting malformed agent data crash Tk."""
-
-    if isinstance(value, bool):
-        return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if result >= 0 else None
-
-
-def display_bytes(value: Any, *, per_second: bool = False) -> str:
-    amount = numeric_value(value)
-    if amount is None:
-        return "—"
-    suffix = "/с" if per_second else ""
-    units = ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ")
-    index = 0
-    while amount >= 1024 and index < len(units) - 1:
-        amount /= 1024
-        index += 1
-    precision = 0 if index == 0 or amount >= 100 else 1
-    return f"{amount:.{precision}f} {units[index]}{suffix}"
-
-
-def display_duration(value: Any) -> str:
-    seconds = numeric_value(value)
-    if seconds is None:
-        return "—"
-    total = int(seconds)
-    days, remainder = divmod(total, 86_400)
-    hours, remainder = divmod(remainder, 3_600)
-    minutes, seconds = divmod(remainder, 60)
-    if days:
-        return f"{days} д {hours} ч"
-    if hours:
-        return f"{hours} ч {minutes} мин"
-    if minutes:
-        return f"{minutes} мин {seconds} с"
-    return f"{seconds} с"
-
-
-def display_percent(value: Any) -> tuple[float, str]:
-    number = numeric_value(value)
-    if number is None:
-        return 0.0, "—"
-    bounded = max(0.0, min(100.0, number))
-    return bounded, f"{bounded:.1f}%"
-
-
-def is_rcon_lifecycle_message(message: str) -> bool:
-    """Recognize old RCON connection bookkeeping already stored in D1."""
-
-    lowered = message.casefold()
-    return (
-        "thread rcon client" in lowered
-        and ("rcon listener" in lowered or "rcon client" in lowered)
-        and (" started" in lowered or " shutting down" in lowered)
-    )
-
-
-def is_legacy_agent_network_error(message: str) -> bool:
-    """Recognize pre-1.2.1 transient network errors that used to repeat."""
-
-    lowered = message.casefold()
-    return message.startswith("[agent] Ошибка:") and any(
-        marker in lowered
-        for marker in ("hub unavailable", "temporary failure in name resolution", "read operation timed out")
-    )
-
-
-# Minecraft's RCON protocol does not expose the game client's Brigadier tab
-# completion API.  These high-value fallbacks make the remote console feel
-# close to the in-game chat: command names, online players, selectors and the
-# most useful vanilla arguments.  The agent additionally learns root commands
-# from ``help`` so commands supplied by the current modpack also appear.
-DEFAULT_MINECRAFT_COMMANDS = (
-    "advancement", "attribute", "ban", "ban-ip", "banlist", "bossbar", "clear", "clone", "damage", "data",
-    "datapack", "debug", "defaultgamemode", "difficulty", "effect", "enchant", "execute", "experience", "fill",
-    "fillbiome", "forceload", "function", "gamemode", "gamerule", "give", "help", "item", "jfr", "kick", "kill",
-    "list", "locate", "loot", "me", "msg", "op", "pardon", "pardon-ip", "particle", "place", "playsound",
-    "publish", "random", "recipe", "reload", "ride", "save-all", "save-off", "save-on", "say", "schedule",
-    "scoreboard", "seed", "setblock", "setidletimeout", "setworldspawn", "spawnpoint", "spectate", "spreadplayers",
-    "stop", "stopsound", "summon", "tag", "team", "teammsg", "teleport", "tell", "tellraw", "time", "title", "tm",
-    "tp", "trigger", "weather", "whitelist", "worldborder", "xp",
-)
-MINECRAFT_SELECTORS = ("@a", "@e", "@p", "@r", "@s")
-MINECRAFT_GAMERULES = (
-    "announceAdvancements", "commandBlockOutput", "disableElytraMovementCheck", "disableRaids", "doDaylightCycle",
-    "doEntityDrops", "doFireTick", "doImmediateRespawn", "doInsomnia", "doLimitedCrafting", "doMobLoot", "doMobSpawning",
-    "doPatrolSpawning", "doTileDrops", "doTraderSpawning", "doWeatherCycle", "drowningDamage", "fallDamage", "fireDamage",
-    "forgiveDeadPlayers", "freezeDamage", "keepInventory", "lavaSourceConversion", "logAdminCommands", "maxCommandChainLength",
-    "maxEntityCramming", "mobExplosionDropDecay", "mobGriefing", "naturalRegeneration", "playersSleepingPercentage",
-    "projectilesCanBreakBlocks", "randomTickSpeed", "reducedDebugInfo", "sendCommandFeedback", "showDeathMessages",
-    "snowAccumulationHeight", "spawnRadius", "spectatorsGenerateChunks", "tntExplosionDropDecay", "universalAnger",
-    "waterSourceConversion",
-)
-
-
-def _unique_sorted(values: list[str] | tuple[str, ...]) -> list[str]:
-    return sorted({str(value).strip() for value in values if str(value).strip()}, key=str.casefold)
-
-
-def minecraft_completion_candidates(value: str, command_names: list[str], players: list[str]) -> list[str]:
-    """Return context-aware suggestions for the remote Minecraft command field."""
-
-    text = value.lstrip()
-    has_slash = text.startswith("/")
-    raw = text[1:] if has_slash else text
-    ends_with_space = raw.endswith(" ")
-    tokens = raw.split()
-
-    # Completing the root command.
-    if not tokens or (len(tokens) == 1 and not ends_with_space):
-        partial = tokens[0] if tokens else ""
-        roots = _unique_sorted([*DEFAULT_MINECRAFT_COMMANDS, *command_names])
-        prefix = "/" if has_slash else ""
-        return [f"{prefix}{name}" for name in roots if name.casefold().startswith(partial.casefold())][:12]
-
-    command = tokens[0].casefold()
-    arguments = tokens[1:]
-    index = len(arguments) if ends_with_space else len(arguments) - 1
-    partial = "" if ends_with_space else arguments[-1]
-    targets = _unique_sorted([*players, *MINECRAFT_SELECTORS])
-
-    options: list[str] = []
-    if command in {"ban", "clear", "deop", "effect", "enchant", "experience", "give", "kick", "kill", "msg", "op", "pardon", "recipe", "spawnpoint", "spectate", "tag", "teammsg", "teleport", "tell", "tp", "xp"}:
-        options = targets
-    if command in {"gamemode", "defaultgamemode"}:
-        options = ["survival", "creative", "adventure", "spectator"] if index == 0 else targets
-    elif command == "difficulty":
-        options = ["peaceful", "easy", "normal", "hard"]
-    elif command == "weather":
-        options = ["clear", "rain", "thunder"]
-    elif command == "time":
-        options = ["set", "add", "query"] if index == 0 else ["day", "night", "noon", "midnight"]
-    elif command in {"tell", "msg", "w", "teammsg"}:
-        options = targets if index == 0 else []
-    elif command == "whitelist":
-        options = ["on", "off", "list", "add", "remove", "reload"] if index == 0 else targets
-    elif command == "gamerule":
-        options = list(MINECRAFT_GAMERULES) if index == 0 else ["true", "false"]
-    elif command == "execute":
-        options = ["as", "at", "positioned", "rotated", "facing", "align", "anchored", "in", "if", "unless", "store", "run"]
-    elif command == "scoreboard":
-        options = ["objectives", "players"] if index == 0 else ["add", "remove", "setdisplay", "list"]
-    elif command == "team":
-        options = ["add", "empty", "join", "leave", "list", "modify", "remove"] if index == 0 else []
-    elif command == "datapack":
-        options = ["enable", "disable", "list"]
-    elif command == "save-all":
-        options = ["flush"]
-
-    return [option for option in _unique_sorted(options) if option.casefold().startswith(partial.casefold())][:12]
-
-
-def replace_minecraft_completion(value: str, completion: str) -> str:
-    """Replace only the word under the caret; command field has no mid-text edits."""
-
-    if not value or value.endswith(" "):
-        return f"{value}{completion}"
-    before, separator, _current = value.rpartition(" ")
-    return f"{before}{separator}{completion}" if separator else completion
-
-
-class MinecraftCommandInput(ttk.Frame):
-    """Entry with Minecraft-like Tab completion, list navigation and history."""
-
-    def __init__(
-        self,
-        parent: tk.Misc,
-        *,
-        candidates: Callable[[str], list[str]],
-        submit: Callable[[str], None],
-    ) -> None:
-        super().__init__(parent)
-        self._candidates = candidates
-        self._submit = submit
-        self._matches: list[str] = []
-        self._history: list[str] = []
-        self._history_index: int | None = None
-        self._suggestions_visible = False
-
-        row = ttk.Frame(self)
-        row.pack(fill="x")
-        ttk.Label(row, text=">").pack(side="left", padx=(0, 6))
-        self.entry = enable_clipboard_paste(ttk.Entry(row))
-        self.entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Отправить", command=self.submit).pack(side="left", padx=(8, 0))
-
-        self.listbox = tk.Listbox(
-            self,
-            height=6,
-            exportselection=False,
-            activestyle="none",
-            background="#1a2229",
-            foreground="#e6eef5",
-            selectbackground="#315a7d",
-            selectforeground="#ffffff",
-            relief="solid",
-            borderwidth=1,
-        )
-        self.listbox.bind("<ButtonRelease-1>", self._choose_with_mouse)
-        self.entry.bind("<KeyRelease>", self._on_key_release, add="+")
-        self.entry.bind("<Tab>", self._on_tab)
-        self.entry.bind("<Return>", self._on_return)
-        self.entry.bind("<Up>", self._on_up)
-        self.entry.bind("<Down>", self._on_down)
-        self.entry.bind("<Escape>", lambda _event: self._hide_suggestions() or "break")
-
-    def focus_set(self) -> None:
-        self.entry.focus_set()
-
-    def submit(self) -> None:
-        value = self.entry.get().strip()
-        if not value:
-            return
-        if not self._history or self._history[-1] != value:
-            self._history.append(value)
-            self._history = self._history[-100:]
-        self._history_index = None
-        self.entry.delete(0, "end")
-        self._hide_suggestions()
-        self._submit(value)
-        self.entry.focus_set()
-
-    def _on_key_release(self, event: tk.Event) -> None:
-        if event.keysym in {"Tab", "Return", "Up", "Down", "Escape", "Shift_L", "Shift_R", "Control_L", "Control_R"}:
-            return
-        self._history_index = None
-        self._refresh_suggestions()
-
-    def _on_tab(self, _event: tk.Event) -> str:
-        if not self._suggestions_visible:
-            self._refresh_suggestions()
-        if self._matches:
-            selection = self.listbox.curselection()
-            index = int(selection[0]) if selection else 0
-            self._apply_completion(index)
-        return "break"
-
-    def _on_return(self, _event: tk.Event) -> str:
-        self.submit()
-        return "break"
-
-    def _on_up(self, _event: tk.Event) -> str:
-        if self._suggestions_visible:
-            self._move_selection(-1)
-        else:
-            self._move_history(-1)
-        return "break"
-
-    def _on_down(self, _event: tk.Event) -> str:
-        if self._suggestions_visible:
-            self._move_selection(1)
-        else:
-            self._move_history(1)
-        return "break"
-
-    def _refresh_suggestions(self) -> None:
-        self._matches = self._candidates(self.entry.get())
-        if not self._matches:
-            self._hide_suggestions()
-            return
-        self.listbox.delete(0, "end")
-        for value in self._matches:
-            self.listbox.insert("end", value)
-        self.listbox.selection_set(0)
-        self.listbox.activate(0)
-        if not self._suggestions_visible:
-            self.listbox.pack(fill="x", pady=(4, 0))
-            self._suggestions_visible = True
-
-    def _hide_suggestions(self) -> None:
-        if self._suggestions_visible:
-            self.listbox.pack_forget()
-        self._suggestions_visible = False
-        self._matches = []
-
-    def _move_selection(self, offset: int) -> None:
-        if not self._matches:
-            return
-        selection = self.listbox.curselection()
-        current = int(selection[0]) if selection else 0
-        next_index = (current + offset) % len(self._matches)
-        self.listbox.selection_clear(0, "end")
-        self.listbox.selection_set(next_index)
-        self.listbox.activate(next_index)
-        self.listbox.see(next_index)
-
-    def _move_history(self, offset: int) -> None:
-        if not self._history:
-            return
-        if self._history_index is None:
-            self._history_index = len(self._history)
-        self._history_index = max(0, min(len(self._history), self._history_index + offset))
-        value = "" if self._history_index == len(self._history) else self._history[self._history_index]
-        self.entry.delete(0, "end")
-        self.entry.insert(0, value)
-        self.entry.icursor("end")
-
-    def _choose_with_mouse(self, _event: tk.Event) -> None:
-        selection = self.listbox.curselection()
-        if selection:
-            self._apply_completion(int(selection[0]))
-        self.entry.focus_set()
-
-    def _apply_completion(self, index: int) -> None:
-        if not (0 <= index < len(self._matches)):
-            return
-        current = self.entry.get()
-        self.entry.delete(0, "end")
-        self.entry.insert(0, replace_minecraft_completion(current, self._matches[index]))
-        self.entry.icursor("end")
-        self._refresh_suggestions()
 
 
 class ServerControlApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"{APP_TITLE} {APP_VERSION}")
-        self.root.geometry("1160x780")
-        self.root.minsize(900, 620)
+        self.root.minsize(1024, 680)
         self.root.option_add("*tearOff", False)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-
-        self.config: dict[str, Any] = {}
+        self.closed = False
+        self.update_in_progress = False
+        self.panel: ControlPanel | None = None
+        self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self.api: ApiClient | None = None
         self.user: dict[str, Any] | None = None
-        self.server_log_after = 0
-        self.minecraft_log_after = 0
-        self.server_logs_initialized = False
-        self.minecraft_logs_initialized = False
-        self.safe_power_off_pending = False
-        self.power_polling = False
-        self.status_polling = False
-        self.server_logs_polling = False
-        self.minecraft_logs_polling = False
-        self.poll_after_id: str | None = None
-        self.next_server_log_poll_at = 0.0
-        self.next_minecraft_log_poll_at = 0.0
-        self.update_in_progress = False
-        self.closed = False
-        self.user_cache: dict[str, dict[str, Any]] = {}
-        self.minecraft_command_names: list[str] = []
-        self.minecraft_players: list[str] = []
-
-        self.status_var = tk.StringVar(value="Подготовка…")
-        self.power_var = tk.StringVar(value="Питание сервера: неизвестно")
-        self.server_state_var = tk.StringVar(value="Домашний сервер: неизвестно")
-        self.minecraft_state_var = tk.StringVar(value="Minecraft: неизвестно")
-        self.dashboard_server_info_var = tk.StringVar(value="Ожидаю первый отчёт агента…")
-        self.dashboard_cpu_var = tk.StringVar(value="CPU: —")
-        self.dashboard_memory_var = tk.StringVar(value="Память: —")
-        self.dashboard_disk_var = tk.StringVar(value="Диск /: —")
-        self.dashboard_network_var = tk.StringVar(value="Сеть: —")
-        self.dashboard_disk_io_var = tk.StringVar(value="Диск I/O: —")
-        self.dashboard_temperature_var = tk.StringVar(value="Температура: —")
-        self.dashboard_minecraft_var = tk.StringVar(value="Minecraft: ожидаю состояние…")
-        self.dashboard_players_var = tk.StringVar(value="Игроки: —")
-        self.dashboard_cpu_progress_var = tk.DoubleVar(value=0)
-        self.dashboard_memory_progress_var = tk.DoubleVar(value=0)
-        self.dashboard_disk_progress_var = tk.DoubleVar(value=0)
-        self.dashboard_minecraft_progress_var = tk.DoubleVar(value=0)
-
-        self._configure_style()
+        self.preferences = LocalPreferences(preferences_path())
+        geometry = str(self.preferences.get("window_geometry", "1280x820"))
+        try:
+            self.root.geometry(geometry)
+        except tk.TclError:
+            self.root.geometry("1280x820")
+        self._configure_style(str(self.preferences.get("theme", "dark")))
+        self.root.after(30, self._drain_ui_queue)
         try:
             self.config = load_configuration()
             self.api = ApiClient(str(self.config["api_base_url"]))
             self.show_login()
+            self.root.after(1200, self._mark_update_healthy)
         except ConfigurationError as error:
+            self.config = {}
             self.show_configuration_error(str(error))
 
-    def _configure_style(self) -> None:
+    def _configure_style(self, theme: str) -> None:
+        dark = theme != "light"
+        colors = {
+            "bg": "#10171d" if dark else "#f4f6f8",
+            "panel": "#172129" if dark else "#ffffff",
+            "sidebar": "#0b1116" if dark else "#e8edf2",
+            "text": "#e6eef5" if dark else "#17212b",
+            "muted": "#91a0ad" if dark else "#5f6b7a",
+            "accent": "#3f8cff",
+            "danger": "#ff6b6b" if dark else "#a61b1b",
+            "warning": "#ffd166" if dark else "#8a5a00",
+        }
+        self.root.configure(background=colors["bg"])
         style = ttk.Style(self.root)
         try:
-            style.theme_use("vista" if sys.platform == "win32" else "clam")
+            style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
-        style.configure("Subtle.TLabel", foreground="#5f6b7a")
-        style.configure("Card.TLabelframe", padding=14)
-        style.configure("Danger.TButton", foreground="#9b1c1c")
+        style.configure(".", background=colors["bg"], foreground=colors["text"], fieldbackground=colors["panel"], font=("Segoe UI", 10))
+        style.configure("TFrame", background=colors["bg"])
+        style.configure("TLabelframe", background=colors["bg"], foreground=colors["text"], bordercolor="#34424d")
+        style.configure("TLabelframe.Label", background=colors["bg"], foreground=colors["text"], font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background=colors["bg"], foreground=colors["text"])
+        style.configure("Subtle.TLabel", foreground=colors["muted"])
+        style.configure("Warning.TLabel", foreground=colors["warning"])
+        style.configure("Connection.TLabel", foreground="#63e6be")
+        style.configure("Sidebar.TFrame", background=colors["sidebar"])
+        style.configure("SidebarTitle.TLabel", background=colors["sidebar"], foreground=colors["text"], font=("Segoe UI", 15, "bold"))
+        style.configure("SidebarSubtle.TLabel", background=colors["sidebar"], foreground=colors["muted"])
+        style.configure("Nav.TButton", anchor="w", padding=(10, 7), background=colors["sidebar"], foreground=colors["text"], borderwidth=0)
+        style.map("Nav.TButton", background=[("active", "#23313c")])
+        style.configure("TButton", padding=(9, 5), background=colors["panel"], foreground=colors["text"])
+        style.configure("Danger.TButton", foreground=colors["danger"])
+        style.configure("TEntry", padding=5, fieldbackground=colors["panel"], foreground=colors["text"], insertcolor=colors["text"])
+        style.configure("TCombobox", padding=4, fieldbackground=colors["panel"], foreground=colors["text"])
+        style.configure("Treeview", background=colors["panel"], fieldbackground=colors["panel"], foreground=colors["text"], rowheight=25)
+        style.configure("Treeview.Heading", background="#25323c" if dark else "#e1e7ec", foreground=colors["text"], padding=5)
+        style.map("Treeview", background=[("selected", colors["accent"])], foreground=[("selected", "#ffffff")])
+        style.configure("TNotebook", background=colors["bg"])
+        style.configure("TNotebook.Tab", padding=(12, 6), background=colors["panel"], foreground=colors["text"])
+        style.map("TNotebook.Tab", background=[("selected", colors["accent"])], foreground=[("selected", "#ffffff")])
+        style.configure("Horizontal.TProgressbar", troughcolor=colors["panel"], background=colors["accent"])
 
     def clear(self) -> None:
+        if self.panel:
+            self.panel.close()
+            self.panel = None
         for child in self.root.winfo_children():
             child.destroy()
 
     def show_configuration_error(self, text: str) -> None:
         self.clear()
         frame = ttk.Frame(self.root, padding=40)
-        frame.pack(expand=True, fill="both")
-        ttk.Label(frame, text="Нужно настроить подключение", style="Title.TLabel").pack(anchor="w", pady=(0, 18))
-        ttk.Label(frame, text=text, wraplength=700, justify="left").pack(anchor="w")
-        ttk.Label(
-            frame,
-            text="После заполнения файла перезапустите программу.",
-            style="Subtle.TLabel",
-        ).pack(anchor="w", pady=(16, 0))
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Нужно настроить подключение", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(frame, text=text, wraplength=760).pack(anchor="w", pady=16)
+        ttk.Label(frame, text=f"Ожидаемый файл: {application_directory() / 'server-control.json'}", style="Subtle.TLabel").pack(anchor="w")
 
     def show_login(self) -> None:
         self.clear()
         frame = ttk.Frame(self.root, padding=40)
-        frame.place(relx=0.5, rely=0.5, anchor="center")
-        ttk.Label(frame, text="Server Control", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(frame, text="Управление домашним сервером", style="Subtle.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(0, 24)
-        )
-        ttk.Label(frame, text="Логин").grid(row=2, column=0, sticky="w", pady=4)
-        self.login_username = enable_clipboard_paste(ttk.Entry(frame, width=34))
-        self.login_username.grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Label(frame, text="Пароль").grid(row=3, column=0, sticky="w", pady=4)
-        self.login_password = enable_clipboard_paste(ttk.Entry(frame, width=34, show="•"))
-        self.login_password.grid(row=3, column=1, sticky="ew", pady=4)
-        self.login_password.bind("<Return>", lambda _event: self.login())
-        self.login_button = ttk.Button(frame, text="Войти", command=self.login)
-        self.login_button.grid(row=4, column=1, sticky="e", pady=(16, 4))
-        ttk.Button(frame, text="Первичная настройка", command=self.show_bootstrap_dialog).grid(
-            row=5, column=1, sticky="e", pady=(2, 0)
-        )
-        ttk.Label(frame, textvariable=self.status_var, style="Subtle.TLabel", wraplength=380).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(18, 0)
-        )
-        frame.columnconfigure(1, weight=1)
-        self.login_username.focus_set()
-        self.status_var.set(f"Версия клиента: {APP_VERSION}")
-        self.root.after(800, self.check_for_updates)
+        frame.place(relx=0.5, rely=0.46, anchor="center")
+        ttk.Label(frame, text="Server Control", font=("Segoe UI", 24, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(frame, text=f"Безопасное управление Debian и Minecraft · {APP_VERSION}", style="Subtle.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 20))
+        username = tk.StringVar()
+        password = tk.StringVar()
+        status = tk.StringVar()
+        ttk.Label(frame, text="Логин").grid(row=2, column=0, sticky="w", pady=5)
+        username_entry = enable_clipboard_paste(ttk.Entry(frame, textvariable=username, width=36))
+        username_entry.grid(row=2, column=1, sticky="ew", pady=5)
+        ttk.Label(frame, text="Пароль").grid(row=3, column=0, sticky="w", pady=5)
+        password_entry = enable_clipboard_paste(ttk.Entry(frame, textvariable=password, show="•", width=36))
+        password_entry.grid(row=3, column=1, sticky="ew", pady=5)
+        ttk.Label(frame, textvariable=status, style="Warning.TLabel", wraplength=440).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
+        button = ttk.Button(frame, text="Войти")
+        button.grid(row=5, column=1, sticky="e", pady=(12, 0))
+        ttk.Button(frame, text="Первоначальная настройка", command=self.show_setup).grid(row=5, column=0, sticky="w", pady=(12, 0))
 
-    def show_bootstrap_dialog(self) -> None:
+        def submit(_event: tk.Event | None = None) -> None:
+            if not username.get().strip() or not password.get():
+                status.set("Введите логин и пароль.")
+                return
+            button.configure(state="disabled")
+            status.set("Вход…")
+
+            def success(result: dict[str, Any]) -> None:
+                self.user = result.get("user") if isinstance(result.get("user"), dict) else {}
+                self.show_panel()
+
+            def failure(error: Exception) -> None:
+                button.configure(state="normal")
+                status.set(str(error))
+
+            self.async_call(lambda: self.require_api().login(username.get().strip(), password.get()), success, failure)
+
+        button.configure(command=submit)
+        password_entry.bind("<Return>", submit)
+        username_entry.focus_set()
+        frame.columnconfigure(1, weight=1)
+
+    def show_setup(self) -> None:
         dialog = tk.Toplevel(self.root)
-        dialog.title("Первичная настройка владельца")
+        dialog.title("Первоначальная настройка владельца")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.resizable(False, False)
         frame = ttk.Frame(dialog, padding=20)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Создать единственный аккаунт владельца", style="Title.TLabel").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
-        )
-        ttk.Label(
-            frame,
-            text="Эта форма работает только до создания первого аккаунта. Ключ не сохраняется на компьютере.",
-            wraplength=430,
-            style="Subtle.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 16))
-        fields: list[tuple[str, bool]] = [("Ключ первоначальной настройки", True), ("Логин владельца", False), ("Пароль владельца", True)]
-        entries: list[ttk.Entry] = []
-        for row, (label, sensitive) in enumerate(fields, start=2):
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
-            entry = enable_clipboard_paste(ttk.Entry(frame, width=42, show="•" if sensitive else ""))
-            entry.grid(row=row, column=1, sticky="ew", pady=4)
-            entries.append(entry)
+        variables = (tk.StringVar(), tk.StringVar(), tk.StringVar())
+        for row, (label, variable, secret) in enumerate((("BOOTSTRAP_KEY", variables[0], True), ("Логин владельца", variables[1], False), ("Пароль (от 12 символов)", variables[2], True))):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            enable_clipboard_paste(ttk.Entry(frame, textvariable=variable, show="•" if secret else "", width=36)).grid(row=row, column=1, sticky="ew", pady=5)
 
         def submit() -> None:
-            bootstrap_key, username, password = (entry.get() for entry in entries)
+            def success(result: dict[str, Any]) -> None:
+                dialog.destroy()
+                self.user = result.get("user") if isinstance(result.get("user"), dict) else {}
+                self.show_panel()
+
             self.async_call(
-                lambda: self.require_api().setup_owner(bootstrap_key, username, password),
-                lambda result: self._bootstrap_done(dialog, result),
-                context="Создание владельца",
+                lambda: self.require_api().setup_owner(variables[0].get(), variables[1].get().strip(), variables[2].get()),
+                success,
+                lambda error: messagebox.showerror("Настройка", str(error), parent=dialog),
             )
 
-        ttk.Button(frame, text="Создать владельца", command=submit).grid(row=5, column=1, sticky="e", pady=(16, 0))
+        ttk.Button(frame, text="Создать владельца", command=submit).grid(row=3, column=1, sticky="e", pady=(12, 0))
         frame.columnconfigure(1, weight=1)
-        entries[0].focus_set()
 
-    def _bootstrap_done(self, dialog: tk.Toplevel, result: dict[str, Any]) -> None:
-        dialog.destroy()
-        self.enter_application(result)
-
-    def login(self) -> None:
-        username = self.login_username.get()
-        password = self.login_password.get()
-        if not username or not password:
-            self.status_var.set("Введите логин и пароль.")
+    def show_panel(self) -> None:
+        if not self.user:
+            self.show_login()
             return
-        self.login_button.configure(state="disabled")
-        self.status_var.set("Выполняется вход…")
-
-        def success(result: dict[str, Any]) -> None:
-            self.enter_application(result)
-
-        def failure(error: Exception) -> None:
-            self.login_button.configure(state="normal")
-            self.status_var.set(str(error))
-
-        self.async_call(lambda: self.require_api().login(username, password), success, failure, context="Вход")
-
-    def enter_application(self, result: dict[str, Any]) -> None:
-        self.user = dict(result["user"])
-        self.server_log_after = 0
-        self.minecraft_log_after = 0
-        self.server_logs_initialized = False
-        self.minecraft_logs_initialized = False
-        self.power_polling = False
-        self.status_polling = False
-        self.server_logs_polling = False
-        self.minecraft_logs_polling = False
-        self.next_server_log_poll_at = 0.0
-        self.next_minecraft_log_poll_at = 0.0
-        self.minecraft_command_names = []
-        self.minecraft_players = []
         self.clear()
-
-        header = ttk.Frame(self.root, padding=(18, 14, 18, 8))
-        header.pack(fill="x")
-        ttk.Label(header, text="Server Control", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text=f"{self.user['username']} · {self.role_label()}", style="Subtle.TLabel").pack(
-            side="left", padx=16
+        self.panel = ControlPanel(
+            self.root,
+            api=self.require_api(),
+            user=self.user,
+            preferences=self.preferences,
+            logout=self.logout,
+            check_client_update=lambda: self.check_for_updates(manual=True),
+            client_version=APP_VERSION,
         )
-        ttk.Button(header, text="Выйти", command=self.logout).pack(side="right")
+        self.panel.pack(fill="both", expand=True)
+        self.root.after(1800, self.check_for_updates)
 
-        overview = ttk.Frame(self.root, padding=(18, 4, 18, 10))
-        overview.pack(fill="x")
-        self.build_power_card(overview)
-        self.build_status_card(overview)
-
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=18, pady=(0, 12))
-        self.build_dashboard_tab()
-        self.build_server_tab()
-        self.build_minecraft_tab()
-        if self.has_permission("user_manage"):
-            self.build_users_tab()
-
-        footer = ttk.Label(self.root, textvariable=self.status_var, style="Subtle.TLabel", padding=(18, 0, 18, 10))
-        footer.pack(fill="x")
-        self.status_var.set("Подключено. Статус обновляется автоматически.")
-        self.poll()
-
-    def build_power_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Питание сервера", style="Card.TLabelframe")
-        card.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Label(card, textvariable=self.power_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        button_row = ttk.Frame(card)
-        button_row.pack(anchor="w", pady=(10, 0))
-        if self.has_permission("power_control"):
-            ttk.Button(button_row, text="Включить", command=lambda: self.power_action("on")).pack(side="left")
-            ttk.Button(button_row, text="Безопасно выключить", command=lambda: self.power_action("off")).pack(side="left", padx=6)
-            if self.user and self.user.get("role") == "owner":
-                ttk.Button(button_row, text="Отключить сразу", style="Danger.TButton", command=self.force_power_off).pack(side="left")
-        elif self.has_permission("power_view"):
-            ttk.Label(card, text="У вас есть только просмотр состояния.", style="Subtle.TLabel").pack(anchor="w", pady=(8, 0))
-        else:
-            self.power_var.set("Питание сервера: доступ запрещён")
-
-    def build_status_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Состояние", style="Card.TLabelframe")
-        card.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        ttk.Label(card, textvariable=self.server_state_var).pack(anchor="w")
-        ttk.Label(card, textvariable=self.minecraft_state_var).pack(anchor="w", pady=(6, 0))
-
-    def build_dashboard_tab(self) -> None:
-        """The first tab is intentionally compact: it remains useful on 900px-wide screens."""
-
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text="Главная")
-
-        summary = ttk.LabelFrame(tab, text="Домашний сервер", style="Card.TLabelframe")
-        summary.pack(fill="x", pady=(0, 10))
-        ttk.Label(summary, textvariable=self.dashboard_server_info_var, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(
-            summary,
-            text="Показатели снимает агент на самом сервере; они не берутся из Windows-клиента.",
-            style="Subtle.TLabel",
-            wraplength=900,
-        ).pack(anchor="w", pady=(5, 0))
-
-        resources = ttk.LabelFrame(tab, text="Ресурсы", style="Card.TLabelframe")
-        resources.pack(fill="x", pady=(0, 10))
-        self.dashboard_metric(resources, 0, 0, "Процессор", self.dashboard_cpu_var, self.dashboard_cpu_progress_var)
-        self.dashboard_metric(resources, 0, 1, "Оперативная память", self.dashboard_memory_var, self.dashboard_memory_progress_var)
-        self.dashboard_metric(resources, 1, 0, "Диск", self.dashboard_disk_var, self.dashboard_disk_progress_var)
-        self.dashboard_metric(resources, 1, 1, "Сеть", self.dashboard_network_var)
-        self.dashboard_metric(resources, 2, 0, "Дисковые операции", self.dashboard_disk_io_var)
-        self.dashboard_metric(resources, 2, 1, "Температура", self.dashboard_temperature_var)
-        resources.columnconfigure(0, weight=1)
-        resources.columnconfigure(1, weight=1)
-
-        minecraft = ttk.LabelFrame(tab, text="Minecraft", style="Card.TLabelframe")
-        minecraft.pack(fill="x")
-        header = ttk.Frame(minecraft)
-        header.pack(fill="x")
-        ttk.Label(header, textvariable=self.dashboard_minecraft_var, font=("Segoe UI", 11, "bold")).pack(side="left")
-        ttk.Label(header, textvariable=self.dashboard_players_var).pack(side="right")
-        ttk.Progressbar(
-            minecraft,
-            maximum=100,
-            mode="determinate",
-            variable=self.dashboard_minecraft_progress_var,
-        ).pack(fill="x", pady=(8, 0))
-
-    @staticmethod
-    def dashboard_metric(
-        parent: ttk.LabelFrame,
-        row: int,
-        column: int,
-        label: str,
-        value: tk.StringVar,
-        progress: tk.DoubleVar | None = None,
-    ) -> None:
-        cell = ttk.Frame(parent, padding=(0, 0, 18 if column == 0 else 0, 10))
-        cell.grid(row=row, column=column, sticky="nsew")
-        ttk.Label(cell, text=label, style="Subtle.TLabel").pack(anchor="w")
-        ttk.Label(cell, textvariable=value, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(2, 0))
-        if progress is not None:
-            ttk.Progressbar(cell, maximum=100, mode="determinate", variable=progress).pack(fill="x", pady=(5, 0))
-
-    def build_server_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text="Домашний сервер")
-        if not self.has_permission("server_view"):
-            ttk.Label(tab, text="У вас нет доступа к Linux-консоли.", style="Subtle.TLabel").pack(anchor="w")
-            return
-
-        controls = ttk.Frame(tab)
-        controls.pack(fill="x", pady=(0, 8))
-        if self.has_permission("server_command"):
-            ttk.Button(controls, text="Статус", command=lambda: self.server_action("status")).pack(side="left")
-            if self.user and self.user.get("role") == "owner":
-                ttk.Button(controls, text="Бэкап", command=lambda: self.server_action("backup")).pack(side="left", padx=6)
-                ttk.Button(controls, text="Перезагрузить", command=lambda: self.server_action("reboot")).pack(side="left", padx=6)
-                ttk.Button(controls, text="Выключить Linux", command=lambda: self.server_action("shutdown")).pack(side="left", padx=6)
-        self.server_console = self.console_widget(tab)
-        if self.has_permission("server_command"):
-            entry_row = ttk.Frame(tab)
-            entry_row.pack(fill="x", pady=(8, 0))
-            ttk.Label(entry_row, text="Диагностика:").pack(side="left")
-            self.server_diagnostic_command = tk.StringVar(value="uptime")
-            self.server_diagnostic_box = ttk.Combobox(
-                entry_row,
-                textvariable=self.server_diagnostic_command,
-                values=("uptime", "free -h", "df -h", "lsblk"),
-                state="readonly",
-                width=20,
-            )
-            self.server_diagnostic_box.pack(side="left", padx=(8, 0))
-            ttk.Button(entry_row, text="Запустить", command=self.send_server_command).pack(side="left", padx=(8, 0))
-            ttk.Label(
-                tab,
-                text="Полный SSH-терминал специально не встроен. Разрешены только точные диагностические команды из allow-list агента; sudo, цепочки и перенаправления заблокированы.",
-                style="Subtle.TLabel",
-                wraplength=950,
-            ).pack(anchor="w", pady=(6, 0))
-
-    def build_minecraft_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text="Minecraft")
-        if not self.has_permission("minecraft_view"):
-            ttk.Label(tab, text="У вас нет доступа к Minecraft-консоли.", style="Subtle.TLabel").pack(anchor="w")
-            return
-
-        startup = ttk.LabelFrame(tab, text="Запуск Minecraft", style="Card.TLabelframe")
-        startup.pack(fill="x", pady=(0, 8))
-        startup_header = ttk.Frame(startup)
-        startup_header.pack(fill="x")
-        self.minecraft_startup_label_var = tk.StringVar(value="Ожидаю состояние Minecraft…")
-        self.minecraft_startup_detail_var = tk.StringVar(value="Прогресс появится при следующем запуске сервера.")
-        self.minecraft_startup_progress_var = tk.IntVar(value=0)
-        ttk.Label(startup_header, textvariable=self.minecraft_startup_label_var, font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Label(startup_header, textvariable=self.minecraft_startup_detail_var, style="Subtle.TLabel").pack(side="right")
-        self.minecraft_startup_progress = ttk.Progressbar(
-            startup,
-            maximum=100,
-            mode="determinate",
-            variable=self.minecraft_startup_progress_var,
-        )
-        self.minecraft_startup_progress.pack(fill="x", pady=(8, 0))
-
-        controls = ttk.Frame(tab)
-        controls.pack(fill="x", pady=(0, 8))
-        if self.has_permission("minecraft_command"):
-            for label, action in (("Запустить", "start"), ("Остановить", "stop"), ("Перезапустить", "restart"), ("Статус", "status")):
-                ttk.Button(controls, text=label, command=lambda action=action: self.minecraft_action(action)).pack(side="left", padx=(0, 6))
-        ttk.Label(
-            controls,
-            text="Живая консоль · обновление раз в секунду",
-            style="Subtle.TLabel",
-        ).pack(side="right")
-        self.minecraft_console = self.console_widget(tab)
-        if self.has_permission("minecraft_command"):
-            self.minecraft_command_input = MinecraftCommandInput(
-                tab,
-                candidates=self.minecraft_command_suggestions,
-                submit=self.send_minecraft_command,
-            )
-            self.minecraft_command_input.pack(fill="x", pady=(8, 0))
-            ttk.Label(
-                tab,
-                text="Tab — подсказки; ↑/↓ — выбрать подсказку или историю; Enter — отправить. Слэш в начале команды можно писать или не писать.",
-                style="Subtle.TLabel",
-                wraplength=950,
-            ).pack(anchor="w", pady=(6, 0))
-
-    def build_users_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text="Пользователи")
-        controls = ttk.Frame(tab)
-        controls.pack(fill="x", pady=(0, 8))
-        ttk.Button(controls, text="Обновить", command=self.refresh_users).pack(side="left")
-        ttk.Button(controls, text="Создать пользователя", command=self.show_create_user_dialog).pack(side="left", padx=6)
-        ttk.Button(controls, text="Включить / отключить", command=self.toggle_selected_user).pack(side="left", padx=6)
-        ttk.Button(controls, text="Сменить пароль", command=self.show_reset_password_dialog).pack(side="left", padx=6)
-        columns = ("username", "role", "enabled", "permissions", "last_login")
-        self.users_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="browse")
-        headings = {
-            "username": "Логин",
-            "role": "Роль",
-            "enabled": "Доступ",
-            "permissions": "Права",
-            "last_login": "Последний вход",
-        }
-        widths = {"username": 160, "role": 90, "enabled": 100, "permissions": 420, "last_login": 150}
-        for column in columns:
-            self.users_tree.heading(column, text=headings[column])
-            self.users_tree.column(column, width=widths[column], anchor="w")
-        self.users_tree.pack(fill="both", expand=True)
-        self.refresh_users()
-
-    @staticmethod
-    def console_widget(parent: ttk.Frame) -> tk.Text:
-        container = ttk.Frame(parent)
-        container.pack(fill="both", expand=True)
-        console = tk.Text(container, wrap="word", background="#101418", foreground="#d7e3ed", insertbackground="#ffffff")
-        console.tag_configure("warning", foreground="#f2c14e")
-        console.tag_configure("error", foreground="#ff7777")
-        console.tag_configure("command", foreground="#8bd5a2")
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=console.yview)
-        console.configure(yscrollcommand=scrollbar.set, state="disabled")
-        console.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        return console
-
-    def poll(self) -> None:
-        """Refresh compact status cards each second without blocking on logs."""
-        if self.closed or not self.user:
-            return
-
-        self._poll_power()
-        self._poll_server_status()
-        now = time.monotonic()
-        if now >= self.next_server_log_poll_at:
-            self.next_server_log_poll_at = now + SERVER_LOG_POLL_INTERVAL_SECONDS
-            self._poll_server_logs()
-        if now >= self.next_minecraft_log_poll_at:
-            self.next_minecraft_log_poll_at = now + MINECRAFT_LOG_POLL_INTERVAL_SECONDS
-            self._poll_minecraft_logs()
-        self._schedule_next_poll()
-
-    def _schedule_next_poll(self) -> None:
-        if self.closed or not self.user or self.poll_after_id is not None:
-            return
-        self.poll_after_id = self.root.after(STATUS_POLL_INTERVAL_MS, self._scheduled_poll)
-
-    def _scheduled_poll(self) -> None:
-        self.poll_after_id = None
-        self.poll()
-
-    def _poll_power(self) -> None:
-        if not self.has_permission("power_view") or self.power_polling:
-            return
-        self.power_polling = True
-
-        def success(result: dict[str, Any]) -> None:
-            self.power_polling = False
-            self.apply_poll_results({"power": result})
-
-        def failure(error: Exception) -> None:
-            self.power_polling = False
-            self.handle_poll_error(error, "Питание")
-
-        self.async_call(
-            lambda: self.require_api().request("GET", "/v1/power/status", timeout_seconds=7),
-            success,
-            failure,
-            context="Обновление питания",
-            quiet=True,
-        )
-
-    def _poll_server_status(self) -> None:
-        if not (self.has_permission("server_view") or self.has_permission("minecraft_view")) or self.status_polling:
-            return
-        self.status_polling = True
-
-        def success(result: dict[str, Any]) -> None:
-            self.status_polling = False
-            self.apply_poll_results({"status": result})
-
-        def failure(error: Exception) -> None:
-            self.status_polling = False
-            self.handle_poll_error(error, "Домашний сервер")
-
-        self.async_call(
-            lambda: self.require_api().request("GET", "/v1/server/status", timeout_seconds=7),
-            success,
-            failure,
-            context="Обновление состояния сервера",
-            quiet=True,
-        )
-
-    def _poll_server_logs(self) -> None:
-        if not self.has_permission("server_view") or self.server_logs_polling:
-            return
-        self.server_logs_polling = True
-        latest = "&latest=1" if not self.server_logs_initialized else ""
-
-        def success(result: dict[str, Any]) -> None:
-            self.server_logs_polling = False
-            self.apply_poll_results({"server_logs": result})
-
-        def failure(error: Exception) -> None:
-            self.server_logs_polling = False
-            self.handle_poll_error(error, "Linux-консоль")
-
-        self.async_call(
-            lambda: self.require_api().request(
-                "GET", f"/v1/server/logs?after={self.server_log_after}{latest}", timeout_seconds=7
-            ),
-            success,
-            failure,
-            context="Обновление Linux-консоли",
-            quiet=True,
-        )
-
-    def _poll_minecraft_logs(self) -> None:
-        if not self.has_permission("minecraft_view") or self.minecraft_logs_polling:
-            return
-        self.minecraft_logs_polling = True
-        latest = "&latest=1" if not self.minecraft_logs_initialized else ""
-
-        def success(result: dict[str, Any]) -> None:
-            self.minecraft_logs_polling = False
-            self.apply_poll_results({"minecraft_logs": result})
-
-        def failure(error: Exception) -> None:
-            self.minecraft_logs_polling = False
-            self.handle_poll_error(error, "Minecraft-консоль")
-
-        self.async_call(
-            lambda: self.require_api().request(
-                "GET", f"/v1/minecraft/logs?after={self.minecraft_log_after}{latest}", timeout_seconds=7
-            ),
-            success,
-            failure,
-            context="Обновление Minecraft-консоли",
-            quiet=True,
-        )
-
-    def handle_poll_error(self, error: Exception, source: str) -> None:
-        if isinstance(error, ApiError) and error.code in {"access_revoked", "invalid_session", "authentication_required"}:
-            self.handle_error(error, quiet=True)
-            return
-        if not self.closed:
-            self.status_var.set(f"{source}: временно нет ответа. Повторяю автоматически.")
-
-    def apply_poll_results(self, results: dict[str, Any]) -> None:
-        if "power" in results:
-            power = results["power"].get("power", {})
-            state = power.get("on")
-            readable = "включено" if state is True else "выключено" if state is False else "не удалось определить"
-            self.power_var.set(f"Питание сервера: {readable}")
-            if state is False:
-                self.safe_power_off_pending = False
-        if "status" in results:
-            status = results["status"]
-            online = bool(status.get("online"))
-            data = status.get("status") or {}
-            server = data.get("server") or {}
-            minecraft = data.get("minecraft") or {}
-            age_seconds = max(0, round(float(status.get("age_ms", 0)) / 1000))
-            freshness = f" · обновлено {age_seconds} с назад" if online else ""
-            self.server_state_var.set(
-                f"Домашний сервер: {'онлайн' if online else 'нет связи'} · {server.get('hostname', '—')}{freshness}"
-            )
-            self.apply_server_metrics(server)
-            self.apply_minecraft_status(online, minecraft)
-        if "server_logs" in results:
-            logs = results["server_logs"]
-            self.server_log_after = int(logs.get("next_after", self.server_log_after))
-            self.server_logs_initialized = True
-            if hasattr(self, "server_console"):
-                self.append_events(self.server_console, logs.get("events", []))
-        if "minecraft_logs" in results:
-            logs = results["minecraft_logs"]
-            self.minecraft_log_after = int(logs.get("next_after", self.minecraft_log_after))
-            self.minecraft_logs_initialized = True
-            if hasattr(self, "minecraft_console"):
-                self.append_events(self.minecraft_console, logs.get("events", []))
-
-    def apply_server_metrics(self, server: dict[str, Any]) -> None:
-        metrics = server.get("metrics") if isinstance(server.get("metrics"), dict) else None
-        if not metrics:
-            self.dashboard_server_info_var.set(
-                "Агент предыдущей версии: показатели появятся после обновления агента до 1.2.0."
-            )
-            return
-
-        hostname = str(server.get("hostname") or "домашний сервер")
-        uptime = display_duration(metrics.get("uptime_seconds"))
-        self.dashboard_server_info_var.set(f"{hostname} · работает {uptime}")
-
-        cpu = metrics.get("cpu") if isinstance(metrics.get("cpu"), dict) else {}
-        cpu_progress, cpu_text = display_percent(cpu.get("percent"))
-        self.dashboard_cpu_progress_var.set(cpu_progress)
-        loads = cpu.get("load_average") if isinstance(cpu.get("load_average"), list) else []
-        load_text = " · ".join(str(value) for value in loads[:3])
-        cpu_suffix = f" · load {load_text}" if load_text else ""
-        self.dashboard_cpu_var.set(f"{cpu_text}{cpu_suffix}")
-
-        memory = metrics.get("memory") if isinstance(metrics.get("memory"), dict) else {}
-        memory_progress, memory_text = display_percent(memory.get("percent"))
-        self.dashboard_memory_progress_var.set(memory_progress)
-        self.dashboard_memory_var.set(
-            f"{memory_text} · {display_bytes(memory.get('used_bytes'))} из {display_bytes(memory.get('total_bytes'))}"
-        )
-
-        filesystem = metrics.get("filesystem") if isinstance(metrics.get("filesystem"), dict) else {}
-        disk_progress, disk_text = display_percent(filesystem.get("percent"))
-        self.dashboard_disk_progress_var.set(disk_progress)
-        self.dashboard_disk_var.set(
-            f"{disk_text} · {display_bytes(filesystem.get('used_bytes'))} из {display_bytes(filesystem.get('total_bytes'))}"
-        )
-
-        network = metrics.get("network") if isinstance(metrics.get("network"), dict) else {}
-        self.dashboard_network_var.set(
-            f"↓ {display_bytes(network.get('rx_per_second'), per_second=True)} · ↑ {display_bytes(network.get('tx_per_second'), per_second=True)}"
-        )
-        disk_io = metrics.get("disk_io") if isinstance(metrics.get("disk_io"), dict) else {}
-        self.dashboard_disk_io_var.set(
-            f"чтение {display_bytes(disk_io.get('read_per_second'), per_second=True)} · запись {display_bytes(disk_io.get('write_per_second'), per_second=True)}"
-        )
-        temperature = numeric_value(metrics.get("temperature_celsius"))
-        self.dashboard_temperature_var.set(
-            f"{temperature:.1f} °C" if temperature is not None else "Датчик недоступен"
-        )
-
-    def apply_minecraft_status(self, online: bool, minecraft: dict[str, Any]) -> None:
-        startup = minecraft.get("startup") if isinstance(minecraft.get("startup"), dict) else {}
-        command_names = minecraft.get("command_names")
-        players = minecraft.get("players") if isinstance(minecraft.get("players"), dict) else {}
-        if isinstance(command_names, list):
-            self.minecraft_command_names = [str(name) for name in command_names if isinstance(name, str)]
-        names = players.get("names") if isinstance(players.get("names"), list) else []
-        self.minecraft_players = [str(name) for name in names if isinstance(name, str)]
-
-        if not online:
-            self.minecraft_state_var.set("Minecraft: нет связи с агентом")
-            self.dashboard_minecraft_var.set("Minecraft: нет связи с агентом")
-            self.dashboard_players_var.set("Игроки: —")
-            self.dashboard_minecraft_progress_var.set(0)
-            if hasattr(self, "minecraft_startup_label_var"):
-                self.minecraft_startup_label_var.set("Нет связи с домашним сервером")
-                self.minecraft_startup_detail_var.set("Ожидаю новый статус от агента")
-            return
-
-        active = bool(minecraft.get("active"))
-        phase = str(startup.get("phase", ""))
-        ready = bool(startup.get("ready"))
-        try:
-            progress = max(0, min(100, int(startup.get("progress", 100 if active else 0))))
-        except (TypeError, ValueError):
-            progress = 100 if active else 0
-        label = str(startup.get("label", "Сервер готов" if active else "Сервер остановлен"))
-        detail = str(startup.get("detail", ""))
-
-        if phase == "failed":
-            self.minecraft_state_var.set("Minecraft: ошибка запуска")
-        elif active and ready:
-            self.minecraft_state_var.set("Minecraft: запущен")
-        elif active:
-            self.minecraft_state_var.set(f"Minecraft: запускается · {progress}%")
-        else:
-            self.minecraft_state_var.set("Minecraft: остановлен")
-
-        player_online = players.get("online")
-        player_maximum = players.get("max")
-        if isinstance(player_online, int) and isinstance(player_maximum, int):
-            self.dashboard_players_var.set(f"Игроки: {player_online}/{player_maximum}")
-        else:
-            self.dashboard_players_var.set("Игроки: RCON ещё не ответил")
-        self.dashboard_minecraft_var.set(self.minecraft_state_var.get())
-        self.dashboard_minecraft_progress_var.set(progress)
-
-        if hasattr(self, "minecraft_startup_label_var"):
-            self.minecraft_startup_progress_var.set(progress)
-            self.minecraft_startup_label_var.set(f"{label} · {progress}%")
-            self.minecraft_startup_detail_var.set(detail or "Ожидаю следующую строку запуска")
-
-    def minecraft_command_suggestions(self, value: str) -> list[str]:
-        return minecraft_completion_candidates(value, self.minecraft_command_names, self.minecraft_players)
-
-    @staticmethod
-    def append_events(console: tk.Text, events: Any) -> None:
-        if not isinstance(events, list) or not events:
-            return
-        try:
-            was_at_bottom = float(console.yview()[1]) >= 0.995
-        except tk.TclError:
-            was_at_bottom = True
-        console.configure(state="normal")
-        legacy_network_notice_shown = bool(getattr(console, "_legacy_network_notice_shown", False))
-        for event in events:
-            if isinstance(event, dict):
-                message = str(event.get("message", ""))
-                if is_rcon_lifecycle_message(message):
-                    continue
-                if is_legacy_agent_network_error(message):
-                    if legacy_network_notice_shown:
-                        continue
-                    legacy_network_notice_shown = True
-                    message = (
-                        "[agent] Предупреждение: ранее связь с Control Hub временно прерывалась. "
-                        "Повторяющиеся старые сообщения скрыты."
-                    )
-                lower = message.casefold()
-                tag = ""
-                if any(marker in lower for marker in ("[error]", "exception", "failed", "ошибка")):
-                    tag = "error"
-                elif any(marker in lower for marker in ("[warn]", "warning", "предупреж")):
-                    tag = "warning"
-                elif message.startswith((">", "▶", "[RCON]")):
-                    tag = "command"
-                console.insert("end", f"{message}\n", tag)
-        setattr(console, "_legacy_network_notice_shown", legacy_network_notice_shown)
-        line_count = int(console.index("end-1c").split(".")[0])
-        if line_count > 1_500:
-            console.delete("1.0", f"{line_count - 1_000}.0")
-        if was_at_bottom:
-            console.see("end")
-        console.configure(state="disabled")
-
-    def power_action(self, state: str) -> None:
-        if state == "on":
-            self.command_request("POST", "/v1/power/action", {"state": state}, "Команда питания отправлена")
-            return
-
-        if self.safe_power_off_pending:
-            messagebox.showinfo(
-                "Безопасное выключение",
-                "Оно уже запрошено. Не нажимайте кнопку повторно: Minecraft может останавливаться до трёх минут.",
-            )
-            return
-        if not messagebox.askyesno(
-            "Безопасное выключение",
-            "Minecraft будет остановлен, данные синхронизированы, затем розетка отключит питание. Продолжить?",
-        ):
-            return
-
-        self.safe_power_off_pending = True
-        self.status_var.set("Безопасное выключение начато. Minecraft может останавливаться до трёх минут…")
-
-        def success(result: dict[str, Any]) -> None:
-            if result.get("already_pending"):
-                self.status_var.set("Безопасное выключение уже выполняется. Повторная команда не создана.")
-            else:
-                self.status_var.set("Безопасное выключение начато. Не нажимайте кнопку повторно.")
-            self.poll()
-
-        def failure(error: Exception) -> None:
-            self.safe_power_off_pending = False
-            self.handle_error(error, context="Безопасное выключение")
-
-        self.async_call(
-            lambda: self.require_api().request("POST", "/v1/power/action", {"state": "off"}),
-            success,
-            failure,
-            context="Безопасное выключение",
-        )
-
-    def force_power_off(self) -> None:
-        if not messagebox.askyesno(
-            "Принудительно отключить питание",
-            "Это немедленно выключит розетку и может повредить данные Minecraft. Продолжить?",
-            icon="warning",
-        ):
-            return
-        self.command_request("POST", "/v1/power/action", {"state": "off", "force": True}, "Питание отключено")
-
-    def server_action(self, action: str) -> None:
-        confirmations = {
-            "reboot": "Перезагрузить домашний сервер? Все активные процессы будут остановлены.",
-            "shutdown": "Выключить Linux-сервер? После этого включить его можно только через умную розетку.",
-        }
-        if action in confirmations and not messagebox.askyesno("Подтвердите действие", confirmations[action], icon="warning"):
-            return
-        self.command_request("POST", "/v1/server/action", {"action": action}, "Команда сервера поставлена в очередь")
-
-    def minecraft_action(self, action: str) -> None:
-        if action in {"stop", "restart"} and not messagebox.askyesno(
-            "Подтвердите действие", f"{action.capitalize()} Minecraft-сервер?", icon="warning"
-        ):
-            return
-        if action in {"start", "restart"} and hasattr(self, "minecraft_startup_label_var"):
-            self.minecraft_startup_progress_var.set(1)
-            self.minecraft_startup_label_var.set("Запуск запрошен · 1%")
-            self.minecraft_startup_detail_var.set("Ожидаю первые строки Forge")
-        self.command_request("POST", "/v1/minecraft/action", {"action": action}, "Команда Minecraft поставлена в очередь")
-
-    def send_server_command(self) -> None:
-        command = self.server_diagnostic_command.get().strip() if hasattr(self, "server_diagnostic_command") else ""
-        if not command:
-            return
-        self.command_request("POST", "/v1/server/command", {"command": command}, "Linux-команда поставлена в очередь")
-
-    def send_minecraft_command(self, command: str | None = None) -> None:
-        command = (command or "").strip()
-        if not command:
-            return
-        normalized = command.lstrip("/").strip()
-        if not normalized:
-            return
-        if hasattr(self, "minecraft_console"):
-            self.append_events(self.minecraft_console, [{"message": f"▶ /{normalized}"}])
-        self.status_var.set("Команда отправлена в быструю очередь Minecraft…")
-
-        def success(_result: dict[str, Any]) -> None:
-            self.status_var.set("Команда принята. Ответ появится в живой консоли.")
-            self._poll_minecraft_logs()
-
-        self.async_call(
-            lambda: self.require_api().request("POST", "/v1/minecraft/command", {"command": normalized}, timeout_seconds=7),
-            success,
-            context="Команда Minecraft",
-        )
-
-    def command_request(self, method: str, path: str, payload: dict[str, Any], success_message: str) -> None:
-        self.status_var.set("Отправка команды…")
-
-        def success(_result: dict[str, Any]) -> None:
-            self.status_var.set(success_message)
-            self.poll()
-
-        self.async_call(lambda: self.require_api().request(method, path, payload), success, context=success_message)
-
-    def refresh_users(self) -> None:
-        if not self.has_permission("user_manage"):
-            return
-
-        def success(result: dict[str, Any]) -> None:
-            users = result.get("users", [])
-            self.user_cache = {str(user["id"]): dict(user) for user in users if isinstance(user, dict) and "id" in user}
-            for child in self.users_tree.get_children():
-                self.users_tree.delete(child)
-            for user_id, user in self.user_cache.items():
-                permissions = ", ".join(user.get("permissions", []))
-                enabled = "включён" if user.get("enabled") else "отключён"
-                last_login = self.format_timestamp(user.get("last_login_at"))
-                self.users_tree.insert("", "end", iid=user_id, values=(user.get("username"), user.get("role"), enabled, permissions, last_login))
-
-        self.async_call(lambda: self.require_api().request("GET", "/v1/admin/users"), success, context="Получение пользователей")
-
-    def show_create_user_dialog(self) -> None:
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Создать пользователя")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        frame = ttk.Frame(dialog, padding=20)
-        frame.pack(fill="both", expand=True)
-        username = self.labeled_entry(frame, 0, "Логин")
-        password = self.labeled_entry(frame, 1, "Пароль (минимум 12 символов)", secret=True)
-        ttk.Label(frame, text="Роль").grid(row=2, column=0, sticky="w", pady=4)
-        role = tk.StringVar(value="user")
-        role_box = ttk.Combobox(frame, textvariable=role, values=("user", "admin"), state="readonly", width=28)
-        role_box.grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Label(frame, text="Права").grid(row=3, column=0, sticky="nw", pady=4)
-        permissions_frame = ttk.Frame(frame)
-        permissions_frame.grid(row=3, column=1, sticky="w", pady=4)
-        permission_values = {key: tk.BooleanVar(value=key in {"minecraft_view", "minecraft_command"}) for key, _ in ALL_PERMISSIONS}
-        for row, (key, label) in enumerate(ALL_PERMISSIONS):
-            ttk.Checkbutton(permissions_frame, text=label, variable=permission_values[key]).grid(row=row, column=0, sticky="w")
-
-        def apply_role_defaults(*_args: Any) -> None:
-            desired = {"minecraft_view", "minecraft_command"} if role.get() == "user" else {
-                "power_view", "power_control", "server_view", "server_command", "minecraft_view", "minecraft_command"
-            }
-            for key, value in permission_values.items():
-                value.set(key in desired)
-
-        role_box.bind("<<ComboboxSelected>>", apply_role_defaults)
-
-        def submit() -> None:
-            permissions = [key for key, value in permission_values.items() if value.get()]
-            payload = {"username": username.get(), "password": password.get(), "role": role.get(), "permissions": permissions}
-
-            def done(_result: dict[str, Any]) -> None:
-                dialog.destroy()
-                self.refresh_users()
-                self.status_var.set("Пользователь создан.")
-
-            self.async_call(lambda: self.require_api().request("POST", "/v1/admin/users", payload), done, context="Создание пользователя")
-
-        ttk.Button(frame, text="Создать", command=submit).grid(row=4, column=1, sticky="e", pady=(16, 0))
-        frame.columnconfigure(1, weight=1)
-        username.focus_set()
-
-    def toggle_selected_user(self) -> None:
-        user = self.selected_user()
-        if not user:
-            return
-        if user.get("role") == "owner":
-            messagebox.showinfo("Владелец", "Аккаунт владельца нельзя отключить из интерфейса.")
-            return
-        enabled = not bool(user.get("enabled"))
-        verb = "включить" if enabled else "отключить"
-        if not messagebox.askyesno("Подтвердите", f"{verb.capitalize()} доступ пользователю {user.get('username')}?"):
-            return
-
-        def done(_result: dict[str, Any]) -> None:
-            self.refresh_users()
-            self.status_var.set("Доступ пользователя изменён. Все старые сеансы отозваны.")
-
-        self.async_call(
-            lambda: self.require_api().request("PATCH", f"/v1/admin/users/{user['id']}", {"enabled": enabled}),
-            done,
-            context="Изменение доступа",
-        )
-
-    def show_reset_password_dialog(self) -> None:
-        user = self.selected_user()
-        if not user:
-            return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Сменить пароль")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        frame = ttk.Frame(dialog, padding=20)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text=f"Новый пароль для {user.get('username')}").grid(row=0, column=0, sticky="w")
-        password = enable_clipboard_paste(ttk.Entry(frame, width=34, show="•"))
-        password.grid(row=1, column=0, sticky="ew", pady=(8, 12))
-
-        def submit() -> None:
-            def done(_result: dict[str, Any]) -> None:
-                dialog.destroy()
-                self.status_var.set("Пароль изменён, старые сеансы отозваны.")
-
-            self.async_call(
-                lambda: self.require_api().request(
-                    "POST", f"/v1/admin/users/{user['id']}/password", {"password": password.get()}
-                ),
-                done,
-                context="Смена пароля",
-            )
-
-        ttk.Button(frame, text="Сменить", command=submit).grid(row=2, column=0, sticky="e")
-        password.focus_set()
-
-    @staticmethod
-    def labeled_entry(parent: ttk.Frame, row: int, label: str, secret: bool = False) -> ttk.Entry:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        entry = enable_clipboard_paste(ttk.Entry(parent, width=34, show="•" if secret else ""))
-        entry.grid(row=row, column=1, sticky="ew", pady=4)
-        return entry
-
-    def selected_user(self) -> dict[str, Any] | None:
-        selection = self.users_tree.selection() if hasattr(self, "users_tree") else ()
-        if not selection:
-            messagebox.showinfo("Пользователи", "Выберите пользователя в списке.")
-            return None
-        return self.user_cache.get(selection[0])
-
-    def check_for_updates(self) -> None:
+    def check_for_updates(self, manual: bool = False) -> None:
         if self.update_in_progress:
             return
-        update_config = self.config.get("update", {}) if isinstance(self.config.get("update"), dict) else {}
-        if not update_config.get("enabled") or not getattr(sys, "frozen", False):
+        update = self.config.get("update") if isinstance(self.config.get("update"), dict) else {}
+        if not update.get("enabled", True) or not getattr(sys, "frozen", False):
+            if manual:
+                messagebox.showinfo("Обновления", "Автообновление проверяется только в собранной Windows-версии.")
             return
-        repository = str(update_config.get("repository", ""))
-        asset_name = str(update_config.get("asset_name", "ServerControl-Update.zip"))
-        automatic = bool(update_config.get("install_automatically", True))
+        repository = str(update.get("repository", "chipdans/server-control"))
+        asset = str(update.get("asset_name", "ServerControl-Update.zip"))
 
         def work() -> dict[str, Any] | None:
-            release = latest_release(repository, asset_name)
-            if release and is_newer(str(release["tag"]), APP_VERSION):
-                return release
-            return None
+            release = latest_release(repository, asset)
+            return release if release and is_newer(str(release.get("tag")), APP_VERSION) else None
 
         def success(release: dict[str, Any] | None) -> None:
-            if not release or self.closed:
+            if not release:
+                if manual:
+                    messagebox.showinfo("Обновления", f"Установлена актуальная версия {APP_VERSION}.")
                 return
-            install = automatic or messagebox.askyesno(
-                "Доступно обновление", f"Доступна версия {release['tag']}. Установить её сейчас?"
-            )
-            if not install:
+            automatic = bool(update.get("install_automatically", True)) and not manual
+            if not automatic and not messagebox.askyesno("Обновление", f"Доступна версия {release['tag']}. Установить сейчас?"):
                 return
             self.update_in_progress = True
-            self.status_var.set(f"Скачивание обновления {release['tag']}…")
+            if self.panel:
+                self.panel.status(f"Скачиваю {release['tag']}…", seconds=60)
 
-            def apply() -> None:
-                update_zip = download_update(str(release["url"]))
-                launch_updater(update_zip, Path(sys.executable).resolve())
+            def install() -> None:
+                archive = download_update(str(release["url"]), expected_sha256=release.get("sha256"))
+                launch_updater(archive, Path(sys.executable).resolve())
 
-            def applied(_value: Any) -> None:
-                self.status_var.set("Обновление скачано. Перезапуск…")
-                self.root.after(0, self.close)
-
-            def failed(error: Exception) -> None:
+            def failure(error: Exception) -> None:
                 self.update_in_progress = False
-                self.handle_error(error, context="Установка обновления")
+                messagebox.showerror("Обновление", str(error))
 
-            self.async_call(apply, applied, failed, context="Установка обновления")
+            self.async_call(install, lambda _value: self.close(), failure)
 
-        self.async_call(work, success, context="Проверка обновлений", quiet=True)
+        self.async_call(work, success, lambda error: messagebox.showerror("Обновления", str(error)) if manual else None)
+
+    def _mark_update_healthy(self) -> None:
+        prefix = "--update-health-file="
+        argument = next((value[len(prefix):] for value in sys.argv[1:] if value.startswith(prefix)), "")
+        if not argument:
+            return
+        path = Path(argument)
+        temporary: str | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+            with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                output.write(APP_VERSION)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        except OSError:
+            if temporary:
+                try:
+                    Path(temporary).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def async_call(
         self,
         work: Callable[[], Any],
         success: Callable[[Any], None],
         failure: Callable[[Exception], None] | None = None,
-        *,
-        context: str,
-        quiet: bool = False,
     ) -> None:
         def runner() -> None:
             try:
                 result = work()
-            except Exception as error:  # return to Tk's main thread before touching UI
+            except Exception as error:
                 if not self.closed:
-                    def report(caught_error: Exception = error) -> None:
-                        if failure:
-                            failure(caught_error)
-                        else:
-                            self.handle_error(caught_error, context=context, quiet=quiet)
-
-                    self.root.after(0, report)
+                    self._ui_queue.put(lambda caught=error: failure(caught) if failure else messagebox.showerror("Server Control", str(caught)))
             else:
                 if not self.closed:
-                    self.root.after(0, lambda: success(result))
+                    self._ui_queue.put(lambda completed=result: success(completed))
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def handle_error(self, error: Exception, *, context: str = "", quiet: bool = False) -> None:
-        if isinstance(error, ApiError) and error.code in {"access_revoked", "invalid_session", "authentication_required"}:
-            if not quiet:
-                messagebox.showerror("Доступ закрыт", error.message)
-            self.logout(show_message=False)
+    def _drain_ui_queue(self) -> None:
+        if self.closed:
             return
-        message = str(error)
-        self.status_var.set(message)
-        if not quiet:
-            messagebox.showerror(context or "Ошибка", message)
-
-    def has_permission(self, permission: str) -> bool:
-        return bool(self.user and permission in self.user.get("permissions", []))
+        for _index in range(500):
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except tk.TclError:
+                pass
+        self.root.after(30, self._drain_ui_queue)
 
     def require_api(self) -> ApiClient:
         if not self.api:
-            raise RuntimeError("Клиент API не настроен")
+            raise RuntimeError("API не настроен")
         return self.api
 
-    def role_label(self) -> str:
-        roles = {"owner": "владелец", "admin": "администратор", "user": "пользователь"}
-        return roles.get(str(self.user.get("role") if self.user else ""), "пользователь")
-
-    @staticmethod
-    def format_timestamp(value: Any) -> str:
-        if not value:
-            return "—"
-        try:
-            import datetime
-
-            return datetime.datetime.fromtimestamp(int(value) / 1000).strftime("%d.%m.%Y %H:%M")
-        except (TypeError, ValueError, OSError):
-            return "—"
-
-    def logout(self, show_message: bool = True) -> None:
+    def logout(self) -> None:
         if self.api:
             self.api.token = None
         self.user = None
-        if self.poll_after_id is not None:
-            try:
-                self.root.after_cancel(self.poll_after_id)
-            except tk.TclError:
-                pass
-            self.poll_after_id = None
-        if show_message:
-            self.status_var.set("Вы вышли из аккаунта.")
         self.show_login()
 
     def close(self) -> None:
+        if self.closed:
+            return
         self.closed = True
-        if self.poll_after_id is not None:
-            try:
-                self.root.after_cancel(self.poll_after_id)
-            except tk.TclError:
-                pass
-            self.poll_after_id = None
+        if self.panel:
+            self.panel.close()
         self.root.destroy()
 
 

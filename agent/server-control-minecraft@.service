@@ -1,0 +1,26 @@
+[Unit]
+Description=Server Control Minecraft instance %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+UMask=0007
+Environment=SERVER_CONTROL_INSTANCE_STORE=/var/lib/server-control/runner-instances.json
+Environment=SERVER_CONTROL_MINECRAFT_ROOT=/opt/minecraft
+ExecStart=/usr/bin/python3 /opt/server-control/current/instance_runner.py %i
+ExecStop=/bin/kill -SIGINT $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/minecraft
+
+[Install]
+WantedBy=multi-user.target

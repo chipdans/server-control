@@ -9,8 +9,10 @@ delivery.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,15 +23,36 @@ from pathlib import Path
 from typing import Any
 
 
+MAX_RELEASE_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_BOOTSTRAP_UPDATER_BYTES = 128 * 1024 * 1024
+
+
+def _read_limited(stream: Any, limit: int) -> bytes:
+    try:
+        declared = int(stream.headers.get("content-length", "0") or 0)
+    except (AttributeError, TypeError, ValueError):
+        declared = 0
+    if declared < 0 or declared > limit:
+        raise RuntimeError("Ответ сервера обновлений превышает допустимый размер.")
+    result = bytearray()
+    while True:
+        chunk = stream.read(min(64 * 1024, limit + 1 - len(result)))
+        if not chunk:
+            return bytes(result)
+        result.extend(chunk)
+        if len(result) > limit:
+            raise RuntimeError("Ответ сервера обновлений превышает допустимый размер.")
+
+
 def latest_release(repository: str, asset_name: str) -> dict[str, Any] | None:
-    if not repository or "/" not in repository:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository or ""):
         return None
     url = f"https://api.github.com/repos/{repository}/releases/latest"
     request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ServerControlDesktop"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            release = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+            release = json.loads(_read_limited(response, MAX_RELEASE_RESPONSE_BYTES).decode("utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
         return None
     if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
         return None
@@ -37,9 +60,36 @@ def latest_release(repository: str, asset_name: str) -> dict[str, Any] | None:
     if not isinstance(assets, list):
         return None
     asset = next((item for item in assets if isinstance(item, dict) and item.get("name") == asset_name), None)
-    if not asset or not isinstance(asset.get("browser_download_url"), str):
+    if not asset or not isinstance(asset.get("browser_download_url"), str) or not asset["browser_download_url"].startswith("https://github.com/"):
         return None
-    return {"tag": str(release.get("tag_name", "")), "url": asset["browser_download_url"]}
+    digest = str(asset.get("digest") or "")
+    sha256 = digest.removeprefix("sha256:") if digest.startswith("sha256:") else ""
+    if not re.fullmatch(r"[a-fA-F0-9]{64}", sha256):
+        checksum_asset = next(
+            (item for item in assets if isinstance(item, dict) and item.get("name") == f"{asset_name}.sha256"),
+            None,
+        )
+        if (
+            checksum_asset
+            and isinstance(checksum_asset.get("browser_download_url"), str)
+            and checksum_asset["browser_download_url"].startswith("https://github.com/")
+        ):
+            try:
+                checksum_request = urllib.request.Request(
+                    checksum_asset["browser_download_url"],
+                    headers={"Accept": "application/octet-stream", "User-Agent": "ServerControlDesktop"},
+                )
+                with urllib.request.urlopen(checksum_request, timeout=15) as response:
+                    checksum_text = _read_limited(response, 1024).decode("ascii", "strict")
+                match = re.search(r"\b([a-fA-F0-9]{64})\b", checksum_text)
+                sha256 = match.group(1) if match else ""
+            except (OSError, UnicodeDecodeError, urllib.error.URLError, urllib.error.HTTPError):
+                sha256 = ""
+    return {
+        "tag": str(release.get("tag_name", "")),
+        "url": asset["browser_download_url"],
+        "sha256": sha256.lower() if re.fullmatch(r"[a-fA-F0-9]{64}", sha256) else None,
+    }
 
 
 def is_newer(remote: str, local: str) -> bool:
@@ -53,16 +103,34 @@ def is_newer(remote: str, local: str) -> bool:
     return remote_parts + (0,) * (longest - len(remote_parts)) > local_parts + (0,) * (longest - len(local_parts))
 
 
-def download_update(asset_url: str) -> Path:
+def download_update(asset_url: str, *, expected_sha256: str | None = None) -> Path:
+    if not asset_url.startswith("https://github.com/"):
+        raise RuntimeError("Обновление можно загружать только из GitHub Releases.")
+    if not expected_sha256 or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256, re.IGNORECASE):
+        raise RuntimeError("Релиз не содержит проверяемую SHA-256 сумму обновления.")
     directory = Path(tempfile.mkdtemp(prefix="server-control-update-"))
     destination = directory / "update.zip"
     request = urllib.request.Request(asset_url, headers={"User-Agent": "ServerControlDesktop"})
-    with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as target:
-        while chunk := response.read(1024 * 1024):
-            target.write(chunk)
-    if not zipfile.is_zipfile(destination):
-        raise RuntimeError("GitHub Release содержит не ZIP-файл обновления.")
-    return destination
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as target:
+            while chunk := response.read(1024 * 1024):
+                written += len(chunk)
+                if written > 512 * 1024 * 1024:
+                    raise RuntimeError("Архив обновления превышает лимит 512 МиБ.")
+                target.write(chunk)
+                digest.update(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if digest.hexdigest() != expected_sha256.lower():
+            raise RuntimeError("SHA-256 обновления не совпала с опубликованной суммой.")
+        if not zipfile.is_zipfile(destination):
+            raise RuntimeError("GitHub Release содержит не ZIP-файл обновления.")
+        return destination
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
 
 
 def prepare_bootstrap_updater(update_zip: Path, current_executable: Path) -> Path:
@@ -79,7 +147,15 @@ def prepare_bootstrap_updater(update_zip: Path, current_executable: Path) -> Pat
     try:
         with zipfile.ZipFile(update_zip) as archive:
             member = archive.getinfo(updater_name)
-            contents = archive.read(member)
+            file_type = (member.external_attr >> 16) & 0o170000
+            if member.is_dir() or file_type == 0o120000:
+                raise RuntimeError("Некорректный помощник обновления в архиве.")
+            if member.file_size <= 0 or member.file_size > MAX_BOOTSTRAP_UPDATER_BYTES:
+                raise RuntimeError("Помощник обновления превышает допустимый размер.")
+            if member.compress_size and member.file_size / max(1, member.compress_size) > 250:
+                raise RuntimeError("Подозрительная степень сжатия помощника обновления.")
+            with archive.open(member) as source:
+                contents = _read_limited(source, MAX_BOOTSTRAP_UPDATER_BYTES)
     except (KeyError, OSError, zipfile.BadZipFile):
         # Compatibility with releases from before the updater was bundled.
         return current_executable.with_name(updater_name)

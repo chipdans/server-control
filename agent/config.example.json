@@ -4,6 +4,19 @@
   "poll_seconds": 1,
   "heartbeat_seconds": 2,
   "request_timeout_seconds": 20,
+  "state_directory": "/var/lib/server-control",
+  "minecraft_root": "/opt/minecraft",
+  "backup_root": "/srv/server-control/backups",
+  "max_job_workers": 2,
+  "allowed_services": [
+    "server-control-agent.service",
+    "dragonfyre.service"
+  ],
+  "agent_update_command": [
+    "sudo",
+    "-n",
+    "/usr/local/sbin/server-control-agent-update"
+  ],
   "minecraft": {
     "service": "dragonfyre.service",
     "directory": "/opt/minecraft/dragonfyre",

@@ -1,3 +1,15 @@
+import {
+  CONTROL_PERMISSIONS,
+  CONTROL_ROLE_PERMISSIONS,
+  claimAgentJobs,
+  filterStatusForSession,
+  normalizeEvent,
+  notifyHeartbeatTransitions,
+  routeAgentControlPlane,
+  routeControlPlane,
+  runScheduledMaintenance,
+} from "./control_plane.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -21,6 +33,7 @@ const PERMISSIONS = new Set([
   "minecraft_view",
   "minecraft_command",
   "user_manage",
+  ...CONTROL_PERMISSIONS,
 ]);
 
 const ROLE_PERMISSIONS = {
@@ -32,6 +45,7 @@ const ROLE_PERMISSIONS = {
     "minecraft_view",
     "minecraft_command",
     "user_manage",
+    ...CONTROL_ROLE_PERMISSIONS.owner,
   ],
   admin: [
     "power_view",
@@ -40,8 +54,9 @@ const ROLE_PERMISSIONS = {
     "server_command",
     "minecraft_view",
     "minecraft_command",
+    ...CONTROL_ROLE_PERMISSIONS.admin,
   ],
-  user: ["minecraft_view", "minecraft_command"],
+  user: ["minecraft_view", "minecraft_command", ...CONTROL_ROLE_PERMISSIONS.operator],
 };
 
 class ApiError extends Error {
@@ -52,13 +67,20 @@ class ApiError extends Error {
   }
 }
 
+function decodeOpaqueId(value) {
+  let decoded;
+  try { decoded = decodeURIComponent(value); } catch { throw new ApiError(400, "invalid_id", "Некорректный идентификатор."); }
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(decoded)) throw new ApiError(400, "invalid_id", "Некорректный идентификатор.");
+  return decoded;
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          "access-control-allow-methods": "GET, POST, PATCH, OPTIONS",
+          "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
           "access-control-allow-headers": "authorization, content-type, x-bootstrap-key, x-agent-key",
           "access-control-max-age": "86400",
         },
@@ -74,6 +96,9 @@ export default {
       console.error("Unhandled request error", error);
       return json({ error: "internal_error", message: "Внутренняя ошибка сервиса." }, 500);
     }
+  },
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(runScheduledMaintenance(env, { ApiError, json, readJson, safeJson, requirePermission, requireAnyPermission, addAudit }));
   },
 };
 
@@ -100,22 +125,34 @@ async function route(request, env) {
 
   const session = await requireSession(request, env);
 
+  const controlPlaneResponse = await routeControlPlane(request, env, pathname, url, session, {
+    ApiError,
+    json,
+    readJson,
+    safeJson,
+    requirePermission,
+    requireAnyPermission,
+    addAudit,
+    enqueueCommand,
+  });
+  if (controlPlaneResponse) return controlPlaneResponse;
+
   if (method === "GET" && pathname === "/v1/me") {
     return json({ user: publicUser(session.user) });
   }
 
   if (method === "GET" && pathname === "/v1/power/status") {
-    requirePermission(session, "power_view");
+    requireAnyPermission(session, ["power_view", "power_control", "server.view", "server.power"]);
     return json({ power: await getYandexPowerStatus(env) });
   }
 
   if (method === "POST" && pathname === "/v1/power/action") {
-    requirePermission(session, "power_control");
+    requireAnyPermission(session, ["power_control", "server.power"]);
     return powerAction(request, env, session);
   }
 
   if (method === "GET" && pathname === "/v1/server/status") {
-    requireAnyPermission(session, ["server_view", "minecraft_view"]);
+    requireAnyPermission(session, ["server_view", "minecraft_view", "server.view", "minecraft.view"]);
     const record = await env.DB.prepare("SELECT status, updated_at FROM agent_status WHERE id = 'primary'").first();
     if (!record) {
       return json({ online: false, status: null, updated_at: null });
@@ -124,7 +161,7 @@ async function route(request, env) {
     const ageMs = Math.max(0, Date.now() - updatedAt);
     return json({
       online: ageMs < AGENT_ONLINE_MAX_AGE_MS,
-      status: safeJson(record.status, {}),
+      status: filterStatusForSession(safeJson(record.status, {}), session),
       updated_at: updatedAt,
       age_ms: ageMs,
     });
@@ -161,25 +198,36 @@ async function route(request, env) {
   }
 
   if (method === "GET" && pathname === "/v1/admin/users") {
-    requirePermission(session, "user_manage");
+    requireAnyPermission(session, ["user_manage", "users.manage"]);
     return listUsers(env);
   }
 
   if (method === "POST" && pathname === "/v1/admin/users") {
-    requirePermission(session, "user_manage");
+    requireAnyPermission(session, ["user_manage", "users.manage"]);
     return createUser(request, env, session);
   }
 
   const userMatch = pathname.match(/^\/v1\/admin\/users\/([^/]+)$/);
   if (userMatch && method === "PATCH") {
-    requirePermission(session, "user_manage");
-    return updateUser(request, env, session, decodeURIComponent(userMatch[1]));
+    requireAnyPermission(session, ["user_manage", "users.manage"]);
+    return updateUser(request, env, session, decodeOpaqueId(userMatch[1]));
   }
 
   const passwordMatch = pathname.match(/^\/v1\/admin\/users\/([^/]+)\/password$/);
   if (passwordMatch && method === "POST") {
-    requirePermission(session, "user_manage");
-    return resetPassword(request, env, session, decodeURIComponent(passwordMatch[1]));
+    requireAnyPermission(session, ["user_manage", "users.manage"]);
+    return resetPassword(request, env, session, decodeOpaqueId(passwordMatch[1]));
+  }
+
+  const revokeMatch = pathname.match(/^\/v1\/admin\/users\/([^/]+)\/revoke$/);
+  if (revokeMatch && method === "POST") {
+    requireAnyPermission(session, ["user_manage", "users.manage"]);
+    return revokeUserSessions(env, session, decodeOpaqueId(revokeMatch[1]));
+  }
+
+  if (userMatch && method === "DELETE") {
+    requireAnyPermission(session, ["user_manage", "users.manage"]);
+    return deleteUser(env, session, decodeOpaqueId(userMatch[1]));
   }
 
   throw new ApiError(404, "not_found", "Маршрут не найден.");
@@ -213,26 +261,33 @@ async function setupOwner(request, env) {
     updated_at: now,
   };
 
-  await env.DB.prepare(
-    `INSERT INTO users (
-      id, username, password_salt, password_hash, password_iterations,
-      role, permissions, enabled, token_version, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      user.id,
-      user.username,
-      passwordRecord.salt,
-      passwordRecord.hash,
-      passwordRecord.iterations,
-      user.role,
-      JSON.stringify(user.permissions),
-      user.enabled,
-      user.token_version,
-      user.created_at,
-      user.updated_at,
+  try {
+    await env.DB.prepare(
+      `INSERT INTO users (
+        id, username, password_salt, password_hash, password_iterations,
+        role, permissions, enabled, token_version, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run();
+      .bind(
+        user.id,
+        user.username,
+        passwordRecord.salt,
+        passwordRecord.hash,
+        passwordRecord.iterations,
+        user.role,
+        JSON.stringify(user.permissions),
+        user.enabled,
+        user.token_version,
+        user.created_at,
+        user.updated_at,
+      )
+      .run();
+  } catch (error) {
+    if (String(error?.message || error).includes("UNIQUE")) {
+      throw new ApiError(409, "already_configured", "Владелец уже создан.");
+    }
+    throw error;
+  }
 
   await addAudit(env, user.id, "owner.bootstrap", { username });
   const token = await issueAccessToken(env, user);
@@ -282,11 +337,38 @@ async function login(request, env) {
 async function routeAgent(request, env, pathname) {
   requireAgent(request, env);
 
+  const controlPlaneResponse = await routeAgentControlPlane(request, env, pathname, {
+    ApiError,
+    json,
+    readJson,
+    safeJson,
+    addAudit,
+  });
+  if (controlPlaneResponse) return controlPlaneResponse;
+
+  if (request.method === "GET" && pathname === "/v1/agent/sync") {
+    const commands = await claimAgentCommandsData(env);
+    const jobs = await claimAgentJobs(env, { safeJson });
+    return json({ ...commands, ...jobs, server_time: Date.now() });
+  }
+
   if (request.method === "POST" && pathname === "/v1/agent/heartbeat") {
-    const body = await readJson(request);
+    const body = await readJson(request, 512 * 1024);
+    const previous = await env.DB.prepare("SELECT status FROM agent_status WHERE id = 'primary'").first();
+    const previousStatus = previous ? safeJson(previous.status, {}) : {};
     const status = {
       server: isObject(body.server) ? body.server : {},
       minecraft: isObject(body.minecraft) ? body.minecraft : {},
+      instances: Array.isArray(body.instances) ? body.instances.slice(0, 100) : [],
+      selected_instance_id: typeof body.selected_instance_id === "string" ? body.selected_instance_id.slice(0, 48) : null,
+      storage: isObject(body.storage) ? body.storage : {},
+      system: isObject(body.system) ? body.system : {},
+      processes: Array.isArray(body.processes) ? body.processes.slice(0, 200) : [],
+      services: Array.isArray(body.services) ? body.services.slice(0, 100) : [],
+      java: Array.isArray(body.java) ? body.java.slice(0, 50) : [],
+      backups: Array.isArray(body.backups) ? body.backups.slice(0, 500) : [],
+      health: isObject(body.health) ? body.health : {},
+      protocol_version: Number(body.protocol_version) || 1,
       agent_version: typeof body.agent_version === "string" ? body.agent_version.slice(0, 64) : "unknown",
     };
     const now = Date.now();
@@ -296,11 +378,12 @@ async function routeAgent(request, env, pathname) {
     )
       .bind(JSON.stringify(status), now)
       .run();
+    await notifyHeartbeatTransitions(env, previousStatus, status);
     return json({ ok: true, server_time: now });
   }
 
   if (request.method === "POST" && pathname === "/v1/agent/events") {
-    const body = await readJson(request);
+    const body = await readJson(request, 1024 * 1024);
     const events = Array.isArray(body.events) ? body.events : [];
     if (events.length > MAX_CONSOLE_EVENTS_PER_PUSH) {
       throw new ApiError(400, "too_many_events", "Слишком много событий за один запрос.");
@@ -308,16 +391,16 @@ async function routeAgent(request, env, pathname) {
     const now = Date.now();
     const statements = [];
     for (const event of events) {
-      if (!isObject(event) || !["server", "minecraft"].includes(event.kind) || typeof event.message !== "string") {
-        continue;
-      }
-      const message = event.message.trim().slice(0, MAX_CONSOLE_MESSAGE_LENGTH);
-      if (!message) continue;
+      const normalized = normalizeEvent(event);
+      if (!normalized) continue;
       statements.push(
-        env.DB.prepare("INSERT INTO console_events (kind, message, created_at) VALUES (?, ?, ?)").bind(
-          event.kind,
-          message,
+        env.DB.prepare("INSERT INTO console_events (kind, message, created_at, instance_id, source, level) VALUES (?, ?, ?, ?, ?, ?)").bind(
+          normalized.kind,
+          normalized.message,
           now,
+          normalized.instance_id,
+          normalized.source,
+          normalized.level,
         ),
       );
     }
@@ -331,7 +414,7 @@ async function routeAgent(request, env, pathname) {
 
   const resultMatch = pathname.match(/^\/v1\/agent\/commands\/([^/]+)\/result$/);
   if (request.method === "POST" && resultMatch) {
-    return completeAgentCommand(request, env, decodeURIComponent(resultMatch[1]));
+    return completeAgentCommand(request, env, decodeOpaqueId(resultMatch[1]));
   }
 
   throw new ApiError(404, "not_found", "Маршрут агента не найден.");
@@ -357,6 +440,13 @@ async function powerAction(request, env, session) {
     const power = await setYandexPower(env, false);
     await addAudit(env, session.user.id, "power.off.force", {});
     return json({ ok: true, mode: "forced", power });
+  }
+
+  const activeOperation = await env.DB.prepare(
+    "SELECT id,type FROM jobs WHERE status IN ('pending','claimed','running') ORDER BY created_at LIMIT 1",
+  ).first();
+  if (activeOperation) {
+    throw new ApiError(409, "operation_locked", `Сначала завершите операцию ${activeOperation.type}; безопасное отключение питания не начато.`);
   }
 
   let command = await getActiveSafePowerOff(env);
@@ -435,8 +525,9 @@ async function createUser(request, env, session) {
   const body = await readJson(request);
   const username = validateUsername(body.username);
   const password = validatePassword(body.password);
-  const role = body.role === "admin" ? "admin" : "user";
+  const role = normalizeManagedRole(body.role, "user");
   const permissions = sanitizePermissions(body.permissions, ROLE_PERMISSIONS[role]);
+  assertMayDelegateAccount(session, role, permissions);
   const passwordRecord = await createPasswordRecord(password);
   const now = Date.now();
   const user = {
@@ -491,11 +582,15 @@ async function updateUser(request, env, session, targetId) {
   if (target.role === "owner") {
     throw new ApiError(403, "owner_protected", "Аккаунт владельца нельзя изменить этим способом.");
   }
+  assertMayManageAccount(session, target);
 
-  const role = body.role === "admin" ? "admin" : body.role === "user" ? "user" : target.role;
+  const role = Object.prototype.hasOwnProperty.call(body, "role")
+    ? normalizeManagedRole(body.role, target.role)
+    : target.role;
   const permissions = Object.prototype.hasOwnProperty.call(body, "permissions")
     ? sanitizePermissions(body.permissions, ROLE_PERMISSIONS[role])
     : target.permissions;
+  assertMayDelegateAccount(session, role, permissions);
   const enabled = Object.prototype.hasOwnProperty.call(body, "enabled") ? (body.enabled ? 1 : 0) : target.enabled ? 1 : 0;
   const now = Date.now();
   await env.DB.prepare(
@@ -519,11 +614,13 @@ async function updateUser(request, env, session, targetId) {
 async function resetPassword(request, env, session, targetId) {
   const body = await readJson(request);
   const password = validatePassword(body.password);
-  const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE id = ?").bind(targetId).first();
-  if (!target) throw new ApiError(404, "user_not_found", "Пользователь не найден.");
+  const targetRow = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(targetId).first();
+  if (!targetRow) throw new ApiError(404, "user_not_found", "Пользователь не найден.");
+  const target = normalizeDbUser(targetRow);
   if (target.role === "owner" && target.id !== session.user.id) {
     throw new ApiError(403, "owner_protected", "Пароль владельца нельзя сбросить этим способом.");
   }
+  if (target.id !== session.user.id) assertMayManageAccount(session, target);
   const passwordRecord = await createPasswordRecord(password);
   const now = Date.now();
   await env.DB.prepare(
@@ -536,6 +633,35 @@ async function resetPassword(request, env, session, targetId) {
     .run();
   await addAudit(env, session.user.id, "user.password_reset", { user_id: targetId, username: target.username });
   return json({ ok: true });
+}
+
+async function revokeUserSessions(env, session, targetId) {
+  const targetRow = await env.DB.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
+  if (!targetRow) throw new ApiError(404, "user_not_found", "Пользователь не найден.");
+  const target = normalizeDbUser(targetRow);
+  if (target.role === "owner") throw new ApiError(403, "owner_protected", "Сеансы владельца отзываются только сменой собственного пароля.");
+  assertMayManageAccount(session, target);
+  await env.DB.prepare("UPDATE users SET token_version=token_version+1,updated_at=? WHERE id=?").bind(Date.now(), targetId).run();
+  await addAudit(env, session.user.id, "user.sessions_revoke", { user_id: targetId, username: target.username });
+  return json({ ok: true });
+}
+
+async function deleteUser(env, session, targetId) {
+  const targetRow = await env.DB.prepare("SELECT * FROM users WHERE id=?").bind(targetId).first();
+  if (!targetRow) throw new ApiError(404, "user_not_found", "Пользователь не найден.");
+  const target = normalizeDbUser(targetRow);
+  if (target.role === "owner" || target.id === session.user.id) throw new ApiError(403, "owner_protected", "Нельзя удалить владельца или текущую учётную запись.");
+  assertMayManageAccount(session, target);
+  await addAudit(env, session.user.id, "user.delete", { user_id: targetId, username: target.username });
+  await env.DB.batch([
+    env.DB.prepare("UPDATE command_queue SET requested_by=NULL WHERE requested_by=?").bind(targetId),
+    env.DB.prepare("UPDATE jobs SET requested_by=NULL WHERE requested_by=?").bind(targetId),
+    env.DB.prepare("UPDATE transfers SET requested_by=NULL WHERE requested_by=?").bind(targetId),
+    env.DB.prepare("UPDATE settings SET updated_by=NULL WHERE updated_by=?").bind(targetId),
+    env.DB.prepare("UPDATE audit_log SET actor_id=NULL WHERE actor_id=?").bind(targetId),
+    env.DB.prepare("DELETE FROM users WHERE id=?").bind(targetId),
+  ]);
+  return json({ ok: true, deleted: targetId });
 }
 
 async function getConsoleEvents(env, kind, afterValue, latest = false) {
@@ -591,6 +717,10 @@ async function getActiveSafePowerOff(env) {
 }
 
 async function claimAgentCommands(env) {
+  return json(await claimAgentCommandsData(env));
+}
+
+async function claimAgentCommandsData(env) {
   const staleBefore = Date.now() - COMMAND_CLAIM_STALE_AFTER_MS;
   const result = await env.DB.prepare(
     `SELECT id, type, payload, requested_by, created_at
@@ -609,10 +739,10 @@ async function claimAgentCommands(env) {
       ),
     );
   }
-  return json({
+  return {
     commands: commands.map((command) => ({ ...command, payload: safeJson(command.payload, {}) })),
     server_time: claimedAt,
-  });
+  };
 }
 
 async function completeAgentCommand(request, env, commandId) {
@@ -781,7 +911,7 @@ async function yandexRequest(env, path, init) {
 async function requireSession(request, env) {
   const authorization = request.headers.get("authorization") || "";
   const match = authorization.match(/^Bearer\s+(.+)$/i);
-  if (!match) throw new ApiError(401, "authentication_required", "Требуется вход в приложение.");
+  if (!match || match[1].length > 4096) throw new ApiError(401, "authentication_required", "Требуется вход в приложение.");
   const claims = await verifyJwt(match[1], requiredSecret(env, "JWT_SECRET"));
   if (!claims || !claims.sub || !claims.exp || Number(claims.exp) <= Math.floor(Date.now() / 1000)) {
     throw new ApiError(401, "invalid_session", "Сеанс истёк. Войдите снова.");
@@ -820,12 +950,22 @@ function requiredSecret(env, name) {
 }
 
 function normalizeDbUser(row) {
+  const role = String(row.role);
+  const storedPermissions = sanitizePermissions(safeJson(row.permissions, ROLE_PERMISSIONS.user), ROLE_PERMISSIONS.user);
+  // 0.3.x accounts only contain underscore-style grants. Upgrade those in
+  // memory during a rolling deployment. Once dotted granular permissions are
+  // saved, the explicit set is preserved exactly.
+  const legacyGrant = !storedPermissions.some((item) => item.includes("."));
+  const roleDefaults = ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.user;
+  const permissions = role === "owner" || legacyGrant
+    ? [...new Set([...storedPermissions, ...roleDefaults])]
+    : storedPermissions;
   return {
     ...row,
     id: String(row.id),
     username: String(row.username),
-    role: String(row.role),
-    permissions: sanitizePermissions(safeJson(row.permissions, ROLE_PERMISSIONS.user), ROLE_PERMISSIONS.user),
+    role,
+    permissions,
     enabled: Number(row.enabled) === 1,
     token_version: Number(row.token_version),
     created_at: Number(row.created_at),
@@ -866,6 +1006,40 @@ function validatePassword(value) {
 function sanitizePermissions(value, fallback) {
   if (!Array.isArray(value)) return [...fallback];
   return [...new Set(value.filter((item) => typeof item === "string" && PERMISSIONS.has(item)))];
+}
+
+function normalizeManagedRole(value, fallback = "user") {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (!['admin', 'user'].includes(value)) {
+    throw new ApiError(400, "invalid_role", "Допустимы роли admin и user; набор Operator/File Manager/Viewer задаётся точными разрешениями.");
+  }
+  return value;
+}
+
+function assertMayDelegateAccount(session, role, permissions) {
+  if (session.user.role === "owner") return;
+  if (role !== "user") {
+    throw new ApiError(403, "owner_required", "Только владелец может назначать администраторов.");
+  }
+  const actorPermissions = new Set(session.user.permissions);
+  if (permissions.some((permission) => !actorPermissions.has(permission))) {
+    throw new ApiError(403, "permission_escalation", "Нельзя выдать разрешение, которого нет у вашей учётной записи.");
+  }
+  if (permissions.some((permission) => ["user_manage", "users.manage"].includes(permission))) {
+    throw new ApiError(403, "owner_required", "Делегировать управление пользователями может только владелец.");
+  }
+}
+
+function assertMayManageAccount(session, target) {
+  if (session.user.role === "owner") return;
+  const targetPermissions = new Set(target.permissions || []);
+  if (target.role !== "user" || targetPermissions.has("user_manage") || targetPermissions.has("users.manage")) {
+    throw new ApiError(403, "owner_required", "Этой учётной записью может управлять только владелец.");
+  }
+  const actorPermissions = new Set(session.user.permissions);
+  if ([...targetPermissions].some((permission) => !actorPermissions.has(permission))) {
+    throw new ApiError(403, "permission_escalation", "Нельзя изменять учётную запись с более широкими правами.");
+  }
 }
 
 async function createPasswordRecord(password) {
@@ -918,14 +1092,18 @@ async function signJwt(payload, secret) {
 }
 
 async function verifyJwt(token, secret) {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [headerPart, payloadPart, signaturePart] = parts;
-  const header = safeJson(decoder.decode(base64UrlToBytes(headerPart)), null);
-  if (!header || header.alg !== "HS256") return null;
-  const expected = await hmac(`${headerPart}.${payloadPart}`, secret);
-  if (!constantTimeBytesEqual(expected, base64UrlToBytes(signaturePart))) return null;
-  return safeJson(decoder.decode(base64UrlToBytes(payloadPart)), null);
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [headerPart, payloadPart, signaturePart] = parts;
+    const header = safeJson(decoder.decode(base64UrlToBytes(headerPart)), null);
+    if (!header || header.alg !== "HS256") return null;
+    const expected = await hmac(`${headerPart}.${payloadPart}`, secret);
+    if (!constantTimeBytesEqual(expected, base64UrlToBytes(signaturePart))) return null;
+    return safeJson(decoder.decode(base64UrlToBytes(payloadPart)), null);
+  } catch {
+    return null;
+  }
 }
 
 async function hmac(value, secret) {
@@ -939,22 +1117,48 @@ async function hmac(value, secret) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value)));
 }
 
-async function addAudit(env, actorId, action, details) {
-  await env.DB.prepare("INSERT INTO audit_log (actor_id, action, details, created_at) VALUES (?, ?, ?, ?)")
-    .bind(actorId || null, action, JSON.stringify(details || {}), Date.now())
+async function addAudit(env, actorId, action, details, options = {}) {
+  const request = options.request;
+  const ip = request?.headers?.get("cf-connecting-ip") || null;
+  const device = request?.headers?.get("user-agent")?.slice(0, 200) || null;
+  await env.DB.prepare(
+    "INSERT INTO audit_log (actor_id, action, details, created_at, target, result, ip, device) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  )
+    .bind(actorId || null, action, JSON.stringify(details || {}).slice(0, 16_000), Date.now(), options.target || null, options.result || "success", ip, device)
     .run();
 }
 
-async function readJson(request) {
+async function readJson(request, maxBytes = 32_768) {
   const contentLength = Number(request.headers.get("content-length") || "0");
-  if (contentLength > 32_768) {
+  if (!Number.isFinite(contentLength) || contentLength < 0 || contentLength > maxBytes) {
     throw new ApiError(413, "payload_too_large", "Слишком большой запрос.");
   }
   try {
-    const body = await request.json();
+    if (!request.body) throw new Error("empty body");
+    const reader = request.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new ApiError(413, "payload_too_large", "Слишком большой запрос.");
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     if (!isObject(body)) throw new Error("not an object");
     return body;
-  } catch {
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
     throw new ApiError(400, "invalid_json", "Некорректный JSON-запрос.");
   }
 }

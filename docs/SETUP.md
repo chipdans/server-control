@@ -1,31 +1,42 @@
-# Установка Server Control
+# Новая установка Server Control 1.0
 
-## 1. Что понадобится
+Для обновления существующей версии `0.3.x` используйте не эту страницу, а
+[единый сценарий обновления](UPGRADE-1.0.0.md).
 
-- учётная запись Cloudflare на бесплатном тарифе;
-- GitHub-репозиторий для релизов приложения;
-- доступ к Debian-серверу `ChipdanServer`;
-- OAuth-токен Яндекс Умного дома и ID умной розетки, которая питает сервер.
+## 1. Требования
 
-Не публикуйте OAuth-токен, RCON-пароль, ключ агента или `BOOTSTRAP_KEY` в
-GitHub, Discord, скриншотах или конфигурации клиента.
+- Cloudflare account with Workers, D1 and R2;
+- public GitHub Releases repository (the source repository may remain private);
+- Debian server with Python 3.11+, systemd, `sudo`, `unzip` and `visudo`;
+- locally working Minecraft pack or permission to install Vanilla;
+- Yandex Smart Home OAuth token and the device ID of the server power socket.
 
-## 2. Развернуть бесплатный Control Hub
+Never put `JWT_SECRET`, `BOOTSTRAP_KEY`, `AGENT_API_KEY`, Yandex OAuth, RCON
+password or private credentials in Git, screenshots or the desktop config.
 
-Установите Node.js LTS на своём ПК, откройте терминал в папке `worker` и
-выполните:
+## 2. Deploy Control Hub
 
-```bash
+From `worker/` on an administrator computer:
+
+```powershell
 npx wrangler login
 npx wrangler d1 create server-control
+npx wrangler r2 bucket create server-control-files
+npx wrangler r2 bucket create server-control-files-preview
 ```
 
-Во втором ответе Cloudflare покажет `database_id`. Вставьте его вместо
-`REPLACE_WITH_D1_DATABASE_ID` в `worker/wrangler.toml`.
+Copy the D1 `database_id` into `worker/wrangler.toml`. Bucket names must match
+the `FILES` binding already present in that file.
 
-Далее создайте таблицы и секреты:
+Generate three different random secrets of at least 32 bytes. For example:
 
-```bash
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Apply all migrations, enter secrets only into Wrangler prompts, and deploy:
+
+```powershell
 npx wrangler d1 migrations apply server-control --remote
 npx wrangler secret put JWT_SECRET
 npx wrangler secret put BOOTSTRAP_KEY
@@ -35,145 +46,160 @@ npx wrangler secret put YANDEX_DEVICE_ID
 npx wrangler deploy
 ```
 
-Для `JWT_SECRET`, `BOOTSTRAP_KEY` и `AGENT_API_KEY` сгенерируйте разные
-случайные строки длиной не менее 32 байт. Например:
+Keep `BOOTSTRAP_KEY` until the first owner is created. `AGENT_API_KEY` must also
+be placed in `/etc/server-control/agent-config.json`; it never goes into the
+desktop client.
 
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+Verify the public, unauthenticated liveness endpoint:
+
+```powershell
+curl.exe https://YOUR-WORKER.workers.dev/health
 ```
 
-Сохраните только для себя `BOOTSTRAP_KEY` и `AGENT_API_KEY`. После создания
-аккаунта владельца `BOOTSTRAP_KEY` больше не работает, потому что Worker не
-разрешает второй первоначальный аккаунт.
+It should return `{"ok":true,...}`. The detailed `/v1/health` endpoint requires
+a signed-in user and filters fields according to permissions.
 
-Worker использует официальный API Яндекс Умного дома: он читает состояние
-розетки по `GET /v1.0/devices/{device_id}` и отправляет действие по
-`POST /v1.0/devices/actions`. Поэтому ему нужен OAuth-токен и ID именно той
-розетки, которая питает домашний сервер.
+## 3. Prepare Minecraft and RCON
 
-## 3. Подготовить Minecraft на Debian
+For each existing pack, enable local RCON in `server.properties`:
 
-Текущая сборка расположена в `/opt/minecraft/dragonfyre`.
-
-1. В `server.properties` включите RCON и задайте новый длинный пароль:
-
-   ```properties
-   enable-rcon=true
-   rcon.port=25575
-   rcon.password=ДЛИННЫЙ_СЛУЧАЙНЫЙ_ПАРОЛЬ
-   ```
-
-2. Не открывайте и не пробрасывайте порт `25575` в интернет. Агент подключается
-   к нему только по `127.0.0.1`.
-3. В `variables.txt` у Dragonfyre установите `RESTART=false`, иначе команда
-   остановки Minecraft может запустить его снова.
-4. Скопируйте `agent/minecraft-dragonfyre.service.example` в
-   `/etc/systemd/system/minecraft-dragonfyre.service`, затем выполните:
-
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now minecraft-dragonfyre.service
-   ```
-
-Перед включением убедитесь, что сервер нормально запускается и останавливается:
-
-```bash
-sudo systemctl status minecraft-dragonfyre.service
-sudo systemctl stop minecraft-dragonfyre.service
-sudo systemctl start minecraft-dragonfyre.service
+```properties
+enable-rcon=true
+rcon.port=25575
+rcon.password=USE_A_LONG_RANDOM_PASSWORD
 ```
 
-## 4. Установить агента
+Use a unique RCON and game port for every concurrently running instance. Bind or
+firewall RCON to localhost; never port-forward it. For Dragonfyre, set
+`RESTART=false` so a normal stop is not immediately undone by its shell loop.
 
-На `ChipdanServer`:
+The 1.0 installer creates an unprivileged `minecraft` account and a managed
+systemd template. Existing packs can continue using an allow-listed legacy
+service until imported into the managed profile list.
+
+## 4. Build or download the release
+
+Push a semantic tag such as `v1.0.0`. The release workflow first validates
+Python, JavaScript, shell syntax, migrations and tests on Ubuntu, then performs
+the Windows PyInstaller build. It publishes:
+
+- `ServerControl-Setup.zip` and SHA-256;
+- `ServerControl-Update.zip` and SHA-256;
+- `ServerControl-Agent.zip` and SHA-256.
+
+If release assets are placed in another public repository, set GitHub Actions:
+
+- variable `RELEASE_REPOSITORY=owner/public-release-repository`;
+- secret `RELEASE_REPOSITORY_TOKEN`, fine-grained **Contents: read/write** only
+  for that repository.
+
+## 5. Install Debian Agent
+
+Download the matching release assets on Debian and verify the archive before
+extracting it:
 
 ```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin servercontrol
-sudo install -d -o servercontrol -g servercontrol /opt/server-control /etc/server-control
-sudo install -o servercontrol -g servercontrol -m 0755 agent/server_control_agent.py /opt/server-control/server_control_agent.py
-sudo install -o servercontrol -g servercontrol -m 0600 agent-config.json /etc/server-control/agent-config.json
-sudo install -o root -g root -m 0440 agent/servercontrol-sudoers.example /etc/sudoers.d/servercontrol
-sudo install -o root -g root -m 0644 agent/server-control-agent.service /etc/systemd/system/server-control-agent.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now server-control-agent.service
+cd /tmp
+curl -fL https://github.com/OWNER/REPOSITORY/releases/download/v1.0.0/ServerControl-Agent.zip -o ServerControl-Agent.zip
+curl -fL https://github.com/OWNER/REPOSITORY/releases/download/v1.0.0/ServerControl-Agent.zip.sha256 -o ServerControl-Agent.zip.sha256
+sha256sum -c ServerControl-Agent.zip.sha256
+install -d -m 0700 /tmp/server-control-agent-1.0.0
+unzip -q ServerControl-Agent.zip -d /tmp/server-control-agent-1.0.0
+sudo sh /tmp/server-control-agent-1.0.0/install-agent.sh
 ```
 
-Перед командой с `agent-config.json` создайте его из
-`agent/config.example.json` и заполните:
-
-- `hub_url` — URL Worker после `wrangler deploy`;
-- `agent_api_key` — тот же, что добавлен в Cloudflare Secrets;
-- `minecraft.rcon_password` — пароль из `server.properties`;
-- при необходимости имя systemd-службы и allow-list Linux-команд.
-
-Проверьте агент:
+On a new installation the installer creates
+`/etc/server-control/agent-config.json` from the example and intentionally does
+not start with placeholder secrets successfully. Edit it as root:
 
 ```bash
-sudo systemctl status server-control-agent.service
-sudo journalctl -u server-control-agent.service -f
+sudoedit /etc/server-control/agent-config.json
 ```
 
-Если лог Minecraft недоступен агенту, добавьте пользователя `servercontrol` в
-группу `minecraft`, затем перезапустите агент:
+Required values:
+
+- `hub_url`: deployed HTTPS Worker URL;
+- `agent_api_key`: exact Cloudflare `AGENT_API_KEY` value;
+- legacy `minecraft.rcon_password`: current pack's local RCON password;
+- `allowed_services`: only exact extra services the UI may control.
+
+Do not broaden the sudoers wildcard. It points only to a root-owned helper that
+revalidates exact action and unit names against local configuration/profiles.
+
+Restart and verify:
 
 ```bash
-sudo usermod -aG minecraft servercontrol
 sudo systemctl restart server-control-agent.service
+sudo systemctl --no-pager --full status server-control-agent.service
+sudo journalctl -u server-control-agent.service -n 100 --no-pager
 ```
 
-## 5. Собрать и установить Windows-клиент
+## 6. Install Windows client
 
-В GitHub создайте релиз с тегом `v0.1.0`: workflow
-`.github/workflows/release.yml` соберёт `ServerControl-Setup.zip` и
-`ServerControl-Update.zip`.
+Extract `ServerControl-Setup.zip` into:
 
-Распакуйте `ServerControl-Setup.zip` в папку без ограничений на запись, например
-`%LOCALAPPDATA%\ServerControl`. Рядом с `ServerControl.exe` откройте
-`server-control.json` и укажите:
+```text
+%LOCALAPPDATA%\ServerControl
+```
+
+Edit only `server-control.json` next to `ServerControl.exe`:
 
 ```json
 {
-  "api_base_url": "https://ВАШ-WORKER.workers.dev",
+  "api_base_url": "https://YOUR-WORKER.workers.dev",
   "update": {
     "enabled": true,
     "install_automatically": true,
-    "repository": "ВАШ-GITHUB/server-control-releases",
+    "repository": "OWNER/PUBLIC-RELEASE-REPOSITORY",
     "asset_name": "ServerControl-Update.zip"
   }
 }
 ```
 
-Для автоматических обновлений репозиторий с release-архивами должен быть
-доступен пользователям приложения без GitHub-токена. Его можно сделать
-отдельным публичным репозиторием, содержащим только файлы релизов; исходный код
-при этом можно оставить в другом приватном репозитории. В обновлениях нет
-секретов.
+The updater accepts only GitHub Release asset URLs and requires a matching
+SHA-256. It keeps the previous executable and rolls back if the new client does
+not write its health marker.
 
-Если исходный репозиторий закрытый, создайте публичный
-`server-control-releases`, а в GitHub исходного проекта добавьте:
+## 7. Create owner and users
 
-- переменную Actions `RELEASE_REPOSITORY` со значением
-  `ваш-аккаунт/server-control-releases`;
-- секрет Actions `RELEASE_REPOSITORY_TOKEN` — fine-grained token с правом
-  **Contents: Read and write** только для репозитория релизов.
+1. Start `ServerControl.exe`.
+2. Choose **Первоначальная настройка**.
+3. Enter the saved `BOOTSTRAP_KEY`, owner login and a 12–128 character password.
+4. Open **Пользователи** and assign an exact preset or granular permissions.
+5. Revoke `BOOTSTRAP_KEY` from Cloudflare after setup if you do not need to keep
+   it; the API also refuses a second owner bootstrap while an owner exists.
 
-Workflow сам загрузит оба архива в этот публичный репозиторий. Если исходный
-репозиторий публичный, ничего добавлять не нужно: обновления будут публиковаться
-в нём же.
+Suggested least-privilege presets:
 
-## 6. Создать владельца и пользователей
+| Preset | Typical access |
+|---|---|
+| Viewer | server/Minecraft/file read and logs |
+| File Manager | Viewer plus confined file changes |
+| Operator | start/stop/restart, console and players |
+| Admin | most administration except owner-critical power/delete/user delegation |
 
-1. Запустите `ServerControl.exe`.
-2. Нажмите **Первичная настройка**.
-3. Введите сохранённый `BOOTSTRAP_KEY`, логин владельца и пароль от 12 символов.
-4. Войдите в приложение и во вкладке **Пользователи** создайте остальных людей.
-5. Отключение пользователя немедленно отзывает его текущий сеанс. Старый EXE,
-   сохранённый пароль или отсутствие обновления не дадут ему отправить команду.
+## 8. Add or import instances
 
-## 7. Как работает безопасное выключение
+Open **Сборки → Добавить** and choose empty, Vanilla, ZIP, existing directory or
+duplicate. For ZIP/import, review detected loader, Java, ports and startup
+command. The first launch remains blocked until the startup command is marked as
+reviewed. Never approve a command from an untrusted pack without inspecting its
+files.
 
-Кнопка **Безопасно выключить** не обесточивает сервер сразу. Она ставит задачу
-агенту: отправить `save-all flush`, остановить Minecraft, дождаться завершения
-службы и выполнить `sync`. Только после успешного ответа агенту Worker посылает
-умной розетке команду выключения. Кнопка **Отключить сразу** доступна только
-владельцу и предназначена для аварийных случаев.
+## 9. Post-install verification
+
+Perform these checks before calling the installation production-ready:
+
+1. `/health` responds and authenticated **Обновления** shows Worker/DB/Agent.
+2. Agent status is `active (running)` and Agent protocol is `2`.
+3. Dashboard values update and stop changing to fake values when Agent is off.
+4. `list` returns an `[RCON]` response; console receives only new rows.
+5. Start/stop/restart one test instance and confirm real log-driven stages.
+6. Create and download a backup, then restore it only on a disposable test copy.
+7. Upload/download a test file and compare SHA-256.
+8. Create a Viewer and verify write/admin/server details are unavailable.
+9. Disable that user and verify their existing session is rejected immediately.
+10. Test desktop and Agent update rollback on a non-production release first.
+
+See [Testing](TESTING.md) for the repository checks and [Security](SECURITY.md)
+for hardening and incident actions.
