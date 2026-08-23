@@ -18,8 +18,10 @@ from server_control_agent import (  # noqa: E402
     Agent,
     Config,
     EventBuffer,
+    HubError,
     MinecraftStartupTracker,
     RconClient,
+    is_rcon_lifecycle_log,
     parse_meminfo,
     parse_minecraft_player_list,
     parse_proc_diskstats,
@@ -29,6 +31,8 @@ from server_control_agent import (  # noqa: E402
 from main import (  # noqa: E402
     display_bytes,
     display_duration,
+    is_legacy_agent_network_error,
+    is_rcon_lifecycle_message,
     minecraft_completion_candidates,
     replace_minecraft_completion,
 )
@@ -125,6 +129,9 @@ class ProjectTests(unittest.TestCase):
             def __exit__(self, *_args: object) -> None:
                 return None
 
+            def close(self) -> None:
+                return None
+
             def settimeout(self, _timeout: float) -> None:
                 return None
 
@@ -148,6 +155,74 @@ class ProjectTests(unittest.TestCase):
             result = RconClient("127.0.0.1", 25575, "secret").command("help")
         self.assertEqual(result, "first part second part")
         self.assertEqual(len(connection.sent), 3)
+
+    def test_rcon_reuses_one_authenticated_connection(self) -> None:
+        def packet(request_id: int, packet_type: int, payload: str) -> bytes:
+            body = struct.pack("<ii", request_id, packet_type) + payload.encode("utf-8") + b"\x00\x00"
+            return struct.pack("<i", len(body)) + body
+
+        class FakeConnection:
+            def __init__(self, response: bytes) -> None:
+                self.response = response
+                self.sent: list[bytes] = []
+
+            def settimeout(self, _timeout: float) -> None:
+                return None
+
+            def sendall(self, data: bytes) -> None:
+                self.sent.append(data)
+
+            def recv(self, count: int) -> bytes:
+                chunk, self.response = self.response[:count], self.response[count:]
+                return chunk
+
+            def close(self) -> None:
+                return None
+
+        base_id = 123_456
+        connection = FakeConnection(
+            packet(base_id, 2, "")
+            + packet(base_id + 1, 0, "first")
+            + packet(base_id + 2, 0, "")
+            + packet(base_id + 5, 0, "second")
+            + packet(base_id + 6, 0, "")
+        )
+        with patch("server_control_agent.socket.create_connection", return_value=connection) as connect, patch(
+            "server_control_agent.time.time", return_value=123.456
+        ):
+            client = RconClient("127.0.0.1", 25575, "secret")
+            self.assertEqual(client.command("help"), "first")
+            self.assertEqual(client.command("list"), "second")
+        connect.assert_called_once()
+        self.assertEqual(len(connection.sent), 5)
+
+    def test_transient_console_noise_is_recognized(self) -> None:
+        started = "[RCON Listener #1/INFO] Thread RCON Client /127.0.0.1 started"
+        stopped = "[RCON Client /127.0.0.1 #42/INFO] Thread RCON Client /127.0.0.1 shutting down"
+        self.assertTrue(is_rcon_lifecycle_log(started))
+        self.assertTrue(is_rcon_lifecycle_message(stopped))
+        self.assertFalse(is_rcon_lifecycle_log("[Server thread/ERROR] Failed to start Minecraft"))
+        self.assertTrue(is_legacy_agent_network_error("[agent] Ошибка: Hub unavailable: Temporary failure in name resolution"))
+
+    def test_hub_failures_are_coalesced_until_recovery(self) -> None:
+        config = Config(
+            hub_url="https://example.invalid",
+            agent_api_key="test",
+            poll_seconds=1,
+            heartbeat_seconds=2,
+            request_timeout_seconds=5,
+            minecraft={},
+            commands={"allow_shell_commands": ["uptime"]},
+        )
+        agent = Agent(config)
+        with patch.object(agent, "_stderr"):
+            agent._record_hub_failure(HubError("Hub unavailable: DNS"))
+            agent._record_hub_failure(HubError("Hub unavailable: DNS"))
+            agent._record_hub_recovered()
+        messages = [event["message"] for event in agent.events.take(10)]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("временно потеряна", messages[0])
+        self.assertIn("Скрыто повторных сообщений: 1", messages[1])
 
     def test_update_archive_prepares_a_separate_bootstrap_updater(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

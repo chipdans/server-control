@@ -17,7 +17,7 @@ from api import ApiClient, ApiError
 from updater import download_update, is_newer, latest_release, launch_updater
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 APP_TITLE = "Server Control"
 STATUS_POLL_INTERVAL_MS = 1_000
 SERVER_LOG_POLL_INTERVAL_SECONDS = 5
@@ -134,6 +134,27 @@ def display_percent(value: Any) -> tuple[float, str]:
         return 0.0, "—"
     bounded = max(0.0, min(100.0, number))
     return bounded, f"{bounded:.1f}%"
+
+
+def is_rcon_lifecycle_message(message: str) -> bool:
+    """Recognize old RCON connection bookkeeping already stored in D1."""
+
+    lowered = message.casefold()
+    return (
+        "thread rcon client" in lowered
+        and ("rcon listener" in lowered or "rcon client" in lowered)
+        and (" started" in lowered or " shutting down" in lowered)
+    )
+
+
+def is_legacy_agent_network_error(message: str) -> bool:
+    """Recognize pre-1.2.1 transient network errors that used to repeat."""
+
+    lowered = message.casefold()
+    return message.startswith("[agent] Ошибка:") and any(
+        marker in lowered
+        for marker in ("hub unavailable", "temporary failure in name resolution", "read operation timed out")
+    )
 
 
 # Minecraft's RCON protocol does not expose the game client's Brigadier tab
@@ -1064,9 +1085,20 @@ class ServerControlApp:
         except tk.TclError:
             was_at_bottom = True
         console.configure(state="normal")
+        legacy_network_notice_shown = bool(getattr(console, "_legacy_network_notice_shown", False))
         for event in events:
             if isinstance(event, dict):
                 message = str(event.get("message", ""))
+                if is_rcon_lifecycle_message(message):
+                    continue
+                if is_legacy_agent_network_error(message):
+                    if legacy_network_notice_shown:
+                        continue
+                    legacy_network_notice_shown = True
+                    message = (
+                        "[agent] Предупреждение: ранее связь с Control Hub временно прерывалась. "
+                        "Повторяющиеся старые сообщения скрыты."
+                    )
                 lower = message.casefold()
                 tag = ""
                 if any(marker in lower for marker in ("[error]", "exception", "failed", "ошибка")):
@@ -1076,6 +1108,7 @@ class ServerControlApp:
                 elif message.startswith((">", "▶", "[RCON]")):
                     tag = "command"
                 console.insert("end", f"{message}\n", tag)
+        setattr(console, "_legacy_network_notice_shown", legacy_network_notice_shown)
         line_count = int(console.index("end-1c").split(".")[0])
         if line_count > 1_500:
             console.delete("1.0", f"{line_count - 1_000}.0")

@@ -29,13 +29,26 @@ from pathlib import Path
 from typing import Any
 
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 MAX_EVENT_MESSAGE = 8000
 MAX_EVENT_BUFFER_EVENTS = 2_000
 MAX_EVENT_BUFFER_BYTES = 2 * 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 128 * 1024
 RCON_STATUS_INTERVAL_SECONDS = 2.0
 COMMAND_LIST_REFRESH_SECONDS = 15 * 60
+HUB_RETRY_MAX_SECONDS = 10.0
+HUB_ERROR_LOG_INTERVAL_SECONDS = 60.0
+
+
+def is_rcon_lifecycle_log(message: str) -> bool:
+    """Hide connection bookkeeping produced by Minecraft's local RCON server."""
+
+    lowered = message.casefold()
+    return (
+        "thread rcon client" in lowered
+        and ("rcon listener" in lowered or "rcon client" in lowered)
+        and (" started" in lowered or " shutting down" in lowered)
+    )
 
 
 class HubError(RuntimeError):
@@ -100,6 +113,11 @@ class HubClient:
             raise HubError(f"Hub returned HTTP {error.code}: {details[:500]}") from error
         except urllib.error.URLError as error:
             raise HubError(f"Hub unavailable: {error.reason}") from error
+        except TimeoutError as error:
+            # ``http.client`` can surface a read timeout directly instead of
+            # wrapping it in URLError.  Treat both forms as the same temporary
+            # Control Hub outage so the retry/backoff logic can coalesce them.
+            raise HubError(f"Hub unavailable: {error}") from error
 
         try:
             parsed = json.loads(response_data)
@@ -559,7 +577,13 @@ def parse_help_command_names(output: str) -> list[str]:
 
 
 class RconClient:
-    """Small, local-only implementation of the Minecraft RCON protocol."""
+    """Small, local-only implementation of the Minecraft RCON protocol.
+
+    Minecraft writes a pair of log lines every time an RCON TCP connection is
+    opened and closed.  Reusing one authenticated connection avoids tens of
+    thousands of useless lines per day while keeping commands synchronous and
+    local-only.
+    """
 
     AUTH = 3
     COMMAND = 2
@@ -569,6 +593,8 @@ class RconClient:
         self.port = port
         self.password = password
         self.timeout = timeout
+        self._connection: socket.socket | None = None
+        self._next_request_id = int(time.time() * 1000) & 0x7FFFFFFC
 
     @staticmethod
     def _packet(request_id: int, packet_type: int, payload: str) -> bytes:
@@ -598,17 +624,43 @@ class RconClient:
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def command(self, command: str) -> str:
-        with socket.create_connection((self.host, self.port), timeout=self.timeout) as connection:
-            connection.settimeout(self.timeout)
-            # Reserve two following signed-int IDs for command completion.
-            request_id = int(time.time() * 1000) & 0x7FFFFFFC
+    def close(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is None:
+            return
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+    def _connect(self) -> socket.socket:
+        if self._connection is not None:
+            return self._connection
+        connection = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        connection.settimeout(self.timeout)
+        request_id = self._next_request_id
+        try:
             connection.sendall(self._packet(request_id, self.AUTH, self.password))
             authenticated_id, _, _ = self._read_packet(connection)
             if authenticated_id == -1:
                 raise RuntimeError("RCON authentication failed")
-            command_id = request_id + 1
-            terminator_id = request_id + 2
+        except Exception:
+            try:
+                connection.close()
+            except OSError:
+                pass
+            raise
+        self._connection = connection
+        return connection
+
+    def command(self, command: str) -> str:
+        connection = self._connect()
+        # Reserve two following signed-int IDs for command completion.
+        request_id = self._next_request_id
+        self._next_request_id = (self._next_request_id + 4) & 0x7FFFFFFC
+        command_id = request_id + 1
+        terminator_id = request_id + 2
+        try:
             connection.sendall(self._packet(command_id, self.COMMAND, command))
             # Long RCON results are allowed to arrive as several packets.  A
             # second, empty command gives us a deterministic end marker while
@@ -629,6 +681,12 @@ class RconClient:
                 if response_id == command_id:
                     chunks.append(payload)
             return "".join(chunks)
+        except Exception:
+            # A stale connection must never poison following commands.  We do
+            # not automatically repeat the command because it may already
+            # have been executed before the connection failed.
+            self.close()
+            raise
 
 
 class Agent:
@@ -657,22 +715,36 @@ class Agent:
         self.player_limit: int | None = None
         self.command_names: list[str] = []
         self.system_monitor = SystemMonitor()
+        self.hub_failure_count = 0
+        self.hub_failure_started_at = 0.0
+        self.hub_retry_not_before = 0.0
+        self.last_hub_error_log_at = 0.0
 
     def run(self) -> None:
         self.events.add("server", f"Server Control agent {AGENT_VERSION} started.")
-        while True:
-            try:
-                self._tick()
-            except KeyboardInterrupt:
-                raise
-            except Exception as error:  # keep control access alive after a transient failure
-                self._stderr(f"Agent tick failed: {error}")
-                self.events.add("server", f"[agent] Ошибка: {error}")
-            time.sleep(self.config.poll_seconds)
+        try:
+            while True:
+                try:
+                    hub_synced = self._tick()
+                except KeyboardInterrupt:
+                    raise
+                except HubError as error:
+                    self._record_hub_failure(error)
+                except Exception as error:  # keep control access alive after a local failure
+                    self._stderr(f"Agent tick failed: {error}")
+                    self.events.add("server", f"[agent] Ошибка: {error}")
+                else:
+                    if hub_synced:
+                        self._record_hub_recovered()
+                time.sleep(self.config.poll_seconds)
+        finally:
+            self.rcon.close()
 
-    def _tick(self) -> None:
+    def _tick(self) -> bool:
         self._collect_minecraft_logs()
         now = time.monotonic()
+        if now < self.hub_retry_not_before:
+            return False
         if now - self.last_heartbeat >= self.config.heartbeat_seconds:
             self.hub.heartbeat(self._server_status(), self._minecraft_status())
             self.last_heartbeat = now
@@ -681,10 +753,48 @@ class Agent:
         for command in self.hub.get_commands():
             self._execute_queued_command(command)
         self._flush_events()
+        return True
+
+    def _record_hub_failure(self, error: HubError) -> None:
+        now = time.monotonic()
+        self.hub_failure_count += 1
+        if self.hub_failure_count == 1:
+            self.hub_failure_started_at = now
+            self.last_hub_error_log_at = now
+            reason = str(error).strip()[:300]
+            self._stderr(f"Control Hub connection lost: {reason}")
+            self.events.add(
+                "server",
+                f"[agent] Предупреждение: связь с Control Hub временно потеряна: {reason}. "
+                "Повторяющиеся сообщения скрыты.",
+            )
+        elif now - self.last_hub_error_log_at >= HUB_ERROR_LOG_INTERVAL_SECONDS:
+            self.last_hub_error_log_at = now
+            self._stderr(f"Control Hub is still unavailable; suppressed failures: {self.hub_failure_count - 1}")
+        delay = min(HUB_RETRY_MAX_SECONDS, float(2 ** min(self.hub_failure_count - 1, 4)))
+        self.hub_retry_not_before = now + delay
+
+    def _record_hub_recovered(self) -> None:
+        if not self.hub_failure_count:
+            return
+        elapsed = max(1, round(time.monotonic() - self.hub_failure_started_at))
+        suppressed = max(0, self.hub_failure_count - 1)
+        self._stderr(f"Control Hub connection restored after {elapsed}s")
+        self.events.add(
+            "server",
+            f"[agent] Связь с Control Hub восстановлена через {elapsed} с. "
+            f"Скрыто повторных сообщений: {suppressed}.",
+        )
+        self.hub_failure_count = 0
+        self.hub_failure_started_at = 0.0
+        self.hub_retry_not_before = 0.0
+        self.last_hub_error_log_at = 0.0
 
     def _collect_minecraft_logs(self) -> None:
         for line in self.log_tail.read_new_lines():
             self.startup.observe(line)
+            if is_rcon_lifecycle_log(line):
+                continue
             self.events.add("minecraft", line)
 
     def _flush_events(self) -> None:
