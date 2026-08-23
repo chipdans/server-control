@@ -35,7 +35,7 @@ from sc_agent.instances import InstanceProfile
 from sc_agent.security import atomic_write_bytes, secure_path_within, validate_instance_id
 
 
-AGENT_VERSION = "2.0.0"
+AGENT_VERSION = "2.0.1"
 PROTOCOL_VERSION = 2
 MAX_EVENT_MESSAGE = 8000
 MAX_EVENT_BUFFER_EVENTS = 2_000

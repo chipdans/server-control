@@ -111,6 +111,22 @@ jobs:
           Copy-Item agent/servercontrol-sudoers.example agent-package/servercontrol-sudoers.example
           Copy-Item agent/config.example.json agent-package/config.example.json
           Copy-Item agent/sc_agent/*.py agent-package/sc_agent/
+          # Git for Windows may check text files out with CRLF.  The Debian
+          # bundle must be valid POSIX text regardless of runner defaults.
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          Get-ChildItem agent-package -File -Recurse | Where-Object {
+            $_.Extension -in '.py', '.sh', '.service', '.example', '.json'
+          } | ForEach-Object {
+            $text = [System.IO.File]::ReadAllText($_.FullName)
+            $text = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+            [System.IO.File]::WriteAllText($_.FullName, $text, $utf8NoBom)
+          }
+          $crlfFiles = Get-ChildItem agent-package -File -Recurse | Where-Object {
+            $_.Extension -in '.py', '.sh', '.service', '.example', '.json'
+          } | Where-Object {
+            [System.IO.File]::ReadAllText($_.FullName).Contains("`r")
+          }
+          if ($crlfFiles) { throw "Agent bundle still contains CR characters: $($crlfFiles.FullName -join ', ')" }
           $source = Get-Content agent/server_control_agent.py -Raw
           $version = [regex]::Match($source, 'AGENT_VERSION\s*=\s*"([^"]+)"').Groups[1].Value
           if ($version -eq "") { throw "Could not determine AGENT_VERSION" }

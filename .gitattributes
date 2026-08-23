@@ -1,0 +1,10 @@
+* text=auto
+
+# Debian consumes these files directly.  Keep POSIX line endings even when a
+# release archive is assembled by a Windows GitHub Actions runner.
+agent/*.sh text eol=lf
+agent/*.py text eol=lf
+agent/*.service text eol=lf
+agent/*.example text eol=lf
+agent/*.json text eol=lf
+agent/sc_agent/*.py text eol=lf

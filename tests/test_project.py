@@ -60,6 +60,22 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_debian_release_files_use_posix_line_endings(self) -> None:
+        release_files = [
+            ROOT / "agent" / "install-agent.sh",
+            ROOT / "agent" / "server-control-agent.service",
+            ROOT / "agent" / "server-control-minecraft@.service",
+            ROOT / "agent" / "servercontrol-sudoers.example",
+            ROOT / "agent" / "server_control_agent.py",
+            ROOT / "agent" / "agent_update_helper.py",
+            ROOT / "agent" / "service_control_helper.py",
+            ROOT / "agent" / "instance_runner.py",
+            *(ROOT / "agent" / "sc_agent").glob("*.py"),
+        ]
+        for path in release_files:
+            with self.subTest(path=path.name):
+                self.assertNotIn(b"\r", path.read_bytes())
+
     def test_database_migration_runs_in_sqlite(self) -> None:
         connection = sqlite3.connect(":memory:")
         for migration_path in sorted((ROOT / "worker" / "migrations").glob("*.sql")):

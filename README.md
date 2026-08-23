@@ -96,8 +96,8 @@ Additional references:
 
 ## Version compatibility
 
-Release `v1.0.0` contains desktop client `1.0.0`, Control Hub API `2` and
-Agent `2.0.0` (protocol `2`). The Worker retains compatibility routes during a
+Release `v1.0.1` contains desktop client `1.0.1`, Control Hub API `2` and
+Agent `2.0.1` (protocol `2`). The Worker retains compatibility routes during a
 rolling upgrade. New management/file/job features stay disabled with a clear
 message until Agent protocol 2 is online.
 
