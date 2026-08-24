@@ -75,7 +75,7 @@ function decodeOpaqueId(value) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -88,7 +88,7 @@ export default {
     }
 
     try {
-      return await route(request, env);
+      return await route(request, env, ctx);
     } catch (error) {
       if (error instanceof ApiError) {
         return json({ error: error.code, message: error.message }, error.status);
@@ -102,7 +102,7 @@ export default {
   },
 };
 
-async function route(request, env) {
+async function route(request, env, ctx) {
   const url = new URL(request.url);
   const { pathname } = url;
   const { method } = request;
@@ -120,7 +120,7 @@ async function route(request, env) {
   }
 
   if (pathname.startsWith("/v1/agent/")) {
-    return routeAgent(request, env, pathname);
+    return routeAgent(request, env, pathname, ctx);
   }
 
   const session = await requireSession(request, env);
@@ -334,7 +334,7 @@ async function login(request, env) {
   return json({ token, user: publicUser(user) });
 }
 
-async function routeAgent(request, env, pathname) {
+async function routeAgent(request, env, pathname, ctx) {
   requireAgent(request, env);
 
   const controlPlaneResponse = await routeAgentControlPlane(request, env, pathname, {
@@ -354,8 +354,6 @@ async function routeAgent(request, env, pathname) {
 
   if (request.method === "POST" && pathname === "/v1/agent/heartbeat") {
     const body = await readJson(request, 512 * 1024);
-    const previous = await env.DB.prepare("SELECT status FROM agent_status WHERE id = 'primary'").first();
-    const previousStatus = previous ? safeJson(previous.status, {}) : {};
     const status = {
       server: isObject(body.server) ? body.server : {},
       minecraft: isObject(body.minecraft) ? body.minecraft : {},
@@ -372,13 +370,20 @@ async function routeAgent(request, env, pathname) {
       agent_version: typeof body.agent_version === "string" ? body.agent_version.slice(0, 64) : "unknown",
     };
     const now = Date.now();
-    await env.DB.prepare(
-      `INSERT INTO agent_status (id, status, updated_at) VALUES ('primary', ?, ?)
-       ON CONFLICT(id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
-    )
-      .bind(JSON.stringify(status), now)
-      .run();
-    await notifyHeartbeatTransitions(env, previousStatus, status);
+    const [previousResult] = await env.DB.batch([
+      env.DB.prepare("SELECT status FROM agent_status WHERE id = 'primary'"),
+      env.DB.prepare(
+        `INSERT INTO agent_status (id, status, updated_at) VALUES ('primary', ?, ?)
+         ON CONFLICT(id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
+      ).bind(JSON.stringify(status), now),
+    ]);
+    const previous = previousResult?.results?.[0];
+    const previousStatus = previous ? safeJson(previous.status, {}) : {};
+    const notifications = notifyHeartbeatTransitions(env, previousStatus, status).catch((error) => {
+      console.error("Heartbeat transition notification failed", error);
+    });
+    if (ctx?.waitUntil) ctx.waitUntil(notifications);
+    else await notifications;
     return json({ ok: true, server_time: now });
   }
 

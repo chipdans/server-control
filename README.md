@@ -96,8 +96,8 @@ Additional references:
 
 ## Version compatibility
 
-Release `v1.0.2` contains desktop client `1.0.2`, Control Hub API `2` and
-Agent `2.0.2` (protocol `2`). Polling is bounded for the Workers Free daily
+Release `v1.0.3` contains desktop client `1.0.3`, Control Hub API `2` and
+Agent `2.0.3` (protocol `2`). Polling is bounded for the Workers Free daily
 request allowance. The Worker retains compatibility routes during a
 rolling upgrade. New management/file/job features stay disabled with a clear
 message until Agent protocol 2 is online.
