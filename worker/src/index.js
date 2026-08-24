@@ -1140,7 +1140,14 @@ async function readJson(request, maxBytes = 32_768) {
   }
   try {
     if (!request.body) throw new Error("empty body");
-    const reader = request.body.getReader();
+    const contentEncoding = (request.headers.get("content-encoding") || "identity").toLowerCase();
+    if (!["identity", "gzip"].includes(contentEncoding)) {
+      throw new ApiError(415, "unsupported_content_encoding", "Неподдерживаемое сжатие запроса.");
+    }
+    const stream = contentEncoding === "gzip"
+      ? request.body.pipeThrough(new DecompressionStream("gzip"))
+      : request.body;
+    const reader = stream.getReader();
     const chunks = [];
     let total = 0;
     while (true) {

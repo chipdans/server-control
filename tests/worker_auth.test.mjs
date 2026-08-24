@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import worker from "../worker/src/index.js";
 import {
   boundedJobResult,
@@ -177,6 +178,25 @@ async function call(env, method, path, body, token, extraHeaders = {}) {
   const response = await worker.fetch(request, env);
   return { response, json: await response.json() };
 }
+
+test("gzip JSON requests are decompressed with the normal size guard", async () => {
+  const env = {
+    DB: new FakeD1(), JWT_SECRET: "x".repeat(48), BOOTSTRAP_KEY: "bootstrap-secret",
+    AGENT_API_KEY: "agent-secret", YANDEX_OAUTH_TOKEN: "not-used", YANDEX_DEVICE_ID: "not-used",
+  };
+  const body = gzipSync(Buffer.from(JSON.stringify({
+    username: "compressed-owner", password: "a secure compressed password",
+  })));
+  const response = await worker.fetch(new Request("https://control.example/v1/setup", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json", "content-encoding": "gzip", "x-bootstrap-key": "bootstrap-secret",
+    },
+    body,
+  }), env);
+  assert.equal(response.status, 201);
+  assert.equal((await response.json()).user.username, "compressed-owner");
+});
 
 test("disabled user loses access even with an already issued token", async () => {
   const env = {

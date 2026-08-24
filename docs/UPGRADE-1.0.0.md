@@ -1,4 +1,4 @@
-# Обновление существующей установки 0.3.x до 1.0.3
+# Обновление существующей установки 0.3.x до 1.0.4
 
 Этот порядок рассчитан на уже работающий проект `chipdans/server-control`. Он
 сохраняет существующих пользователей D1, URL Worker, Yandex secrets,
@@ -49,8 +49,8 @@ curl.exe https://server-control-hub.channelchipdanq.workers.dev/health
 ```powershell
 cd D:\Code\server
 git fetch origin
-git tag -a v1.0.3 origin/main -m "Server Control 1.0.3"
-git push origin v1.0.3
+git tag -a v1.0.4 origin/main -m "Server Control 1.0.4"
+git push origin v1.0.4
 ```
 
 В GitHub Actions дождитесь зелёных jobs `validate` и `build`. В Releases должны
@@ -64,8 +64,8 @@ git push origin v1.0.3
 
 ```bash
 cd /tmp
-curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.3/ServerControl-Agent.zip -o ServerControl-Agent.zip
-curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.3/ServerControl-Agent.zip.sha256 -o ServerControl-Agent.zip.sha256
+curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.4/ServerControl-Agent.zip -o ServerControl-Agent.zip
+curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.4/ServerControl-Agent.zip.sha256 -o ServerControl-Agent.zip.sha256
 sha256sum -c ServerControl-Agent.zip.sha256
 install -d -m 0700 /tmp/server-control-agent-1.0.0
 unzip -q ServerControl-Agent.zip -d /tmp/server-control-agent-1.0.0
@@ -83,11 +83,11 @@ sudo systemctl --no-pager --full status server-control-agent.service
 
 Если старая конфигурация содержит только Dragonfyre, Agent автоматически создаст
 для неё совместимый первый профиль. После запуска откройте **Обновления** и
-убедитесь, что показаны Agent `2.0.3`, protocol `2`.
+убедитесь, что показаны Agent `2.0.4`, protocol `2`.
 
 ### D. Обновить Windows client
 
-Можно запустить текущий `ServerControl.exe`: он найдёт `v1.0.3`, проверит
+Можно запустить текущий `ServerControl.exe`: он найдёт `v1.0.4`, проверит
 SHA-256, обновит client и updater, перезапустится и подтвердит health marker.
 При сбое он вернёт предыдущий EXE и запишет
 `ServerControl-update-error.log` рядом с программой.
@@ -95,7 +95,7 @@ SHA-256, обновит client и updater, перезапустится и по�
 Если автоматическое обновление не стартовало, выполните ручную замену один раз:
 
 1. Закройте Server Control.
-2. Скачайте `ServerControl-Setup.zip` из release `v1.0.3`.
+2. Скачайте `ServerControl-Setup.zip` из release `v1.0.4`.
 3. Сверьте опубликованный SHA-256.
 4. Скопируйте `ServerControl.exe` и `ServerControlUpdater.exe` с заменой в
    `%LOCALAPPDATA%\ServerControl`.

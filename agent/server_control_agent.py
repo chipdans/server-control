@@ -9,6 +9,7 @@ opens a network port on the home server.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import http.client
 import json
@@ -36,7 +37,7 @@ from sc_agent.instances import InstanceProfile
 from sc_agent.security import atomic_write_bytes, secure_path_within, validate_instance_id
 
 
-AGENT_VERSION = "2.0.3"
+AGENT_VERSION = "2.0.4"
 PROTOCOL_VERSION = 2
 MAX_EVENT_MESSAGE = 8000
 MAX_EVENT_BUFFER_EVENTS = 2_000
@@ -158,7 +159,8 @@ class HubClient:
         raise last_error or OSError(f"IPv4 address not found for {host}")
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        body = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        original_body = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = gzip.compress(original_body, compresslevel=6) if original_body is not None and len(original_body) >= 1024 else original_body
         headers = {
             "X-Agent-Key": self.api_key,
             "Accept": "application/json",
@@ -168,6 +170,9 @@ class HubClient:
         }
         if body is not None:
             headers["Content-Length"] = str(len(body))
+        if original_body is not None and body is not original_body:
+            headers["Content-Encoding"] = "gzip"
+            headers["X-Uncompressed-Length"] = str(len(original_body))
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout)
         connection._create_connection = self._create_ipv4_connection  # type: ignore[method-assign]
         try:
@@ -178,7 +183,8 @@ class HubClient:
             finally:
                 response.close()
         except (OSError, TimeoutError, http.client.HTTPException) as error:
-            raise HubError(f"Hub unavailable over IPv4: {error}") from error
+            sizes = f"; request={len(original_body or b'')} B, wire={len(body or b'')} B"
+            raise HubError(f"Hub unavailable over IPv4: {error}{sizes}") from error
         finally:
             connection.close()
 
