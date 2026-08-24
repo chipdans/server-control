@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sqlite3
 import struct
 import sys
@@ -60,6 +61,30 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_hub_transport_resolves_ipv4_only(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class FakeSocket:
+            def settimeout(self, value: float) -> None:
+                calls.append(("timeout", value))
+
+            def bind(self, value: tuple[str, int]) -> None:
+                calls.append(("bind", value))
+
+            def connect(self, value: tuple[str, int]) -> None:
+                calls.append(("connect", value))
+
+            def close(self) -> None:
+                calls.append(("close",))
+
+        with patch("server_control_agent.socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("188.114.96.1", 443)),
+        ]) as addresses, patch("server_control_agent.socket.socket", return_value=FakeSocket()):
+            result = HubClient._create_ipv4_connection(("example.invalid", 443), 15)
+        self.assertIsInstance(result, FakeSocket)
+        self.assertEqual(addresses.call_args.args[2], socket.AF_INET)
+        self.assertIn(("connect", ("188.114.96.1", 443)), calls)
+
     def test_agent_config_enforces_free_tier_safe_polling_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "agent.json"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -123,36 +124,69 @@ class HubClient:
         self.base_url = config.hub_url
         self.api_key = config.agent_api_key
         self.timeout = config.request_timeout_seconds
+        parsed = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("hub_url должен быть корректным адресом HTTPS")
+        self.host = parsed.hostname
+        self.port = parsed.port or 443
+        self.base_path = parsed.path.rstrip("/")
+
+    @staticmethod
+    def _create_ipv4_connection(
+        address: tuple[str, int],
+        timeout: float | object = socket._GLOBAL_DEFAULT_TIMEOUT,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        """Create a TLS transport socket without a broken IPv6 detour."""
+
+        host, port = address
+        last_error: OSError | None = None
+        for family, socktype, protocol, _name, sockaddr in socket.getaddrinfo(
+            host, port, socket.AF_INET, socket.SOCK_STREAM
+        ):
+            sock = socket.socket(family, socktype, protocol)
+            try:
+                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(float(timeout))
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as error:
+                last_error = error
+                sock.close()
+        raise last_error or OSError(f"IPv4 address not found for {host}")
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=body,
-            method=method,
-            headers={
-                "X-Agent-Key": self.api_key,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": f"ServerControlAgent/{AGENT_VERSION}",
-            },
-        )
+        headers = {
+            "X-Agent-Key": self.api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": f"ServerControlAgent/{AGENT_VERSION}",
+            "Connection": "close",
+        }
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+        connection = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout)
+        connection._create_connection = self._create_ipv4_connection  # type: ignore[method-assign]
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            connection.request(method, f"{self.base_path}{path}", body=body, headers=headers)
+            response = connection.getresponse()
+            try:
                 raw = response.read(MAX_HUB_JSON_RESPONSE_BYTES + 1)
-                if len(raw) > MAX_HUB_JSON_RESPONSE_BYTES:
-                    raise HubError("Hub returned an oversized JSON response")
-                response_data = raw.decode("utf-8")
-        except urllib.error.HTTPError as error:
-            details = error.read(4096).decode("utf-8", "replace")
-            raise HubError(f"Hub returned HTTP {error.code}: {details[:500]}") from error
-        except urllib.error.URLError as error:
-            raise HubError(f"Hub unavailable: {error.reason}") from error
-        except TimeoutError as error:
-            # ``http.client`` can surface a read timeout directly instead of
-            # wrapping it in URLError.  Treat both forms as the same temporary
-            # Control Hub outage so the retry/backoff logic can coalesce them.
-            raise HubError(f"Hub unavailable: {error}") from error
+            finally:
+                response.close()
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            raise HubError(f"Hub unavailable over IPv4: {error}") from error
+        finally:
+            connection.close()
+
+        if len(raw) > MAX_HUB_JSON_RESPONSE_BYTES:
+            raise HubError("Hub returned an oversized JSON response")
+        response_data = raw.decode("utf-8", "replace")
+        if response.status >= 400:
+            raise HubError(f"Hub returned HTTP {response.status}: {response_data[:500]}")
 
         try:
             parsed = json.loads(response_data)
