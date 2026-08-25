@@ -96,12 +96,14 @@ Additional references:
 
 ## Version compatibility
 
-Release `v1.0.4` contains desktop client `1.0.4`, Control Hub API `2` and
-Agent `2.0.4` (protocol `2`). Agent JSON is compressed on the wire and polling
-is bounded for the Workers Free daily
-request allowance. The Worker retains compatibility routes during a
-rolling upgrade. New management/file/job features stay disabled with a clear
-message until Agent protocol 2 is online.
+Release `v1.0.5` contains desktop client `1.0.5`, Control Hub API `2` and
+Agent `2.0.4` (protocol `2`). JSON control traffic uses a deterministic IPv4
+TLS transport, the realtime feed reads D1 in one bounded batch, and the Agent
+online window matches its 15-second heartbeat cadence. Agent JSON is compressed
+on the wire and polling is bounded for the Workers Free daily request
+allowance. The Worker retains compatibility routes during a rolling upgrade.
+New management/file/job features stay disabled with a clear message until
+Agent protocol 2 is online.
 
 ## Honest limitations
 

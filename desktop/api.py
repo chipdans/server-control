@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import http.client
 import os
+import socket
 import shutil
 import time
 import urllib.error
@@ -31,7 +33,55 @@ class ApiError(RuntimeError):
 class ApiClient:
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Адрес Control Hub должен быть корректным HTTPS-адресом.")
+        self.host = parsed.hostname
+        self.port = parsed.port or 443
+        self.base_path = parsed.path.rstrip("/")
         self.token: str | None = None
+
+    @staticmethod
+    def _create_ipv4_connection(
+        address: tuple[str, int],
+        timeout: float | object = socket._GLOBAL_DEFAULT_TIMEOUT,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        """Connect directly over IPv4 while retaining normal TLS validation.
+
+        Some home routers advertise an IPv6 route that accepts a connection
+        but never delivers a complete Cloudflare response.  ``urllib`` then
+        waits until its read timeout even though the same URL works through
+        ``curl -4``.  Resolve A records explicitly for the JSON control plane;
+        ``HTTPSConnection`` still validates the certificate for ``host``.
+        """
+
+        host, port = address
+        last_error: OSError | None = None
+        for family, socktype, protocol, _name, sockaddr in socket.getaddrinfo(
+            host, port, socket.AF_INET, socket.SOCK_STREAM
+        ):
+            connection = socket.socket(family, socktype, protocol)
+            try:
+                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    connection.settimeout(float(timeout))
+                if source_address:
+                    connection.bind(source_address)
+                connection.connect(sockaddr)
+                return connection
+            except OSError as error:
+                last_error = error
+                connection.close()
+        raise last_error or OSError(f"IPv4-адрес не найден для {host}")
+
+    def _json_connection(self, timeout_seconds: float) -> http.client.HTTPSConnection:
+        connection = http.client.HTTPSConnection(
+            self.host,
+            self.port,
+            timeout=max(1, timeout_seconds),
+        )
+        connection._create_connection = self._create_ipv4_connection  # type: ignore[method-assign]
+        return connection
 
     def request(
         self,
@@ -42,7 +92,12 @@ class ApiClient:
         *,
         timeout_seconds: float = 25,
     ) -> dict[str, Any]:
-        headers = {"Accept": "application/json", "User-Agent": "ServerControlDesktop/2.0"}
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+            "User-Agent": "ServerControlDesktop/2.0",
+        }
         if payload is not None:
             headers["Content-Type"] = "application/json"
         if self.token:
@@ -50,20 +105,24 @@ class ApiClient:
         if extra_headers:
             headers.update(extra_headers)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
-        request = urllib.request.Request(f"{self.base_url}{path}", data=body, method=method, headers=headers)
-
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+        connection = self._json_connection(timeout_seconds)
         try:
-            with urllib.request.urlopen(request, timeout=max(1, timeout_seconds)) as response:
-                raw = self._read_limited(response, MAX_JSON_RESPONSE_BYTES).decode("utf-8")
+            connection.request(method, f"{self.base_path}{path}", body=body, headers=headers)
+            response = connection.getresponse()
+            try:
+                limit = MAX_ERROR_RESPONSE_BYTES if response.status >= 400 else MAX_JSON_RESPONSE_BYTES
+                raw = self._read_limited(response, limit).decode("utf-8", "replace")
                 status = response.status
-        except TimeoutError as error:
+            finally:
+                response.close()
+        except (TimeoutError, socket.timeout) as error:
             raise ApiError(0, "network_timeout", "Время ожидания ответа истекло.") from error
-        except urllib.error.HTTPError as error:
-            raw = self._read_limited(error, MAX_ERROR_RESPONSE_BYTES).decode("utf-8", "replace")
-            parsed = self._parse_json(raw)
-            raise ApiError(error.code, str(parsed.get("error", "http_error")), str(parsed.get("message", "Ошибка сервера."))) from error
-        except urllib.error.URLError as error:
-            raise ApiError(0, "network_error", f"Не удалось подключиться: {error.reason}") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise ApiError(0, "network_error", f"Не удалось подключиться к Control Hub по IPv4: {error}") from error
+        finally:
+            connection.close()
 
         parsed = self._parse_json(raw)
         if status >= 400:

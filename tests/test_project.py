@@ -61,6 +61,51 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_desktop_json_transport_uses_ipv4_and_closes_each_request(self) -> None:
+        connections: list[object] = []
+
+        class FakeResponse(io.BytesIO):
+            status = 200
+
+            def __init__(self) -> None:
+                value = b'{"ok":true}'
+                super().__init__(value)
+                self.headers = {"content-length": str(len(value))}
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.host = host
+                self.port = port
+                self.timeout = timeout
+                self.closed = False
+                self.request_data: tuple[object, ...] | None = None
+                connections.append(self)
+
+            def request(self, method: str, path: str, body: bytes | None, headers: dict[str, str]) -> None:
+                self.request_data = (method, path, body, headers)
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                self.closed = True
+
+        client = ApiClient("https://control.example/base")
+        client.token = "test-token"
+        with patch("api.http.client.HTTPSConnection", FakeConnection):
+            result = client.request("GET", "/v1/sync?after=0", timeout_seconds=7)
+
+        self.assertEqual(result, {"ok": True})
+        connection = connections[0]
+        self.assertEqual((connection.host, connection.port, connection.timeout), ("control.example", 443, 7))
+        self.assertIs(connection._create_connection, ApiClient._create_ipv4_connection)
+        method, path, body, headers = connection.request_data
+        self.assertEqual((method, path, body), ("GET", "/base/v1/sync?after=0", None))
+        self.assertEqual(headers["Connection"], "close")
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        self.assertTrue(connection.closed)
+
     def test_hub_transport_resolves_ipv4_only(self) -> None:
         calls: list[tuple[object, ...]] = []
 

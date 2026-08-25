@@ -1,4 +1,4 @@
-# Обновление существующей установки 0.3.x до 1.0.4
+# Обновление существующей установки 0.3.x до 1.0.5
 
 Этот порядок рассчитан на уже работающий проект `chipdans/server-control`. Он
 сохраняет существующих пользователей D1, URL Worker, Yandex secrets,
@@ -32,9 +32,9 @@ npx wrangler deploy
 ```
 
 Если Wrangler сообщает, что bucket уже существует, это не ошибка — переходите
-к следующей команде. При миграции должна примениться
-`0004_control_plane.sql`. Повторный запуск миграций безопасен: уже применённые
-файлы пропускаются.
+к следующей команде. При миграции должны примениться
+`0004_control_plane.sql` и `0005_sync_indexes.sql`. Повторный запуск миграций
+безопасен: уже применённые файлы пропускаются.
 
 Проверьте:
 
@@ -49,8 +49,8 @@ curl.exe https://server-control-hub.channelchipdanq.workers.dev/health
 ```powershell
 cd D:\Code\server
 git fetch origin
-git tag -a v1.0.4 origin/main -m "Server Control 1.0.4"
-git push origin v1.0.4
+git tag -a v1.0.5 origin/main -m "Server Control 1.0.5"
+git push origin v1.0.5
 ```
 
 В GitHub Actions дождитесь зелёных jobs `validate` и `build`. В Releases должны
@@ -64,8 +64,8 @@ git push origin v1.0.4
 
 ```bash
 cd /tmp
-curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.4/ServerControl-Agent.zip -o ServerControl-Agent.zip
-curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.4/ServerControl-Agent.zip.sha256 -o ServerControl-Agent.zip.sha256
+curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.5/ServerControl-Agent.zip -o ServerControl-Agent.zip
+curl -fL https://github.com/chipdans/server-control/releases/download/v1.0.5/ServerControl-Agent.zip.sha256 -o ServerControl-Agent.zip.sha256
 sha256sum -c ServerControl-Agent.zip.sha256
 install -d -m 0700 /tmp/server-control-agent-1.0.0
 unzip -q ServerControl-Agent.zip -d /tmp/server-control-agent-1.0.0
@@ -87,7 +87,7 @@ sudo systemctl --no-pager --full status server-control-agent.service
 
 ### D. Обновить Windows client
 
-Можно запустить текущий `ServerControl.exe`: он найдёт `v1.0.4`, проверит
+Можно запустить текущий `ServerControl.exe`: он найдёт `v1.0.5`, проверит
 SHA-256, обновит client и updater, перезапустится и подтвердит health marker.
 При сбое он вернёт предыдущий EXE и запишет
 `ServerControl-update-error.log` рядом с программой.
@@ -95,7 +95,7 @@ SHA-256, обновит client и updater, перезапустится и по�
 Если автоматическое обновление не стартовало, выполните ручную замену один раз:
 
 1. Закройте Server Control.
-2. Скачайте `ServerControl-Setup.zip` из release `v1.0.4`.
+2. Скачайте `ServerControl-Setup.zip` из release `v1.0.5`.
 3. Сверьте опубликованный SHA-256.
 4. Скопируйте `ServerControl.exe` и `ServerControlUpdater.exe` с заменой в
    `%LOCALAPPDATA%\ServerControl`.
@@ -103,7 +103,7 @@ SHA-256, обновит client и updater, перезапустится и по�
 
 ### E. Финальная проверка
 
-1. В заголовке клиента указано `Server Control 1.0.0`.
+1. В заголовке клиента указано `Server Control 1.0.5`.
 2. **Главная** обновляется, связь с Agent online, protocol 2.
 3. Dragonfyre виден в **Сборки**, а его путь/RCON/служба соответствуют старой
    конфигурации.

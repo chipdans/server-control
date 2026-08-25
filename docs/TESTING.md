@@ -62,7 +62,8 @@ Never run first-time negative tests on the only copy of a world.
 
 Measure on the actual deployment while a large modpack runs:
 
-- Worker request count: normally one desktop sync/s and one Agent sync/s;
+- Worker request count: normally one desktop sync per 3 seconds and one Agent
+  poll per 3 seconds, with one heartbeat per 15 seconds;
 - sync response sizes when idle versus during log bursts;
 - desktop process CPU/memory after an hour of console use;
 - Agent memory while Hub is offline (event buffer must remain bounded);

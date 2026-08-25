@@ -3,6 +3,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 import worker from "../worker/src/index.js";
 import {
+  AGENT_ONLINE_MAX_AGE_MS,
   boundedJobResult,
   completeMultipart,
   filterEventsForSession,
@@ -12,6 +13,7 @@ import {
   normalizeJobPayload,
   normalizeRelativePath,
   redactJobValue,
+  routeSync,
 } from "../worker/src/control_plane.js";
 
 class TestApiError extends Error {
@@ -401,6 +403,60 @@ test("realtime sync data is filtered by server-side permissions", () => {
     minecraftOnly,
   );
   assert.deepEqual(events.map((event) => event.message), ["game"]);
+});
+
+test("realtime sync batches D1 reads and keeps a 15-second heartbeat online", async () => {
+  const prepared = [];
+  let batchCalls = 0;
+  const statusUpdatedAt = Date.now() - 20_000;
+  const env = {
+    DB: {
+      prepare(sql) {
+        const statement = {
+          sql: sql.replace(/\s+/g, " ").trim(),
+          args: [],
+          bind(...args) { this.args = args; return this; },
+        };
+        prepared.push(statement);
+        return statement;
+      },
+      async batch(statements) {
+        batchCalls += 1;
+        assert.equal(statements.length, 5);
+        return [
+          { results: [{ status: JSON.stringify({ protocol_version: 2, agent_version: "2.0.4", server: { hostname: "server" } }), updated_at: statusUpdatedAt }] },
+          { results: [] },
+          { results: [{ id: 5, kind: "server", message: "ready", created_at: statusUpdatedAt, instance_id: null, source: "agent", level: "INFO" }] },
+          { results: [{
+            id: "job-1", type: "log_read", payload: "{}", requested_by: "owner", instance_id: "pack",
+            status: "completed", progress: 100, stage: "done", message: "done",
+            result: '{"truncated":true}', error_code: null, lock_key: null, cancel_requested: 0,
+            created_at: 1, started_at: 2, completed_at: 3, updated_at: 4,
+          }] },
+          { results: [] },
+        ];
+      },
+    },
+  };
+  const payload = await routeSync(
+    new Request("https://control.example/v1/sync"),
+    env,
+    new URL("https://control.example/v1/sync?after=0&jobs_since=0&notification_after=0&status_after=0"),
+    { user: { id: "owner", permissions: ["server.view", "logs.view"] } },
+    {
+      safeJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } },
+      json(value) { return value; },
+    },
+  );
+
+  assert.equal(batchCalls, 1);
+  assert.equal(prepared.length, 5);
+  assert.equal(payload.server.online, true);
+  assert.equal(payload.server.status.server.hostname, "server");
+  assert.equal(payload.events[0].message, "ready");
+  assert.equal(payload.jobs[0].result.truncated, true);
+  assert.ok(payload.sync_ms >= 0);
+  assert.equal(AGENT_ONLINE_MAX_AGE_MS, 45_000);
 });
 
 test("job summaries redact commands, file contents, credentials, and oversized results", () => {

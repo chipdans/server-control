@@ -64,6 +64,12 @@ const INSTANCE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 const MAX_JOB_PAYLOAD_BYTES = 256 * 1024;
 const TRANSFER_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_TRANSFER_SIZE = 50 * 1024 * 1024 * 1024;
+export const AGENT_ONLINE_MAX_AGE_MS = 45 * 1000;
+
+const SYNC_EVENT_LIMIT = 250;
+const SYNC_JOB_LIMIT = 100;
+const SYNC_NOTIFICATION_LIMIT = 100;
+const SYNC_JOB_JSON_LIMIT = 32 * 1024;
 
 const SENSITIVE_JOB_KEYS = /(?:password|token|secret|authorization|content|command|output|lines|save_output|private_key|api_key)/i;
 
@@ -376,37 +382,60 @@ export function filterEventsForSession(events, session) {
   ));
 }
 
-async function routeSync(request, env, url, session, h) {
+export async function routeSync(request, env, url, session, h) {
+  const startedAt = Date.now();
   const after = Math.max(0, Number.parseInt(url.searchParams.get("after") || "0", 10) || 0);
   const jobsSince = Math.max(0, Number.parseInt(url.searchParams.get("jobs_since") || "0", 10) || 0);
   const notificationAfter = Math.max(0, Number.parseInt(url.searchParams.get("notification_after") || "0", 10) || 0);
   const statusAfter = Math.max(0, Number.parseInt(url.searchParams.get("status_after") || "0", 10) || 0);
-  const statusRow = await env.DB.prepare("SELECT status, updated_at FROM agent_status WHERE id = 'primary'").first();
-  const powerRow = await env.DB.prepare("SELECT name,on_state,online_state,updated_at FROM power_status WHERE id='primary'").first();
-  const updatedAt = statusRow ? Number(statusRow.updated_at) : 0;
-  const ageMs = updatedAt ? Math.max(0, Date.now() - updatedAt) : null;
-  const logResult = after === 0
-    ? await env.DB.prepare(
-      `SELECT * FROM (SELECT id,kind,message,created_at,instance_id,source,level FROM console_events ORDER BY id DESC LIMIT 250) ORDER BY id ASC`,
-    ).all()
-    : await env.DB.prepare(
-      `SELECT id,kind,message,created_at,instance_id,source,level FROM console_events WHERE id > ? ORDER BY id ASC LIMIT 250`,
-    ).bind(after).all();
-  const jobResult = jobsSince === 0
-    ? await env.DB.prepare("SELECT * FROM jobs WHERE requested_by=? ORDER BY updated_at DESC LIMIT 100").bind(session.user.id).all()
-    : await env.DB.prepare("SELECT * FROM jobs WHERE requested_by=? AND updated_at>? ORDER BY updated_at ASC LIMIT 100").bind(session.user.id, jobsSince).all();
-  const notificationResult = notificationAfter === 0
-    ? await env.DB.prepare(
+  const statusStatement = env.DB.prepare("SELECT status, updated_at FROM agent_status WHERE id = 'primary'");
+  const powerStatement = env.DB.prepare("SELECT name,on_state,online_state,updated_at FROM power_status WHERE id='primary'");
+  const logStatement = after === 0
+    ? env.DB.prepare(
+      `SELECT * FROM (SELECT id,kind,message,created_at,instance_id,source,level FROM console_events ORDER BY id DESC LIMIT ?) ORDER BY id ASC`,
+    ).bind(SYNC_EVENT_LIMIT)
+    : env.DB.prepare(
+      `SELECT id,kind,message,created_at,instance_id,source,level FROM console_events WHERE id > ? ORDER BY id ASC LIMIT ?`,
+    ).bind(after, SYNC_EVENT_LIMIT);
+  // The sync feed only needs safe summaries.  Full payload/result JSON stays
+  // available from /v1/jobs/:id to the requesting user.  Capping it here
+  // prevents one old file-read job from turning every UI refresh into a
+  // multi-megabyte D1 response.
+  const jobColumns = `id,type,
+    CASE WHEN length(payload)<=${SYNC_JOB_JSON_LIMIT} THEN payload ELSE '{}' END AS payload,
+    requested_by,instance_id,status,progress,stage,message,
+    CASE WHEN result IS NULL OR length(result)<=${SYNC_JOB_JSON_LIMIT} THEN result
+         ELSE '{"truncated":true,"message":"Полный результат доступен в задаче."}' END AS result,
+    error_code,lock_key,cancel_requested,created_at,started_at,completed_at,updated_at`;
+  const jobStatement = jobsSince === 0
+    ? env.DB.prepare(`SELECT ${jobColumns} FROM jobs WHERE requested_by=? ORDER BY updated_at DESC LIMIT ?`).bind(session.user.id, SYNC_JOB_LIMIT)
+    : env.DB.prepare(`SELECT ${jobColumns} FROM jobs WHERE requested_by=? AND updated_at>? ORDER BY updated_at ASC LIMIT ?`).bind(session.user.id, jobsSince, SYNC_JOB_LIMIT);
+  const notificationStatement = notificationAfter === 0
+    ? env.DB.prepare(
       `SELECT * FROM (SELECT n.*,CASE WHEN r.user_id IS NULL THEN 0 ELSE 1 END AS is_read
        FROM notifications n LEFT JOIN notification_reads r ON r.notification_id=n.id AND r.user_id=?
        WHERE n.user_id IS NULL OR n.user_id=?
-       ORDER BY n.id DESC LIMIT 100) ORDER BY id ASC`,
-    ).bind(session.user.id, session.user.id).all()
-    : await env.DB.prepare(
+       ORDER BY n.id DESC LIMIT ?) ORDER BY id ASC`,
+    ).bind(session.user.id, session.user.id, SYNC_NOTIFICATION_LIMIT)
+    : env.DB.prepare(
       `SELECT n.*,CASE WHEN r.user_id IS NULL THEN 0 ELSE 1 END AS is_read
        FROM notifications n LEFT JOIN notification_reads r ON r.notification_id=n.id AND r.user_id=?
-       WHERE n.id>? AND (n.user_id IS NULL OR n.user_id=?) ORDER BY n.id ASC LIMIT 100`,
-    ).bind(session.user.id, notificationAfter, session.user.id).all();
+       WHERE n.id>? AND (n.user_id IS NULL OR n.user_id=?) ORDER BY n.id ASC LIMIT ?`,
+    ).bind(session.user.id, notificationAfter, session.user.id, SYNC_NOTIFICATION_LIMIT);
+
+  // D1 batch turns five network round trips into one.  This is especially
+  // important after an idle period when the desktop asks for initial history.
+  const [statusResult, powerResult, logResult, jobResult, notificationResult] = await env.DB.batch([
+    statusStatement,
+    powerStatement,
+    logStatement,
+    jobStatement,
+    notificationStatement,
+  ]);
+  const statusRow = statusResult?.results?.[0] || null;
+  const powerRow = powerResult?.results?.[0] || null;
+  const updatedAt = statusRow ? Number(statusRow.updated_at) : 0;
+  const ageMs = updatedAt ? Math.max(0, Date.now() - updatedAt) : null;
   const allEvents = logResult.results || [];
   const events = filterEventsForSession(allEvents, session);
   const jobs = (jobResult.results || []).map((row) => jobJson(row, h.safeJson)).sort((a, b) => a.updated_at - b.updated_at);
@@ -416,7 +445,7 @@ async function routeSync(request, env, url, session, h) {
   return h.json({
     protocol: { api: 2, minimum_client: "1.0.0", service: "server-control-hub" },
     server: {
-      online: Boolean(statusRow && ageMs < 10_000),
+      online: Boolean(statusRow && ageMs < AGENT_ONLINE_MAX_AGE_MS),
       status: statusRow && updatedAt > statusAfter ? filterStatusForSession(h.safeJson(statusRow.status, {}), session) : undefined,
       status_changed: Boolean(statusRow && updatedAt > statusAfter),
       updated_at: updatedAt || null, age_ms: ageMs,
@@ -434,6 +463,7 @@ async function routeSync(request, env, url, session, h) {
     notifications,
     notification_cursor: notifications.length ? Number(notifications[notifications.length - 1].id) : notificationAfter,
     server_time: Date.now(),
+    sync_ms: Math.max(0, Date.now() - startedAt),
   });
 }
 
@@ -878,7 +908,7 @@ export async function routeControlPlane(request, env, pathname, url, session, he
     const status = row ? h.safeJson(row.status, {}) : {};
     const visibleStatus = filterStatusForSession(status, session);
     const age = row ? Date.now() - Number(row.updated_at) : null;
-    return h.json({ ok: true, protocol: { api: 2 }, backend: true, database: true, agent: Boolean(row && age < 10_000), agent_age_ms: age, agent_version: status.agent_version || "unknown", agent_protocol: status.protocol_version || null, server: visibleStatus.server || null, minecraft: visibleStatus.minecraft || null });
+    return h.json({ ok: true, protocol: { api: 2 }, backend: true, database: true, agent: Boolean(row && age < AGENT_ONLINE_MAX_AGE_MS), agent_age_ms: age, agent_version: status.agent_version || "unknown", agent_protocol: status.protocol_version || null, server: visibleStatus.server || null, minecraft: visibleStatus.minecraft || null });
   }
   let response = await routeInstances(request, env, pathname, session, h);
   if (response) return response;
