@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import hashlib
 import http.client
+import logging
 import os
 import socket
 import shutil
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
 
@@ -31,7 +34,7 @@ class ApiError(RuntimeError):
 
 
 class ApiClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, diagnostic_path: Path | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         parsed = urllib.parse.urlsplit(self.base_url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -40,6 +43,69 @@ class ApiClient:
         self.port = parsed.port or 443
         self.base_path = parsed.path.rstrip("/")
         self.token: str | None = None
+        if diagnostic_path is None:
+            local_root = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
+            diagnostic_path = (
+                Path(local_root) / "ServerControl" / "ServerControl-client.log"
+                if local_root
+                else Path(tempfile.gettempdir()) / "ServerControl" / "ServerControl-client.log"
+            )
+        self.diagnostic_log_path = Path(diagnostic_path)
+        self._http_log = self._create_diagnostic_logger(self.diagnostic_log_path)
+
+    @staticmethod
+    def _create_diagnostic_logger(path: Path) -> logging.Logger:
+        """Create a small rotating HTTP log that never records credentials or bodies."""
+
+        logger = logging.getLogger(f"server_control.http.{hash(str(path.resolve()))}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not logger.handlers:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handler: logging.Handler = RotatingFileHandler(
+                    path,
+                    maxBytes=1_000_000,
+                    backupCount=2,
+                    encoding="utf-8",
+                )
+                handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            except OSError:
+                # Diagnostics must never prevent login or server control.
+                handler = logging.NullHandler()
+            logger.addHandler(handler)
+        return logger
+
+    @staticmethod
+    def _diagnostic_route(path: str) -> str:
+        """Strip all query values because they can contain opaque identifiers."""
+
+        return urllib.parse.urlsplit(path).path or "/"
+
+    def _record_http(
+        self,
+        method: str,
+        path: str,
+        started: float,
+        *,
+        status: int,
+        size: int = 0,
+        error: str = "",
+    ) -> None:
+        elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
+        route = self._diagnostic_route(path)
+        suffix = f" error={error}" if error else ""
+        level = logging.INFO if 200 <= status < 400 else logging.WARNING
+        self._http_log.log(
+            level,
+            "%s %s status=%s time_ms=%s bytes=%s%s",
+            method.upper(),
+            route,
+            status,
+            elapsed_ms,
+            max(0, size),
+            suffix,
+        )
 
     @staticmethod
     def _create_ipv4_connection(
@@ -107,6 +173,7 @@ class ApiClient:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
         if body is not None:
             headers["Content-Length"] = str(len(body))
+        started = time.monotonic()
         connection = self._json_connection(timeout_seconds)
         try:
             connection.request(method, f"{self.base_path}{path}", body=body, headers=headers)
@@ -118,12 +185,15 @@ class ApiClient:
             finally:
                 response.close()
         except (TimeoutError, socket.timeout) as error:
+            self._record_http(method, path, started, status=0, error="network_timeout")
             raise ApiError(0, "network_timeout", "Время ожидания ответа истекло.") from error
         except (OSError, http.client.HTTPException) as error:
+            self._record_http(method, path, started, status=0, error=type(error).__name__)
             raise ApiError(0, "network_error", f"Не удалось подключиться к Control Hub по IPv4: {error}") from error
         finally:
             connection.close()
 
+        self._record_http(method, path, started, status=status, size=len(raw.encode("utf-8")))
         parsed = self._parse_json(raw)
         if status >= 400:
             raise ApiError(status, str(parsed.get("error", "http_error")), str(parsed.get("message", "Ошибка сервера.")))

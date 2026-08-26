@@ -45,7 +45,7 @@ for this matrix:
 | Area | Positive case | Negative/recovery case |
 |---|---|---|
 | Auth/RBAC | each preset sees intended pages/actions | disabled/revoked token rejected immediately |
-| Sync | state/log/jobs update at one-second cadence | Worker/Internet/Agent outage backs off and recovers |
+| Feeds | core status, power, console and notices update independently | one route failing preserves the other last-known values |
 | Power | socket on and safe off | Yandex timeout returns stale cache; duplicate off is reused |
 | Minecraft | start → stages → Running; list/RCON | crash classification, stop timeout then explicit force |
 | Instances | empty/Vanilla/import/ZIP/duplicate | bad ports/Java/RAM, unreviewed script, traversal ZIP |
@@ -62,9 +62,10 @@ Never run first-time negative tests on the only copy of a world.
 
 Measure on the actual deployment while a large modpack runs:
 
-- Worker request count: normally one desktop sync per 3 seconds and one Agent
-  poll per 3 seconds, with one heartbeat per 15 seconds;
-- sync response sizes when idle versus during log bursts;
+- Worker request count: desktop status every 5 seconds, power/notifications
+  every 15 seconds, console every 2 seconds only while visible, plus one Agent
+  poll per 3 seconds and one heartbeat per 15 seconds;
+- independent response sizes and latency when idle versus during log bursts;
 - desktop process CPU/memory after an hour of console use;
 - Agent memory while Hub is offline (event buffer must remain bounded);
 - directory/search/log latency at configured caps;

@@ -17,7 +17,6 @@ from pages_files import BackupsPage, FilesPage
 from pages_minecraft import ConsolePage, InstancesPage, PlayersPage
 from pages_system import MonitoringPage, ServerPage
 from state import AppState, LocalPreferences
-from updater import is_newer
 from widgets import CommandPalette
 
 
@@ -59,6 +58,12 @@ class ControlPanel(ttk.Frame):
         self.closed = False
         self.sync_inflight = False
         self.sync_after: str | None = None
+        self.power_inflight = False
+        self.power_after: str | None = None
+        self.events_inflight = False
+        self.events_after: str | None = None
+        self.notifications_inflight = False
+        self.notifications_after: str | None = None
         self._status_clear_after: str | None = None
         self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._ui_after: str | None = None
@@ -76,6 +81,9 @@ class ControlPanel(ttk.Frame):
         self.bind_all("<Control-K>", lambda _event: self.open_palette())
         self._ui_after = self.after(30, self._drain_ui_queue)
         self.after(50, self.sync)
+        self.after(250, self._poll_power)
+        self.after(400, self._poll_notifications)
+        self.after(550, self._poll_events)
 
     def post_ui(self, callback: Callable[[], None]) -> None:
         self._ui_queue.put(callback)
@@ -157,6 +165,8 @@ class ControlPanel(ttk.Frame):
         self.current_page = name
         self.page_title_var.set(page.title)
         page.on_show()
+        if name in {"console", "logs"}:
+            self._schedule_aux("events_after", 50, self._poll_events)
 
     def _role_label(self) -> str:
         role = str(self.state.user.get("role"))
@@ -230,29 +240,21 @@ class ControlPanel(ttk.Frame):
         if self.closed or self.sync_inflight:
             return
         self.sync_inflight = True
-        query = urllib.parse.urlencode({
-            "after": self.state.event_cursor,
-            "jobs_since": self.state.jobs_cursor,
-            "notification_after": self.state.notification_cursor,
-            "status_after": int(self.state.server.get("updated_at") or 0),
-        })
         started = time.monotonic()
 
         def work() -> dict[str, Any]:
-            return self.api.request("GET", f"/v1/sync?{query}", timeout_seconds=12)
+            return self.api.request("GET", "/v1/server/status", timeout_seconds=8)
 
         def success(payload: dict[str, Any]) -> None:
             self.sync_inflight = False
             self.state.latency_ms = max(0, round((time.monotonic() - started) * 1000))
-            changes = self.state.apply_sync(payload)
-            api_version = int(self.state.protocol.get("api", 1) or 1)
-            minimum_client = str(self.state.protocol.get("minimum_client") or "0.0.0")
+            self.state.apply_server_snapshot(
+                payload,
+                {"api": 2, "minimum_client": "1.0.0", "service": "server-control-hub"},
+            )
             status = self.state.server.get("status") if isinstance(self.state.server.get("status"), dict) else {}
             agent_protocol = int(status.get("protocol_version", 1) or 1)
-            if api_version < 2 or is_newer(minimum_client, self.client_version):
-                self.connection_var.set("Нужно обновить клиент")
-                self.status_var.set(f"Control Hub требует клиент {minimum_client} или новее")
-            elif self.state.server.get("online") and agent_protocol < 2:
+            if self.state.server.get("online") and agent_protocol < 2:
                 self.connection_var.set("Нужно обновить Agent")
                 self.status_var.set("Agent использует старый протокол; откройте раздел «Обновления»")
             else:
@@ -260,12 +262,7 @@ class ControlPanel(ttk.Frame):
                 self.connection_var.set("Agent online" if self.state.server.get("online") else f"Agent offline · {int(age / 1000) if age else '—'} с")
             self._refresh_instance_box()
             for page in self.pages.values():
-                page.update_state(changes)
-            unread = sum(1 for item in self.state.notifications if not item.get("is_read"))
-            self.notification_var.set(f"🔔 {unread}")
-            for item in changes.get("notifications", []):
-                if item.get("severity") in {"warning", "error"}:
-                    self.toast(str(item.get("message") or item.get("title")), error=item.get("severity") == "error")
+                page.update_state()
             self._schedule_sync(self._normal_sync_interval())
 
         def failure(error: Exception) -> None:
@@ -280,7 +277,7 @@ class ControlPanel(ttk.Frame):
                 messagebox.showerror("Доступ закрыт", error.message)
                 self.logout_callback()
 
-        self.run_async(work, success, failure, context="Синхронизация", quiet=True)
+        self.run_async(work, success, failure, context="Статус сервера", quiet=True)
 
     def _schedule_sync(self, milliseconds: int) -> None:
         if self.closed:
@@ -293,7 +290,7 @@ class ControlPanel(ttk.Frame):
         self.sync_after = self.after(milliseconds, self.sync)
 
     def _normal_sync_interval(self) -> int:
-        """Stay responsive without exhausting the Workers Free daily quota."""
+        """Keep the core feed responsive without coupling it to other data."""
 
         try:
             window_state = self.winfo_toplevel().state()
@@ -301,9 +298,112 @@ class ControlPanel(ttk.Frame):
             window_state = "normal"
         if window_state in {"iconic", "withdrawn"}:
             return 15_000
-        if self.current_page == "console":
-            return 2_000
-        return 3_000
+        return 5_000
+
+    def _schedule_aux(self, attribute: str, milliseconds: int, callback: Callable[[], None]) -> None:
+        if self.closed:
+            return
+        current = getattr(self, attribute, None)
+        if current:
+            try:
+                self.after_cancel(current)
+            except tk.TclError:
+                pass
+        setattr(self, attribute, self.after(milliseconds, callback))
+
+    def _poll_power(self) -> None:
+        if self.closed:
+            return
+        if self.power_inflight or not self.state.has_permission("server.view"):
+            self._schedule_aux("power_after", 15_000, self._poll_power)
+            return
+        self.power_inflight = True
+
+        def success(payload: dict[str, Any]) -> None:
+            self.power_inflight = False
+            self.state.apply_power(payload)
+            for page in self.pages.values():
+                page.update_state()
+            self._schedule_aux("power_after", 15_000, self._poll_power)
+
+        def failure(_error: Exception) -> None:
+            self.power_inflight = False
+            self._schedule_aux("power_after", 30_000, self._poll_power)
+
+        self.run_async(
+            lambda: self.api.request("GET", "/v1/power/status", timeout_seconds=10),
+            success,
+            failure,
+            context="Статус питания",
+            quiet=True,
+        )
+
+    def _poll_events(self) -> None:
+        if self.closed:
+            return
+        stream = "minecraft" if self.current_page == "console" else "server" if self.current_page == "logs" else None
+        if stream is None:
+            self._schedule_aux("events_after", 5_000, self._poll_events)
+            return
+        if self.events_inflight:
+            self._schedule_aux("events_after", 1_000, self._poll_events)
+            return
+        self.events_inflight = True
+        cursor = self.state.minecraft_event_cursor if stream == "minecraft" else self.state.server_event_cursor
+        query = urllib.parse.urlencode({"after": cursor, "latest": 1 if cursor == 0 else 0})
+
+        def success(payload: dict[str, Any]) -> None:
+            self.events_inflight = False
+            new_events = self.state.apply_events(payload, stream=stream)
+            changes = {"events": new_events}
+            for page in self.pages.values():
+                page.update_state(changes)
+            self._schedule_aux("events_after", 2_000 if stream == "minecraft" else 5_000, self._poll_events)
+
+        def failure(_error: Exception) -> None:
+            self.events_inflight = False
+            self._schedule_aux("events_after", 5_000, self._poll_events)
+
+        self.run_async(
+            lambda: self.api.request("GET", f"/v1/{stream}/logs?{query}", timeout_seconds=8),
+            success,
+            failure,
+            context="Журнал сервера",
+            quiet=True,
+        )
+
+    def _poll_notifications(self) -> None:
+        if self.closed:
+            return
+        if self.notifications_inflight:
+            self._schedule_aux("notifications_after", 2_000, self._poll_notifications)
+            return
+        self.notifications_inflight = True
+        query = urllib.parse.urlencode({"after": self.state.notification_cursor})
+
+        def success(payload: dict[str, Any]) -> None:
+            self.notifications_inflight = False
+            new_notifications = self.state.apply_notifications(payload)
+            unread = sum(1 for item in self.state.notifications if not item.get("is_read"))
+            self.notification_var.set(f"🔔 {unread}")
+            for page in self.pages.values():
+                page.update_state({"notifications": new_notifications})
+            for item in new_notifications:
+                if item.get("severity") in {"warning", "error"}:
+                    self.toast(str(item.get("message") or item.get("title")), error=item.get("severity") == "error")
+            self._schedule_aux("notifications_after", 15_000, self._poll_notifications)
+
+        def failure(_error: Exception) -> None:
+            self.notifications_inflight = False
+            self._schedule_aux("notifications_after", 30_000, self._poll_notifications)
+
+        self.run_async(
+            lambda: self.api.request("GET", f"/v1/notifications?{query}", timeout_seconds=8),
+            success,
+            failure,
+            context="Уведомления",
+            quiet=True,
+        )
 
     def refresh_now(self) -> None:
         if self.sync_after:
@@ -314,6 +414,9 @@ class ControlPanel(ttk.Frame):
             self.sync_after = None
         if not self.sync_inflight:
             self.sync()
+        self._schedule_aux("power_after", 20, self._poll_power)
+        self._schedule_aux("events_after", 40, self._poll_events)
+        self._schedule_aux("notifications_after", 60, self._poll_notifications)
 
     def _refresh_instance_box(self) -> None:
         labels = [self._instance_label(item) for item in self.state.instances.values()]
@@ -481,11 +584,12 @@ class ControlPanel(ttk.Frame):
 
     def close(self) -> None:
         self.closed = True
-        if self.sync_after:
-            try:
-                self.after_cancel(self.sync_after)
-            except tk.TclError:
-                pass
+        for timer in (self.sync_after, self.power_after, self.events_after, self.notifications_after):
+            if timer:
+                try:
+                    self.after_cancel(timer)
+                except tk.TclError:
+                    pass
         if self._ui_after:
             try:
                 self.after_cancel(self._ui_after)

@@ -58,11 +58,12 @@ docs/                     Architecture, deployment, security and test guides
 
 ## Realtime model
 
-The desktop performs one delta-sync request per second. That single response can
-contain only changed status, new console rows, changed jobs and new
-notifications. It replaces the previous set of independent full-status and log
-polls. This architecture preserves the outbound-only Agent security model and
-does not require an inbound home-server WebSocket port.
+The desktop uses a small status request as its only connection authority.
+Power, console rows and notifications are refreshed independently and retain
+their last known values after a route-specific failure. Console polling becomes
+fast only while its page is open. This architecture preserves the outbound-only
+Agent security model, avoids a single oversized response and does not require an
+inbound home-server WebSocket port.
 
 ## Security model in one minute
 
@@ -96,14 +97,16 @@ Additional references:
 
 ## Version compatibility
 
-Release `v1.0.5` contains desktop client `1.0.5`, Control Hub API `2` and
-Agent `2.0.4` (protocol `2`). JSON control traffic uses a deterministic IPv4
-TLS transport, the realtime feed reads D1 in one bounded batch, and the Agent
-online window matches its 15-second heartbeat cadence. Agent JSON is compressed
-on the wire and polling is bounded for the Workers Free daily request
-allowance. The Worker retains compatibility routes during a rolling upgrade.
-New management/file/job features stay disabled with a clear message until
-Agent protocol 2 is online.
+Release `v1.0.6` contains desktop client `1.0.6`, Control Hub API `2` and
+Agent `2.0.4` (protocol `2`). The desktop connection authority is the small,
+proven `/v1/server/status` route. Power, console events and notifications use
+independent requests, so a slow optional integration can no longer blank the
+whole dashboard. JSON control traffic uses a deterministic IPv4 TLS transport
+and writes a bounded, credential-free diagnostic log. Agent JSON is compressed
+on the wire and polling is bounded for the Workers Free daily request allowance.
+The Worker retains compatibility routes during a rolling upgrade. New
+management/file/job features stay disabled with a clear message until Agent
+protocol 2 is online.
 
 ## Honest limitations
 

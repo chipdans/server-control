@@ -90,21 +90,73 @@ class ProjectTests(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
-        client = ApiClient("https://control.example/base")
-        client.token = "test-token"
-        with patch("api.http.client.HTTPSConnection", FakeConnection):
-            result = client.request("GET", "/v1/sync?after=0", timeout_seconds=7)
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "client.log"
+            client = ApiClient("https://control.example/base", diagnostic_path=log_path)
+            client.token = "test-token"
+            with patch("api.http.client.HTTPSConnection", FakeConnection):
+                result = client.request("GET", "/v1/server/status?opaque=secret", timeout_seconds=7)
+            diagnostic = log_path.read_text(encoding="utf-8")
 
         self.assertEqual(result, {"ok": True})
         connection = connections[0]
         self.assertEqual((connection.host, connection.port, connection.timeout), ("control.example", 443, 7))
         self.assertIs(connection._create_connection, ApiClient._create_ipv4_connection)
         method, path, body, headers = connection.request_data
-        self.assertEqual((method, path, body), ("GET", "/base/v1/sync?after=0", None))
+        self.assertEqual((method, path, body), ("GET", "/base/v1/server/status?opaque=secret", None))
         self.assertEqual(headers["Connection"], "close")
         self.assertEqual(headers["Accept-Encoding"], "identity")
         self.assertEqual(headers["Authorization"], "Bearer test-token")
         self.assertTrue(connection.closed)
+        self.assertIn("GET /v1/server/status status=200", diagnostic)
+        self.assertNotIn("opaque", diagnostic)
+        self.assertNotIn("secret", diagnostic)
+        self.assertNotIn("test-token", diagnostic)
+
+    def test_desktop_core_status_does_not_depend_on_combined_sync(self) -> None:
+        source = (ROOT / "desktop" / "control_panel.py").read_text(encoding="utf-8")
+        self.assertIn('"/v1/server/status"', source)
+        self.assertIn('"/v1/power/status"', source)
+        self.assertNotIn('"/v1/sync', source)
+
+    def test_independent_state_feeds_preserve_each_other(self) -> None:
+        state = AppState({"role": "owner", "permissions": []})
+        state.apply_server_snapshot({
+            "online": True,
+            "updated_at": 123,
+            "age_ms": 10,
+            "status": {
+                "protocol_version": 2,
+                "instances": [{"id": "dragonfyre", "name": "Dragonfyre", "state": "RUNNING"}],
+                "selected_instance_id": "dragonfyre",
+            },
+        })
+        state.apply_power({"power": {"on": True, "online": True}})
+        first_events = state.apply_events({
+            "events": [{"id": 11, "kind": "minecraft", "message": "Done"}],
+            "next_after": 11,
+        }, stream="minecraft")
+        duplicate_events = state.apply_events({
+            "events": [{"id": 11, "kind": "minecraft", "message": "Done"}],
+            "next_after": 11,
+        }, stream="minecraft")
+        first_notifications = state.apply_notifications({
+            "notifications": [{"id": 7, "severity": "warning", "title": "Test"}],
+        })
+        duplicate_notifications = state.apply_notifications({
+            "notifications": [{"id": 7, "severity": "warning", "title": "Test"}],
+        })
+
+        self.assertTrue(state.connected)
+        self.assertTrue(state.server["online"])
+        self.assertEqual(state.selected_instance_id, "dragonfyre")
+        self.assertTrue(state.power["on"])
+        self.assertEqual(len(first_events), 1)
+        self.assertEqual(duplicate_events, [])
+        self.assertEqual(state.minecraft_event_cursor, 11)
+        self.assertEqual(len(first_notifications), 1)
+        self.assertEqual(duplicate_notifications, [])
+        self.assertEqual(state.notification_cursor, 7)
 
     def test_hub_transport_resolves_ipv4_only(self) -> None:
         calls: list[tuple[object, ...]] = []

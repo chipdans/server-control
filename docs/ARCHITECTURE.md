@@ -20,8 +20,9 @@ directly; the Worker is the authorization and durable job boundary.
 ### Desktop
 
 - `main.py`: configuration, login, theme, client update and application life cycle.
-- `control_panel.py`: sidebar shell, one delta-sync loop, shared command palette,
-  background-thread/UI-thread boundary and Agent readiness checks.
+- `control_panel.py`: sidebar shell, independent status/power/event/notification
+  feeds, shared command palette, background-thread/UI-thread boundary and Agent
+  readiness checks.
 - `state.py`: bounded in-memory state and atomic non-secret preferences.
 - `api.py`: bounded HTTP, job waiting and chunked R2 transfers.
 - `pages_*.py`: dashboard, Minecraft, files/backups, system and administration.
@@ -75,13 +76,14 @@ Typical lock domains:
 The UI changes immediately to queued/running state and continues receiving job
 progress even after another page is opened.
 
-## Delta synchronization
+## Independent desktop feeds
 
-`GET /v1/sync` accepts four cursors: console event ID, job update timestamp,
-notification ID and status timestamp. It returns only deltas and a status object
-only when the Agent heartbeat changed. The client uses exponential backoff after
-failures and automatically resets to the normal one-second cadence after
-recovery.
+The desktop deliberately does not make one large response the authority for the
+whole UI. `GET /v1/server/status` drives the connection indicator and dashboard.
+Power, console events and notifications have separate schedules and failure
+handling. Last known data stays visible when an optional feed fails. The former
+`GET /v1/sync` route remains available only for rolling compatibility with older
+clients.
 
 The Agent similarly uses one `/v1/agent/sync` request for legacy commands, jobs
 and cancellations. During Worker rolling deployment it can temporarily fall

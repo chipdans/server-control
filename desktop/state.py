@@ -50,6 +50,8 @@ class AppState:
     notifications: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     event_cursor: int = 0
+    minecraft_event_cursor: int = 0
+    server_event_cursor: int = 0
     jobs_cursor: int = 0
     notification_cursor: int = 0
     protocol: dict[str, Any] = field(default_factory=dict)
@@ -65,28 +67,110 @@ class AppState:
             return True
         return bool(permissions & PERMISSION_ALIASES.get(permission, {permission}))
 
+    def _apply_server_locked(self, incoming_server: dict[str, Any]) -> None:
+        """Replace the lightweight server envelope without losing last status."""
+
+        previous_status = self.server.get("status") if isinstance(self.server.get("status"), dict) else None
+        self.server = dict(incoming_server)
+        if not isinstance(incoming_server.get("status"), dict) and previous_status is not None:
+            self.server["status"] = previous_status
+        status = self.server.get("status") if isinstance(self.server.get("status"), dict) else {}
+        values = status.get("instances") if isinstance(status.get("instances"), list) else []
+        if not values and isinstance(status.get("minecraft"), dict):
+            values = [status["minecraft"]]
+        self.instances = {
+            str(item.get("id") or item.get("service") or index): dict(item)
+            for index, item in enumerate(values)
+            if isinstance(item, dict)
+        }
+        selected = status.get("selected_instance_id") or self.selected_instance_id
+        if selected not in self.instances:
+            selected = next(iter(self.instances), None)
+        self.selected_instance_id = str(selected) if selected else None
+
+    def apply_server_snapshot(self, payload: dict[str, Any], protocol: dict[str, Any] | None = None) -> None:
+        """Apply the proven /v1/server/status feed as the connection authority."""
+
+        with self.lock:
+            if protocol is not None:
+                self.protocol = dict(protocol)
+            self._apply_server_locked(payload)
+            self.connected = True
+            self.last_error = ""
+            self.sync_failures = 0
+
+    def apply_power(self, payload: dict[str, Any]) -> None:
+        with self.lock:
+            value = payload.get("power")
+            if isinstance(value, dict):
+                self.power = dict(value)
+
+    def apply_events(self, payload: dict[str, Any], *, stream: str) -> list[dict[str, Any]]:
+        """Merge one independent log stream and advance only its own cursor."""
+
+        with self.lock:
+            seen = {
+                int(item["id"])
+                for item in self.events
+                if isinstance(item, dict) and str(item.get("id", "")).isdigit()
+            }
+            new_events: list[dict[str, Any]] = []
+            for value in payload.get("events", []):
+                if not isinstance(value, dict):
+                    continue
+                item = dict(value)
+                try:
+                    identifier = int(item.get("id"))
+                except (TypeError, ValueError):
+                    identifier = 0
+                if identifier and identifier in seen:
+                    continue
+                if identifier:
+                    seen.add(identifier)
+                new_events.append(item)
+            self.events.extend(new_events)
+            self.events = self.events[-10_000:]
+            next_after = int(payload.get("next_after", 0) or 0)
+            if stream == "minecraft":
+                self.minecraft_event_cursor = max(self.minecraft_event_cursor, next_after)
+            elif stream == "server":
+                self.server_event_cursor = max(self.server_event_cursor, next_after)
+            return new_events
+
+    def apply_notifications(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        with self.lock:
+            seen = {
+                int(item["id"])
+                for item in self.notifications
+                if isinstance(item, dict) and str(item.get("id", "")).isdigit()
+            }
+            new_notifications: list[dict[str, Any]] = []
+            for value in payload.get("notifications", []):
+                if not isinstance(value, dict):
+                    continue
+                item = dict(value)
+                try:
+                    identifier = int(item.get("id"))
+                except (TypeError, ValueError):
+                    identifier = 0
+                if identifier and identifier in seen:
+                    continue
+                if identifier:
+                    seen.add(identifier)
+                    self.notification_cursor = max(self.notification_cursor, identifier)
+                new_notifications.append(item)
+            self.notifications.extend(new_notifications)
+            self.notifications = self.notifications[-500:]
+            return new_notifications
+
     def apply_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Backward-compatible parser for old clients and fixture tests."""
+
         with self.lock:
             self.protocol = dict(payload.get("protocol") or {})
             incoming_server = payload.get("server") if isinstance(payload.get("server"), dict) else {}
-            previous_status = self.server.get("status") if isinstance(self.server.get("status"), dict) else None
-            self.server = dict(incoming_server)
-            if not isinstance(incoming_server.get("status"), dict) and previous_status is not None:
-                self.server["status"] = previous_status
+            self._apply_server_locked(incoming_server)
             self.power = dict(payload.get("power") or {})
-            status = self.server.get("status") if isinstance(self.server.get("status"), dict) else {}
-            values = status.get("instances") if isinstance(status.get("instances"), list) else []
-            if not values and isinstance(status.get("minecraft"), dict):
-                values = [status["minecraft"]]
-            self.instances = {
-                str(item.get("id") or item.get("service") or index): dict(item)
-                for index, item in enumerate(values)
-                if isinstance(item, dict)
-            }
-            selected = status.get("selected_instance_id") or self.selected_instance_id
-            if selected not in self.instances:
-                selected = next(iter(self.instances), None)
-            self.selected_instance_id = str(selected) if selected else None
             new_events = [dict(item) for item in payload.get("events", []) if isinstance(item, dict)]
             self.events.extend(new_events)
             self.events = self.events[-10_000:]
