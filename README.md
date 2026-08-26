@@ -97,12 +97,16 @@ Additional references:
 
 ## Version compatibility
 
-Release `v1.0.6` contains desktop client `1.0.6`, Control Hub API `2` and
+Release `v1.0.7` contains desktop client `1.0.7`, Control Hub API `2` and
 Agent `2.0.4` (protocol `2`). The desktop connection authority is the small,
 proven `/v1/server/status` route. Power, console events and notifications use
 independent requests, so a slow optional integration can no longer blank the
 whole dashboard. JSON control traffic uses a deterministic IPv4 TLS transport
-and writes a bounded, credential-free diagnostic log. Agent JSON is compressed
+and automatically fails read-only requests over to the next resolved Cloudflare
+IPv4 address when an anycast route stalls. Read-only JSON requests are
+serialized to avoid competing TLS connections while mutations remain
+immediate and are never retried. The client writes a bounded,
+credential-free diagnostic log. Agent JSON is compressed
 on the wire and polling is bounded for the Workers Free daily request allowance.
 The Worker retains compatibility routes during a rolling upgrade. New
 management/file/job features stay disabled with a clear message until Agent

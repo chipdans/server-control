@@ -100,7 +100,7 @@ class ProjectTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         connection = connections[0]
-        self.assertEqual((connection.host, connection.port, connection.timeout), ("control.example", 443, 7))
+        self.assertEqual((connection.host, connection.port, connection.timeout), ("control.example", 443, 3.5))
         self.assertIs(connection._create_connection, ApiClient._create_ipv4_connection)
         method, path, body, headers = connection.request_data
         self.assertEqual((method, path, body), ("GET", "/base/v1/server/status?opaque=secret", None))
@@ -118,6 +118,85 @@ class ProjectTests(unittest.TestCase):
         self.assertIn('"/v1/server/status"', source)
         self.assertIn('"/v1/power/status"', source)
         self.assertNotIn('"/v1/sync', source)
+
+    def test_desktop_get_retries_the_second_cloudflare_ipv4(self) -> None:
+        connections: list[object] = []
+
+        class FakeResponse(io.BytesIO):
+            status = 200
+
+            def __init__(self) -> None:
+                value = b'{"online":true}'
+                super().__init__(value)
+                self.headers = {"content-length": str(len(value))}
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.host = host
+                self.port = port
+                self.timeout = timeout
+                self.closed = False
+                connections.append(self)
+
+            def request(self, _method: str, _path: str, body: bytes | None, headers: dict[str, str]) -> None:
+                self.body = body
+                self.headers = headers
+
+            def getresponse(self) -> FakeResponse:
+                if len(connections) == 1:
+                    raise socket.timeout("first anycast path stalled")
+                return FakeResponse()
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = ApiClient("https://control.example", diagnostic_path=Path(directory) / "client.log")
+            with patch.object(client, "_resolve_ipv4_candidates", return_value=["188.114.97.1", "188.114.96.1"]), patch(
+                "api.http.client.HTTPSConnection", FakeConnection
+            ):
+                result = client.request("GET", "/v1/server/status", timeout_seconds=8)
+                second_result = client.request("GET", "/v1/server/status", timeout_seconds=8)
+
+        self.assertEqual(result, {"online": True})
+        self.assertEqual(second_result, {"online": True})
+        self.assertEqual(len(connections), 3)
+        self.assertEqual(
+            [item._server_control_ipv4 for item in connections],
+            ["188.114.97.1", "188.114.96.1", "188.114.96.1"],
+        )
+        self.assertEqual([item.timeout for item in connections], [4.0, 4.0, 4.0])
+        self.assertTrue(all(item.closed for item in connections))
+
+    def test_desktop_does_not_retry_mutating_requests(self) -> None:
+        connections: list[object] = []
+
+        class FakeConnection:
+            def __init__(self, _host: str, _port: int, timeout: float) -> None:
+                self.timeout = timeout
+                self.closed = False
+                connections.append(self)
+
+            def request(self, _method: str, _path: str, body: bytes | None, headers: dict[str, str]) -> None:
+                self.body = body
+                self.headers = headers
+
+            def getresponse(self) -> object:
+                raise socket.timeout("unknown result")
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = ApiClient("https://control.example", diagnostic_path=Path(directory) / "client.log")
+            with patch.object(client, "_resolve_ipv4_candidates", return_value=["188.114.97.1", "188.114.96.1"]), patch(
+                "api.http.client.HTTPSConnection", FakeConnection
+            ):
+                with self.assertRaisesRegex(ApiError, "Время ожидания"):
+                    client.request("POST", "/v1/power/action", {"state": "off"}, timeout_seconds=8)
+
+        self.assertEqual(len(connections), 1)
+        self.assertTrue(connections[0].closed)
 
     def test_independent_state_feeds_preserve_each_other(self) -> None:
         state = AppState({"role": "owner", "permissions": []})
