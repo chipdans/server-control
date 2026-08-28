@@ -93,14 +93,43 @@ def latest_release(repository: str, asset_name: str) -> dict[str, Any] | None:
 
 
 def is_newer(remote: str, local: str) -> bool:
-    def version_parts(value: str) -> tuple[int, ...]:
-        values = re.findall(r"\d+", value.lstrip("vV"))
-        return tuple(int(part) for part in values[:4]) or (0,)
+    semver = re.compile(
+        r"^[vV]?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+        r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$"
+    )
 
-    remote_parts = version_parts(remote)
-    local_parts = version_parts(local)
-    longest = max(len(remote_parts), len(local_parts))
-    return remote_parts + (0,) * (longest - len(remote_parts)) > local_parts + (0,) * (longest - len(local_parts))
+    def parse(value: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None] | None:
+        match = semver.fullmatch(value.strip())
+        if not match:
+            return None
+        return (
+            (int(match.group(1)), int(match.group(2)), int(match.group(3))),
+            tuple(match.group(4).split(".")) if match.group(4) else None,
+        )
+
+    remote_value = parse(remote)
+    local_value = parse(local)
+    if not remote_value or not local_value:
+        return False
+    remote_core, remote_pre = remote_value
+    local_core, local_pre = local_value
+    if remote_core != local_core:
+        return remote_core > local_core
+    if remote_pre is None:
+        return local_pre is not None
+    if local_pre is None:
+        return False
+    for remote_part, local_part in zip(remote_pre, local_pre):
+        if remote_part == local_part:
+            continue
+        remote_numeric = remote_part.isdigit()
+        local_numeric = local_part.isdigit()
+        if remote_numeric and local_numeric:
+            return int(remote_part) > int(local_part)
+        if remote_numeric != local_numeric:
+            return not remote_numeric
+        return remote_part > local_part
+    return len(remote_pre) > len(local_pre)
 
 
 def download_update(asset_url: str, *, expected_sha256: str | None = None) -> Path:

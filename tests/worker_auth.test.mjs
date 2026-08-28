@@ -123,13 +123,33 @@ class FakeD1 {
       user.updated_at = updated_at;
       return { success: true };
     }
-    if (sql.startsWith("UPDATE users SET role = ?")) {
-      const [role, permissions, enabled, updated_at, id] = args;
+    if (sql.startsWith("UPDATE users SET username = ?, role = ?")) {
+      const [username, role, permissions, enabled, updated_at, id] = args;
       const user = this.users.find((item) => item.id === id);
+      if (this.users.some((item) => item.id !== id && item.username.toLowerCase() === String(username).toLowerCase())) {
+        throw new Error("UNIQUE constraint failed");
+      }
+      user.username = username;
       user.role = role;
       user.permissions = permissions;
       user.enabled = enabled;
       user.token_version += 1;
+      user.updated_at = updated_at;
+      return { success: true };
+    }
+    if (sql.startsWith("UPDATE users SET username = ?, password_salt = ?")) {
+      const [username, password_salt, password_hash, password_iterations, token_version, updated_at, id] = args;
+      const user = this.users.find((item) => item.id === id);
+      if (this.users.some((item) => item.id !== id && item.username.toLowerCase() === String(username).toLowerCase())) {
+        throw new Error("UNIQUE constraint failed");
+      }
+      user.username = username;
+      user.password_salt = password_salt;
+      user.password_hash = password_hash;
+      user.password_iterations = password_iterations;
+      user.token_version = token_version;
+      user.failed_logins = 0;
+      user.locked_until = null;
       user.updated_at = updated_at;
       return { success: true };
     }
@@ -246,6 +266,72 @@ test("disabled user loses access even with an already issued token", async () =>
   const blocked = await call(env, "GET", "/v1/me", undefined, playerToken);
   assert.equal(blocked.response.status, 403);
   assert.equal(blocked.json.error, "access_revoked");
+});
+
+test("owner can rename the main login and receives a replacement session", async () => {
+  const env = {
+    DB: new FakeD1(), JWT_SECRET: "x".repeat(48), BOOTSTRAP_KEY: "bootstrap-secret",
+    AGENT_API_KEY: "agent-secret", YANDEX_OAUTH_TOKEN: "not-used", YANDEX_DEVICE_ID: "not-used",
+  };
+  const setup = await call(
+    env, "POST", "/v1/setup",
+    { username: "owner", password: "a secure owner password" },
+    undefined, { "x-bootstrap-key": "bootstrap-secret" },
+  );
+  const renamed = await call(
+    env, "PATCH", "/v2/me",
+    { username: "chipdan-main", current_password: "a secure owner password" },
+    setup.json.token,
+  );
+  assert.equal(renamed.response.status, 200);
+  assert.equal(renamed.json.user.username, "chipdan-main");
+  assert.ok(renamed.json.token);
+  assert.equal((await call(env, "GET", "/v1/me", undefined, setup.json.token)).response.status, 403);
+  assert.equal((await call(env, "POST", "/v1/login", { username: "owner", password: "a secure owner password" })).response.status, 401);
+  assert.equal((await call(env, "POST", "/v1/login", { username: "chipdan-main", password: "a secure owner password" })).response.status, 200);
+});
+
+test("terminal credentials are returned only for the selected direct-console permission", async () => {
+  const env = {
+    DB: new FakeD1(), JWT_SECRET: "x".repeat(48), BOOTSTRAP_KEY: "bootstrap-secret",
+    AGENT_API_KEY: "agent-secret", YANDEX_OAUTH_TOKEN: "not-used", YANDEX_DEVICE_ID: "not-used",
+    SSH_HOST: "46.175.223.107", SSH_PORT: "2222",
+    SSH_LINUX_USERNAME: "servercontrol-admin", SSH_MINECRAFT_USERNAME: "servercontrol-minecraft",
+    SSH_HOST_KEY_SHA256: `SHA256:${"A".repeat(43)}`,
+    SSH_LINUX_PRIVATE_KEY: "-----BEGIN RSA PRIVATE KEY-----\nlinux\n-----END RSA PRIVATE KEY-----",
+    SSH_MINECRAFT_PRIVATE_KEY: "-----BEGIN RSA PRIVATE KEY-----\nminecraft\n-----END RSA PRIVATE KEY-----",
+  };
+  const setup = await call(
+    env, "POST", "/v1/setup",
+    { username: "owner", password: "a secure owner password" },
+    undefined, { "x-bootstrap-key": "bootstrap-secret" },
+  );
+  const created = await call(
+    env, "POST", "/v1/admin/users",
+    {
+      username: "minecraft-user", password: "a secure minecraft password", role: "user",
+      permissions: ["status.view", "terminal.minecraft"],
+    },
+    setup.json.token,
+  );
+  assert.equal(created.response.status, 201);
+  const login = await call(env, "POST", "/v1/login", {
+    username: "minecraft-user", password: "a secure minecraft password",
+  });
+  const minecraft = await call(env, "GET", "/v2/terminal/session?kind=minecraft", undefined, login.json.token);
+  assert.equal(minecraft.response.status, 200);
+  assert.equal(minecraft.json.host, "46.175.223.107");
+  assert.equal(minecraft.json.username, "servercontrol-minecraft");
+  assert.match(minecraft.json.private_key, /minecraft/);
+  assert.deepEqual(minecraft.json.targets[0], { host: "192.168.0.108", port: 22, network: "lan" });
+  assert.match(minecraft.json.command, /tmux attach-session -t dragonfyre$/);
+  const linux = await call(env, "GET", "/v2/terminal/session?kind=linux", undefined, login.json.token);
+  assert.equal(linux.response.status, 403);
+  assert.equal(linux.json.error, "permission_denied");
+  const ownerLinux = await call(env, "GET", "/v2/terminal/session?kind=linux", undefined, setup.json.token);
+  assert.equal(ownerLinux.response.status, 200);
+  assert.equal(ownerLinux.json.username, "servercontrol-admin");
+  assert.match(ownerLinux.json.private_key, /linux/);
 });
 
 test("a repeated safe power-off request reuses the active command", async () => {

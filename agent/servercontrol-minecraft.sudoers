@@ -1,0 +1,1 @@
+servercontrol-minecraft ALL=(minecraft) NOPASSWD: /usr/bin/tmux attach-session -t dragonfyre

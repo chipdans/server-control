@@ -1,126 +1,77 @@
-# Server Control
+# Server Control 2
 
-Server Control 1.0 is a self-hosted Windows panel for a Debian home server and
-multiple Minecraft server packs. It keeps inbound ports closed: the Debian
-Agent initiates outbound HTTPS requests to a Cloudflare Worker, while the
-desktop client talks only to that authenticated public API.
+Упрощённое Windows-приложение для домашнего Debian-сервера `ChipdanServer` и Minecraft-сборки Dragonfyre.
 
-## What is included
+## Что осталось
 
-- A dashboard with Agent latency and last response, CPU/load/temperature,
-  RAM/Swap, disk space and I/O, network speed, uptime and IP addresses.
-- Multiple independent Minecraft instances with separate Java, RAM, ports,
-  RCON, loader/version, startup command, notes, tags and backup policy.
-- A guided empty/Vanilla/ZIP/import/duplicate workflow. Uploaded scripts are
-  detected and displayed, but never executed until an administrator explicitly
-  reviews the startup command.
-- Live incremental Minecraft console, persistent RCON connection, history,
-  filters, search, copy/paste and useful Tab completion for commands, players,
-  selectors and common arguments.
-- Log-driven startup stages, process/RCON readiness checks and classified crash
-  reasons without inventing a diagnosis when evidence is insufficient.
-- Root-confined paginated file manager, multi-file chunked transfers, SHA-256,
-  transfer progress/speed/ETA/cancel/retry, text editor and a structured
-  `server.properties` editor.
-- Manual and scheduled backups, retention, safe world save, safety backup before
-  restore/update and creation of a new instance from a backup.
-- Process, storage, Java and allow-listed systemd service views; safe Linux
-  shutdown/reboot and deliberately limited diagnostics instead of a remote shell.
-- Persistent jobs, exclusive operation locks, idempotency, notifications,
-  audit log, roles and granular permissions.
-- Verified desktop and Agent updaters with staged replacement, health checks and
-  rollback.
+- знакомое окно входа через Cloudflare Worker + D1;
+- автоматическое обновление через проверяемый GitHub Release;
+- компактный экран состояния питания, домашнего сервера и Minecraft;
+- управление пользователями и пять понятных прав;
+- изменение собственного логина и пароля владельца;
+- встроенный интерактивный SSH-терминал.
 
-## Components
+## Две прямые консоли
 
-| Component | Runtime | Responsibility |
-|---|---|---|
-| Windows client | Python 3.12 / Tk/ttk | UI, local preferences, incremental sync, downloads/uploads and self-update |
-| Control Hub | Cloudflare Worker + D1 + private R2 | Authentication, RBAC, jobs, audit, notifications, transfer metadata and temporary transfer bytes |
-| Debian Agent | Python 3 | Host metrics, safe filesystem/backup operations, local RCON and allow-listed privileged actions |
-| Minecraft runner | systemd template + Python | Starts a reviewed argument vector as the unprivileged `minecraft` user |
+| Переключатель | Подключение |
+|---|---|
+| Linux | SSH → `sudo -n -i` |
+| Minecraft | SSH → `sudo -n -u minecraft -H tmux attach-session -t dragonfyre` |
 
-The Worker never stores worlds in D1, never receives SSH credentials and never
-contains the RCON password. Large temporary files live in a private R2 bucket
-and expire automatically. The desktop client stores only non-secret UI
-preferences; access tokens remain in process memory.
+RCON не используется. Команды и вывод терминала не проходят через Worker, D1, Agent или очередь заданий.
+Приложение быстро проверяет `192.168.0.108:22`: дома оно использует локальный адрес, а вне домашней сети автоматически переключается на `46.175.223.107:2222`.
+Роутер направляет внешний порт на отдельный `192.168.0.108:2222`, где SSH разрешает вход только техническому пользователю приложения; обычный локальный вход `chipdan` на порту `22` наружу не публикуется.
 
-## Repository layout
+## Поток подключения
 
-```text
-desktop/                  Windows client and companion updater
-agent/                    Debian Agent, modules, installer and systemd units
-worker/                   Cloudflare Worker, D1 migrations and R2 binding
-tests/                    Python and Worker regression/security tests
-docs/                     Architecture, deployment, security and test guides
-.github/workflows/        Validated Windows/Agent release build
+```mermaid
+flowchart TD
+    APP["Windows-приложение"] -->|"Вход, права, состояния"| HUB["Cloudflare Worker + D1"]
+    AGENT["Debian Agent"] -->|"Только исходящий HTTPS-статус"| HUB
+    APP -->|"Прямой SSH :2222"| SSH["servercontrol-admin@ChipdanServer"]
+    SSH --> ROOT["Linux root-shell"]
+    SSH --> TMUX["Dragonfyre tmux"]
 ```
 
-## Realtime model
+## Права
 
-The desktop uses a small status request as its only connection authority.
-Power, console rows and notifications are refreshed independently and retain
-their last known values after a route-specific failure. Console polling becomes
-fast only while its page is open. This architecture preserves the outbound-only
-Agent security model, avoids a single oversized response and does not require an
-inbound home-server WebSocket port.
+- просмотр состояния;
+- Linux-консоль с административными правами;
+- прямая Minecraft-консоль;
+- управление питанием;
+- управление пользователями.
 
-## Security model in one minute
+Владелец всегда имеет полный доступ. Блокировка и отзыв сеансов проверяются сервером при каждом API-запросе; Windows-клиент дополнительно перепроверяет учётную запись каждые пять секунд и закрывает активные терминалы при отзыве доступа.
 
-- Every protected request reloads the current user from D1, so disabling an
-  account or revoking sessions invalidates an already-issued token immediately.
-- Permissions are enforced by the Worker; the Agent additionally accepts only
-  known job types and validates every path, filename, service and argument.
-- Minecraft paths must remain below `/opt/minecraft`; `..`, absolute paths and
-  symlink escapes are rejected. ZIP extraction is bounded and rejects traversal,
-  symlinks and suspicious compression ratios.
-- The Agent runs as `servercontrol`, Minecraft runs as `minecraft`, and root is
-  reached only through two fixed helpers with local allow-list validation.
-- Console commands, file contents, outputs and credentials are redacted from
-  cross-user job/audit views and scrubbed from retained job results.
+## Безопасность SSH
 
-See [Security](docs/SECURITY.md) for boundaries and operational rules.
+- отдельный пользователь `servercontrol-admin`;
+- отдельный `servercontrol-minecraft`, чей ключ принудительно открывает только Dragonfyre tmux;
+- оба входят только по разным ключам, без SSH-паролей;
+- ключи хранятся в секретах Worker и не попадают в GitHub или ZIP приложения;
+- приложение проверяет точный SHA-256 отпечаток SSH-сервера;
+- SSH agent, port forwarding, X11 и туннели для этой учётной записи отключены;
+- владелец сознательно выдаёт полный Linux-доступ только пользователям с правом Linux-консоли.
 
-## Installation and upgrade
+Пользователь Linux-консоли технически может сохранить полученный admin-ключ из памяти процесса, поэтому после удаления недоверенного Linux-администратора ключ следует заменить. Minecraft-пользователи получают другой ключ, принудительно ограниченный tmux-сессией.
 
-For a new deployment, follow [Setup](docs/SETUP.md). Existing `0.3.x`
-installations should use the complete ordered procedure in
-[Upgrade to 1.0](docs/UPGRADE-1.0.0.md); it preserves the current Hub URL,
-Agent key, RCON password, users and existing Dragonfyre profile.
+## Компоненты
 
-Additional references:
+| Компонент | Назначение |
+|---|---|
+| `desktop/` | Python 3.12, Tk/ttk, Paramiko и pyte; Windows EXE и updater |
+| `worker/` | авторизация, D1-пользователи, права, статусы и выдача SSH-сессии |
+| `agent/` | существующий Agent состояния и новый tmux-runner для Dragonfyre |
+| `tests/` | Python и Worker regression/security tests |
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Minecraft console and startup detection](docs/MINECRAFT_CONSOLE.md)
-- [Testing and release verification](docs/TESTING.md)
-- [Debian Agent details](agent/README.md)
+Полная установка с крупными блоками команд и ожидаемым результатом: [docs/V2_SETUP.md](docs/V2_SETUP.md).
 
-## Version compatibility
+## Проверки
 
-Release `v1.0.7` contains desktop client `1.0.7`, Control Hub API `2` and
-Agent `2.0.4` (protocol `2`). The desktop connection authority is the small,
-proven `/v1/server/status` route. Power, console events and notifications use
-independent requests, so a slow optional integration can no longer blank the
-whole dashboard. JSON control traffic uses a deterministic IPv4 TLS transport
-and automatically fails read-only requests over to the next resolved Cloudflare
-IPv4 address when an anycast route stalls. Read-only JSON requests are
-serialized to avoid competing TLS connections while mutations remain
-immediate and are never retried. The client writes a bounded,
-credential-free diagnostic log. Agent JSON is compressed
-on the wire and polling is bounded for the Workers Free daily request allowance.
-The Worker retains compatibility routes during a rolling upgrade. New
-management/file/job features stay disabled with a clear message until Agent
-protocol 2 is online.
-
-## Honest limitations
-
-- Standard Minecraft RCON does not expose the full Brigadier suggestion graph.
-  Exact completion for every mod-specific argument requires a small trusted
-  server-side Forge/Fabric/NeoForge integration.
-- TPS/MSPT are displayed only when the loader exposes a working performance
-  command; unavailable metrics remain `—`.
-- Pause is immediate in the active desktop transfer. Downloads resume from a
-  `.part` file and chunks retry; resuming a partially uploaded file after the
-  entire desktop application has exited is not yet persisted.
-- Production Windows, Cloudflare and Debian behaviour must still be verified on
-  their actual platforms after the release workflow and deployment complete.
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+node --test tests/worker_auth.test.mjs
+node --check worker/src/index.js
+node --check worker/src/control_plane.js
+sh -n agent/install-v2-console.sh
+```

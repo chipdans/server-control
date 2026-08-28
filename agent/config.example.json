@@ -21,10 +21,7 @@
     "service": "dragonfyre.service",
     "directory": "/opt/minecraft/dragonfyre",
     "log_file": "/opt/minecraft/dragonfyre/logs/latest.log",
-    "console_mode": "rcon",
-    "rcon_host": "127.0.0.1",
-    "rcon_port": 25575,
-    "rcon_password": "REPLACE_WITH_A_LONG_RCON_PASSWORD",
+    "console_mode": "tmux",
     "tmux_session": "dragonfyre"
   },
   "commands": {

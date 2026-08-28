@@ -56,7 +56,7 @@ const ROLE_PERMISSIONS = {
     "minecraft_command",
     ...CONTROL_ROLE_PERMISSIONS.admin,
   ],
-  user: ["minecraft_view", "minecraft_command", ...CONTROL_ROLE_PERMISSIONS.operator],
+  user: ["status.view", "terminal.minecraft", "minecraft_view", ...CONTROL_ROLE_PERMISSIONS.operator],
 };
 
 class ApiError extends Error {
@@ -141,8 +141,16 @@ async function route(request, env, ctx) {
     return json({ user: publicUser(session.user) });
   }
 
+  if (method === "PATCH" && pathname === "/v2/me") {
+    return updateOwnAccount(request, env, session);
+  }
+
+  if (method === "GET" && pathname === "/v2/terminal/session") {
+    return getTerminalSession(env, session, url.searchParams.get("kind"));
+  }
+
   if (method === "GET" && pathname === "/v1/power/status") {
-    requireAnyPermission(session, ["power_view", "power_control", "server.view", "server.power"]);
+    requireAnyPermission(session, ["status.view", "power_view", "power_control", "server.view", "server.power"]);
     return json({ power: await getYandexPowerStatus(env) });
   }
 
@@ -152,7 +160,7 @@ async function route(request, env, ctx) {
   }
 
   if (method === "GET" && pathname === "/v1/server/status") {
-    requireAnyPermission(session, ["server_view", "minecraft_view", "server.view", "minecraft.view"]);
+    requireAnyPermission(session, ["status.view", "server_view", "minecraft_view", "server.view", "minecraft.view"]);
     const record = await env.DB.prepare("SELECT status, updated_at FROM agent_status WHERE id = 'primary'").first();
     if (!record) {
       return json({ online: false, status: null, updated_at: null });
@@ -332,6 +340,114 @@ async function login(request, env) {
   const token = await issueAccessToken(env, user);
   await addAudit(env, user.id, "user.login", {});
   return json({ token, user: publicUser(user) });
+}
+
+async function updateOwnAccount(request, env, session) {
+  const body = await readJson(request);
+  const currentPassword = typeof body.current_password === "string" ? body.current_password : "";
+  if (!currentPassword || !(await verifyPassword(currentPassword, session.user))) {
+    throw new ApiError(401, "invalid_current_password", "Текущий пароль указан неверно.");
+  }
+
+  const hasUsername = Object.prototype.hasOwnProperty.call(body, "username");
+  const hasPassword = Object.prototype.hasOwnProperty.call(body, "new_password") && body.new_password !== "";
+  if (!hasUsername && !hasPassword) {
+    throw new ApiError(400, "no_account_changes", "Укажите новый логин или новый пароль.");
+  }
+  const username = hasUsername ? validateUsername(body.username) : session.user.username;
+  const passwordRecord = hasPassword
+    ? await createPasswordRecord(validatePassword(body.new_password))
+    : {
+        salt: String(session.user.password_salt),
+        hash: String(session.user.password_hash),
+        iterations: Number(session.user.password_iterations),
+      };
+  const now = Date.now();
+  const tokenVersion = Number(session.user.token_version) + 1;
+  try {
+    await env.DB.prepare(
+      `UPDATE users
+       SET username = ?, password_salt = ?, password_hash = ?, password_iterations = ?,
+           token_version = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
+       WHERE id = ?`,
+    ).bind(
+      username,
+      passwordRecord.salt,
+      passwordRecord.hash,
+      passwordRecord.iterations,
+      tokenVersion,
+      now,
+      session.user.id,
+    ).run();
+  } catch (error) {
+    if (String(error?.message || error).includes("UNIQUE")) {
+      throw new ApiError(409, "username_taken", "Этот логин уже используется.");
+    }
+    throw error;
+  }
+
+  const user = {
+    ...session.user,
+    username,
+    password_salt: passwordRecord.salt,
+    password_hash: passwordRecord.hash,
+    password_iterations: passwordRecord.iterations,
+    token_version: tokenVersion,
+    failed_logins: 0,
+    locked_until: null,
+    updated_at: now,
+  };
+  await addAudit(env, session.user.id, "user.self_update", {
+    old_username: session.user.username,
+    new_username: username,
+    password_changed: hasPassword,
+  });
+  const token = await issueAccessToken(env, user);
+  return json({ token, user: publicUser(user) });
+}
+
+function getTerminalSession(env, session, kindValue) {
+  const kind = kindValue === "minecraft" ? "minecraft" : kindValue === "linux" ? "linux" : "";
+  if (!kind) throw new ApiError(400, "invalid_terminal_kind", "Выберите Linux или Minecraft-консоль.");
+  requirePermission(session, kind === "linux" ? "terminal.linux" : "terminal.minecraft");
+
+  const host = requiredSecret(env, "SSH_HOST").trim();
+  const credentialPrefix = kind === "linux" ? "SSH_LINUX" : "SSH_MINECRAFT";
+  const username = requiredSecret(env, `${credentialPrefix}_USERNAME`).trim();
+  const privateKey = requiredSecret(env, `${credentialPrefix}_PRIVATE_KEY`);
+  const hostKeySha256 = requiredSecret(env, "SSH_HOST_KEY_SHA256").trim();
+  const port = Number(env.SSH_PORT || 2222);
+  if (!/^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|(?:\d{1,3}\.){3}\d{1,3})$/.test(host)) {
+    throw new ApiError(503, "invalid_ssh_configuration", "В SSH_HOST указан некорректный адрес.");
+  }
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(username)) {
+    throw new ApiError(503, "invalid_ssh_configuration", `В ${credentialPrefix}_USERNAME указано некорректное имя пользователя.`);
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new ApiError(503, "invalid_ssh_configuration", "В SSH_PORT указан некорректный порт.");
+  }
+  if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(hostKeySha256)) {
+    throw new ApiError(503, "invalid_ssh_configuration", "SSH_HOST_KEY_SHA256 должен содержать SHA-256 отпечаток сервера.");
+  }
+  if (privateKey.length > 64 * 1024 || !/-----BEGIN (?:OPENSSH|RSA) PRIVATE KEY-----/.test(privateKey)) {
+    throw new ApiError(503, "invalid_ssh_configuration", `${credentialPrefix}_PRIVATE_KEY не содержит поддерживаемый закрытый ключ.`);
+  }
+
+  return json({
+    kind,
+    host,
+    port,
+    targets: [
+      { host: "192.168.0.108", port: 22, network: "lan" },
+      { host, port, network: "internet" },
+    ],
+    username,
+    private_key: privateKey,
+    host_key_sha256: hostKeySha256,
+    command: kind === "linux"
+      ? "sudo -n -i"
+      : "sudo -n -u minecraft -H tmux attach-session -t dragonfyre",
+  });
 }
 
 async function routeAgent(request, env, pathname, ctx) {
@@ -597,19 +713,30 @@ async function updateUser(request, env, session, targetId) {
     : target.permissions;
   assertMayDelegateAccount(session, role, permissions);
   const enabled = Object.prototype.hasOwnProperty.call(body, "enabled") ? (body.enabled ? 1 : 0) : target.enabled ? 1 : 0;
+  const username = Object.prototype.hasOwnProperty.call(body, "username")
+    ? validateUsername(body.username)
+    : target.username;
   const now = Date.now();
-  await env.DB.prepare(
-    `UPDATE users
-     SET role = ?, permissions = ?, enabled = ?, token_version = token_version + 1, updated_at = ?
-     WHERE id = ?`,
-  )
-    .bind(role, JSON.stringify(permissions), enabled, now, targetId)
-    .run();
+  try {
+    await env.DB.prepare(
+      `UPDATE users
+       SET username = ?, role = ?, permissions = ?, enabled = ?, token_version = token_version + 1, updated_at = ?
+       WHERE id = ?`,
+    )
+      .bind(username, role, JSON.stringify(permissions), enabled, now, targetId)
+      .run();
+  } catch (error) {
+    if (String(error?.message || error).includes("UNIQUE")) {
+      throw new ApiError(409, "username_taken", "Этот логин уже используется.");
+    }
+    throw error;
+  }
 
-  const updated = { ...target, role, permissions, enabled, token_version: target.token_version + 1, updated_at: now };
+  const updated = { ...target, username, role, permissions, enabled, token_version: target.token_version + 1, updated_at: now };
   await addAudit(env, session.user.id, enabled ? "user.update" : "user.disable", {
     user_id: targetId,
-    username: target.username,
+    old_username: target.username,
+    username,
     role,
     permissions,
   });

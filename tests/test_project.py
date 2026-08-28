@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -50,6 +51,7 @@ from updater import _read_limited as read_update_response_limited  # noqa: E402
 from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
 from state import AppState  # noqa: E402
+from ssh_terminal import HostFingerprintPolicy, connection_targets, load_private_key  # noqa: E402
 from sc_agent.backups import BackupManager  # noqa: E402
 from sc_agent.files import FileManager  # noqa: E402
 from sc_agent.instances import InstanceProfile, InstanceStore, detect_pack  # noqa: E402
@@ -61,6 +63,71 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_public_ssh_listener_rejects_normal_accounts(self) -> None:
+        config = (ROOT / "agent" / "servercontrol-admin-sshd.conf").read_text(encoding="utf-8")
+        installer = (ROOT / "agent" / "install-v2-console.sh").read_text(encoding="utf-8")
+        self.assertIn("Port 22", config)
+        self.assertIn("Port 2222", config)
+        self.assertIn("Match LocalPort 2222", config)
+        self.assertIn("AllowUsers servercontrol-admin servercontrol-minecraft", config)
+        self.assertIn("Match User servercontrol-admin,servercontrol-minecraft", config)
+        self.assertIn("2222 -> 192.168.0.108:2222", installer)
+        self.assertNotIn("2222 -> 192.168.0.108:22.", installer)
+
+    def test_minecraft_tmux_payload_preserves_process_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exit_file = Path(directory) / "minecraft.exit"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "agent" / "minecraft_tmux_payload.py"),
+                    "--exit-file",
+                    str(exit_file),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit(7)",
+                ],
+                check=False,
+            )
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual(exit_file.read_text(encoding="ascii"), "7")
+
+    def test_embedded_ssh_terminal_loads_keys_and_pins_the_host_fingerprint(self) -> None:
+        import base64
+        import hashlib
+
+        import paramiko
+
+        generated = paramiko.RSAKey.generate(1024)
+        private_key = io.StringIO()
+        generated.write_private_key(private_key)
+        loaded = load_private_key(private_key.getvalue())
+        self.assertEqual(loaded.get_fingerprint(), generated.get_fingerprint())
+        expected = "SHA256:" + base64.b64encode(hashlib.sha256(generated.asbytes()).digest()).decode("ascii").rstrip("=")
+        HostFingerprintPolicy(expected).missing_host_key(None, "46.175.223.107", generated)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(paramiko.SSHException, "не совпал"):
+            HostFingerprintPolicy("SHA256:" + "A" * 43).missing_host_key(None, "46.175.223.107", generated)  # type: ignore[arg-type]
+
+    def test_embedded_ssh_terminal_prefers_lan_only_when_reachable(self) -> None:
+        credentials = {
+            "host": "46.175.223.107",
+            "port": 2222,
+            "targets": [
+                {"host": "192.168.0.108", "port": 22, "network": "lan"},
+                {"host": "46.175.223.107", "port": 2222, "network": "internet"},
+            ],
+        }
+        with patch("ssh_terminal.socket.create_connection", side_effect=OSError("outside LAN")):
+            self.assertEqual(connection_targets(credentials)[0], ("46.175.223.107", 2222))
+
+        class Probe:
+            def close(self) -> None:
+                pass
+
+        with patch("ssh_terminal.socket.create_connection", return_value=Probe()):
+            self.assertEqual(connection_targets(credentials)[0], ("192.168.0.108", 22))
+
     def test_desktop_json_transport_uses_ipv4_and_closes_each_request(self) -> None:
         connections: list[object] = []
 
@@ -313,6 +380,10 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(is_newer("v1.0.0", "0.9.9"))
         self.assertFalse(is_newer("v0.1.0", "0.1.0"))
         self.assertFalse(is_newer("v0.1.0", "0.1.1"))
+        self.assertTrue(is_newer("v2.0.0", "2.0.0-beta.1"))
+        self.assertTrue(is_newer("v2.0.0-beta.2", "2.0.0-beta.1"))
+        self.assertFalse(is_newer("v2.0.0-beta.1", "2.0.0"))
+        self.assertFalse(is_newer("latest", "2.0.0"))
 
     def test_agent_does_not_run_shell_chains(self) -> None:
         config = Config(

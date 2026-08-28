@@ -1,0 +1,1 @@
+servercontrol-admin ALL=(ALL:ALL) NOPASSWD: ALL

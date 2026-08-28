@@ -3,6 +3,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test ../tests/worker_auth.test.mjs",
-    "check": "node --check src/index.js"
+    "check": "node --check src/index.js && node --check src/control_plane.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.0"
   }
 }

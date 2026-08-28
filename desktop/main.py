@@ -36,7 +36,7 @@ from widgets import (
 )
 
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "2.0.0-beta.1"
 APP_TITLE = "Server Control"
 
 
@@ -166,7 +166,7 @@ class ServerControlApp:
         frame = ttk.Frame(self.root, padding=40)
         frame.place(relx=0.5, rely=0.46, anchor="center")
         ttk.Label(frame, text="Server Control", font=("Segoe UI", 24, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        ttk.Label(frame, text=f"Безопасное управление Debian и Minecraft · {APP_VERSION}", style="Subtle.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 20))
+        ttk.Label(frame, text=f"Прямые SSH-консоли Debian и Minecraft · {APP_VERSION}", style="Subtle.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 20))
         username = tk.StringVar()
         password = tk.StringVar()
         status = tk.StringVar()

@@ -12,6 +12,9 @@ from typing import Any
 
 
 PERMISSION_ALIASES = {
+    "status.view": {"status.view", "server.view", "server_view", "minecraft.view", "minecraft_view"},
+    "terminal.linux": {"terminal.linux", "server_command"},
+    "terminal.minecraft": {"terminal.minecraft", "minecraft.console", "minecraft_command"},
     "server.view": {"server.view", "server_view"},
     "server.power": {"server.power", "power_control"},
     "server.reboot": {"server.reboot", "server_command"},

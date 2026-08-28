@@ -9,6 +9,7 @@ const JOB_TYPES = new Set([
 ]);
 
 export const CONTROL_PERMISSIONS = [
+  "status.view", "terminal.linux", "terminal.minecraft",
   "server.view", "server.power", "server.reboot", "server.services", "server.processes",
   "minecraft.view", "minecraft.start", "minecraft.stop", "minecraft.restart", "minecraft.kill",
   "minecraft.console", "minecraft.players", "minecraft.instances.manage", "minecraft.settings",
@@ -342,9 +343,10 @@ export function filterStatusForSession(status, session) {
   const source = status && typeof status === "object" && !Array.isArray(status) ? status : {};
   const permissions = sessionPermissionSet(session);
   const has = (...names) => names.some((name) => permissions.has(name));
-  const minecraftAccess = has("minecraft_view", "minecraft_command")
+  const simpleStatusAccess = has("status.view");
+  const minecraftAccess = simpleStatusAccess || has("minecraft_view", "minecraft_command")
     || [...permissions].some((name) => name.startsWith("minecraft."));
-  const serverAccess = has("server_view", "server_command", "power_view", "power_control")
+  const serverAccess = simpleStatusAccess || has("server_view", "server_command", "power_view", "power_control")
     || [...permissions].some((name) => name.startsWith("server."));
   const result = {
     protocol_version: source.protocol_version,
