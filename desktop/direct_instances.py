@@ -264,7 +264,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         atomic_write(STORE, payload, mode=0o640, group="minecraft")
 
     def properties_port(directory):
-        path = safe_properties_path(directory)
+        path = Path(directory) / "server.properties"
         if not path.is_file():
             return 25565
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
