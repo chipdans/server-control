@@ -86,6 +86,8 @@ class ProjectTests(unittest.TestCase):
     def test_direct_instance_manager_embedded_programs_compile(self) -> None:
         compile(MANAGED_INSTANCE_RUNNER_PROGRAM, "<managed-instance-runner>", "exec")
         compile(REMOTE_INSTANCE_MANAGER_PROGRAM, "<direct-instance-manager>", "exec")
+        self.assertIn('/var/lib/server-control-minecraft/instances.json', MANAGED_INSTANCE_RUNNER_PROGRAM)
+        self.assertIn('LEGACY_STORE = CONFIG_DIR / "minecraft-instances.json"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         command = manager_command({"action": "start", "id": "dragonfyre"})
         self.assertTrue(command.startswith("sudo -n /usr/bin/python3 -c "))
         self.assertIn("dragonfyre", command)
@@ -106,6 +108,11 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(detected["minecraft_version"], "1.20.1")
         self.assertEqual(detected["loader"], "Forge")
         self.assertEqual(detected["port"], 25570)
+
+    def test_direct_status_detects_systemd_restart_loop(self) -> None:
+        source = (ROOT / "desktop" / "direct_status.py").read_text(encoding="utf-8")
+        self.assertIn('sub_state == "auto-restart" and restart_count > 0', source)
+        self.assertIn('"restart_loop": restart_loop', source)
 
     def test_public_ssh_listener_rejects_normal_accounts(self) -> None:
         config = (ROOT / "agent" / "servercontrol-admin-sshd.conf").read_text(encoding="utf-8")

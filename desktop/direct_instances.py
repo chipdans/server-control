@@ -25,7 +25,7 @@ import shutil
 import sys
 from pathlib import Path
 
-STORE = Path("/etc/server-control/minecraft-instances.json")
+STORE = Path("/var/lib/server-control-minecraft/instances.json")
 ROOT = Path("/opt/minecraft").resolve(strict=True)
 TMUX_RUNNER = Path("/opt/server-control/current/minecraft_tmux_runner.py")
 
@@ -134,7 +134,9 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     ROOT = Path("/opt/minecraft")
     INSTANCES_ROOT = ROOT / "instances"
     CONFIG_DIR = Path("/etc/server-control")
-    STORE = CONFIG_DIR / "minecraft-instances.json"
+    STATE_DIR = Path("/var/lib/server-control-minecraft")
+    STORE = STATE_DIR / "instances.json"
+    LEGACY_STORE = CONFIG_DIR / "minecraft-instances.json"
     LOCK = Path("/run/lock/server-control-instances.lock")
     SERVICE = Path("/etc/systemd/system/dragonfyre.service")
     SERVICE_BACKUP = Path("/etc/systemd/system/dragonfyre.service.pre-instance-manager")
@@ -222,9 +224,10 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         return path
 
     def read_store():
-        if STORE.is_file():
+        source = STORE if STORE.is_file() else LEGACY_STORE
+        if source.is_file():
             try:
-                data = json.loads(STORE.read_text(encoding="utf-8"))
+                data = json.loads(source.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 data = {}
         else:
@@ -373,7 +376,10 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         }
 
     def ensure_runtime(data):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        minecraft_gid = grp.getgrnam("minecraft").gr_gid
+        os.chown(STATE_DIR, 0, minecraft_gid)
+        os.chmod(STATE_DIR, 0o750)
         INSTANCES_ROOT.mkdir(parents=True, exist_ok=True)
         if not TMUX_RUNNER.is_file():
             raise RuntimeError("Не найден minecraft_tmux_runner.py. Сначала установите консоль Server Control v2.")
@@ -384,6 +390,8 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                 data["instances"].append(value)
                 data["active"] = "dragonfyre"
                 save_store(data)
+        if not STORE.is_file():
+            save_store(data)
         runtime_text = RUNNER_PROGRAM.rstrip() + "\n"
         if not RUNTIME.is_file() or RUNTIME.read_text(encoding="utf-8", errors="replace") != runtime_text:
             atomic_write(RUNTIME, runtime_text, mode=0o755)
@@ -399,17 +407,32 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     def service_state():
         result = command([
             "/usr/bin/systemctl", "show", "dragonfyre.service",
-            "--property=ActiveState,SubState,MainPID", "--no-pager",
+            "--property=ActiveState,SubState,MainPID,Result,NRestarts,ExecMainStatus", "--no-pager",
         ], timeout=15, check=False)
         values = {}
         for line in result.stdout.splitlines():
             key, separator, value = line.partition("=")
             if separator:
                 values[key] = value
+        try:
+            pid = int(values.get("MainPID", "0") or 0) or None
+        except ValueError:
+            pid = None
+        try:
+            restart_count = int(values.get("NRestarts", "0") or 0)
+        except ValueError:
+            restart_count = 0
+        try:
+            exit_status = int(values.get("ExecMainStatus", "0") or 0)
+        except ValueError:
+            exit_status = 0
         return {
             "active_state": values.get("ActiveState", "unknown"),
             "sub_state": values.get("SubState", "unknown"),
-            "pid": int(values.get("MainPID", "0") or 0) or None,
+            "pid": pid,
+            "result": values.get("Result", "unknown"),
+            "restart_count": restart_count,
+            "exit_status": exit_status,
         }
 
     def public_list(data):
@@ -419,7 +442,8 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
             value = dict(item)
             value["exists"] = Path(value["directory"]).is_dir()
             value["active"] = value["id"] == data["active"]
-            value["state"] = state["active_state"] if value["active"] else "inactive"
+            restart_loop = state["sub_state"] == "auto-restart" and state["restart_count"] > 0
+            value["state"] = ("failed" if restart_loop else state["active_state"]) if value["active"] else "inactive"
             value["service_sub_state"] = state["sub_state"] if value["active"] else "dead"
             value["pid"] = state["pid"] if value["active"] else None
             values.append(value)
@@ -610,8 +634,9 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                     command(["/usr/bin/systemctl", "start", "dragonfyre.service"], timeout=220, check=False)
                 raise RuntimeError(result.stderr.strip() or "Minecraft не удалось запустить; выбрана предыдущая сборка")
             time.sleep(2)
-            started_state = service_state()["active_state"]
-            if started_state in {"failed", "inactive"}:
+            started = service_state()
+            restart_loop = started["sub_state"] == "auto-restart" and started["restart_count"] > 0
+            if started["active_state"] in {"failed", "inactive"} or restart_loop:
                 journal = command(
                     ["/usr/bin/journalctl", "-u", "dragonfyre.service", "-n", "12", "--no-pager"],
                     timeout=30,

@@ -37,7 +37,7 @@ from widgets import (
 )
 
 
-APP_VERSION = "2.0.0-beta.6"
+APP_VERSION = "2.0.0-beta.7"
 APP_TITLE = "Server Control"
 
 

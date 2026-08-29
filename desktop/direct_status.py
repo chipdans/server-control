@@ -325,7 +325,7 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     disk_used = disk.total - disk.free
     code, service_output = run([
         "systemctl", "show", "dragonfyre.service",
-        "--property=ActiveState,SubState,MainPID,ExecMainStartTimestampMonotonic", "--no-pager",
+        "--property=ActiveState,SubState,MainPID,ExecMainStartTimestampMonotonic,Result,NRestarts,ExecMainStatus", "--no-pager",
     ])
     service = {}
     if code == 0:
@@ -335,6 +335,15 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
                 service[key] = value
     active_state = service.get("ActiveState", "unknown")
     sub_state = service.get("SubState", "unknown")
+    try:
+        restart_count = int(service.get("NRestarts", "0") or 0)
+    except ValueError:
+        restart_count = 0
+    try:
+        exit_status = int(service.get("ExecMainStatus", "0") or 0)
+    except ValueError:
+        exit_status = 0
+    restart_loop = sub_state == "auto-restart" and restart_count > 0
     active_profile = active_minecraft_profile()
     minecraft_directory = Path(active_profile["directory"])
     port = minecraft_port(minecraft_directory, active_profile.get("port"))
@@ -355,7 +364,7 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
         except (OSError, IndexError, ValueError):
             pass
     reference = startup_reference(log_directory, current_lines)
-    if active_state == "failed":
+    if active_state == "failed" or restart_loop:
         minecraft_state = "CRASHED"
     elif active_state == "deactivating":
         minecraft_state = "STOPPING"
@@ -368,7 +377,11 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     else:
         startup = {
             "STOPPING": {"progress": 85, "label": "Остановка Minecraft", "ready": False},
-            "CRASHED": {"progress": 0, "label": "Ошибка службы", "ready": False},
+            "CRASHED": {
+                "progress": 0,
+                "label": "Служба перезапускается после кода " + str(exit_status) if restart_loop else "Ошибка службы",
+                "ready": False,
+            },
             "STOPPED": {"progress": 0, "label": "Служба остановлена", "ready": False},
         }[minecraft_state]
     collected_at = int(time.time() * 1000)
@@ -390,8 +403,10 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
         "minecraft": {
             "id": active_profile["id"], "name": active_profile["name"],
             "directory": str(minecraft_directory), "service": "dragonfyre.service",
-            "active": active_state in ("active", "activating", "deactivating"),
+            "active": active_state in ("active", "activating", "deactivating") and not restart_loop,
             "state": minecraft_state, "service_state": active_state, "service_sub_state": sub_state,
+            "service_result": service.get("Result", "unknown"), "restart_count": restart_count,
+            "exit_status": exit_status, "restart_loop": restart_loop,
             "pid": int(service.get("MainPID", "0") or 0) or None,
             "port": port, "startup": startup,
             "players": {"online": online_players, "max": maximum_players, "names": []},
