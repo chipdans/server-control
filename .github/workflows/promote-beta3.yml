@@ -1,0 +1,20 @@
+name: Promote Server Control beta 3
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/promote-beta3.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish beta 3 as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit v2.0.0-beta.3 --repo "${{ github.repository }}" --prerelease=false --latest
