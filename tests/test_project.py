@@ -387,6 +387,7 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(is_newer("v2.0.0", "2.0.0-beta.1"))
         self.assertTrue(is_newer("v2.0.0-beta.2", "2.0.0-beta.1"))
         self.assertTrue(is_newer("v2.0.0-beta.4", "2.0.0-beta.3"))
+        self.assertTrue(is_newer("v2.0.0-beta.5", "2.0.0-beta.4"))
         self.assertFalse(is_newer("v2.0.0-beta.1", "2.0.0"))
         self.assertFalse(is_newer("latest", "2.0.0"))
 

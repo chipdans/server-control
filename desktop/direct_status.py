@@ -21,13 +21,16 @@ MAX_STATUS_BYTES = 256 * 1024
 REMOTE_STATUS_PROGRAM = textwrap.dedent(
     r"""
     import glob
+    import gzip
     import json
     import os
+    import re
     import shutil
     import socket
     import struct
     import subprocess
     import time
+    from pathlib import Path
 
     def read_text(path, limit=1048576):
         try:
@@ -85,6 +88,123 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             if -20 <= value <= 150:
                 candidates.append(value)
         return round(max(candidates), 1) if candidates else None
+
+    def read_log_start(path, max_chars=25165824):
+        lines = []
+        consumed = 0
+        try:
+            opener = gzip.open if str(path).endswith(".gz") else open
+            with opener(path, "rt", encoding="utf-8", errors="replace") as source:
+                for line in source:
+                    consumed += len(line)
+                    if consumed > max_chars:
+                        break
+                    value = line.rstrip("\r\n")
+                    lines.append(value)
+                    lowered = value.casefold()
+                    if "done (" in lowered and "for help, type" in lowered:
+                        break
+        except (OSError, EOFError, gzip.BadGzipFile):
+            return []
+        return lines
+
+    def normalize_startup_line(line):
+        value = line.strip()
+        value = re.sub(r"^\[[^\]]*(?:\d{1,2}:){2}[^\]]*\]\s*", "", value)
+        value = re.sub(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            "<uuid>", value, flags=re.IGNORECASE,
+        )
+        value = re.sub(r"@[0-9a-f]{6,}\b", "@<id>", value, flags=re.IGNORECASE)
+        value = re.sub(
+            r"\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?)\b",
+            "<time>", value, flags=re.IGNORECASE,
+        )
+        value = re.sub(r"\s+", " ", value).strip()
+        return value[:600]
+
+    def select_startup_markers(lines, count=100):
+        unique = []
+        seen = set()
+        ignored = (
+            "preparing spawn area:", "preparing start region for dimension",
+            "joined the game", "left the game", "lost connection", "saving chunks",
+            "thread rcon client", "rcon listener", "stopping server",
+        )
+        for line in lines:
+            lowered = line.casefold()
+            if any(marker in lowered for marker in ignored):
+                continue
+            value = normalize_startup_line(line)
+            if len(value) < 24 or value in seen:
+                continue
+            seen.add(value)
+            unique.append(value)
+        if len(unique) <= count:
+            return unique
+        indexes = [round(index * (len(unique) - 1) / (count - 1)) for index in range(count)]
+        return [unique[index] for index in indexes]
+
+    def completed_startup(lines):
+        return any("done (" in line.casefold() and "for help, type" in line.casefold() for line in lines)
+
+    def startup_reference(log_directory, current_lines):
+        candidates = []
+        try:
+            candidates = sorted(
+                [path for path in log_directory.iterdir() if path.name != "latest.log" and path.is_file() and path.suffix in (".log", ".gz")],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )[:12]
+        except OSError:
+            pass
+        for path in candidates:
+            lines = read_log_start(path)
+            if completed_startup(lines):
+                return select_startup_markers(lines)
+        if completed_startup(current_lines):
+            return select_startup_markers(current_lines)
+        return []
+
+    def startup_from_log(current_lines, reference, ready, start_id):
+        if ready:
+            return {
+                "progress": 100, "label": "Сервер принимает подключения", "ready": True,
+                "detail": "Minecraft полностью запущен", "milestones_matched": len(reference),
+                "milestones_total": len(reference), "start_id": start_id,
+            }
+        normalized = {normalize_startup_line(line) for line in current_lines if line.strip()}
+        matched = sum(1 for marker in reference if marker in normalized)
+        progress = 2
+        if reference:
+            progress = max(progress, min(97, 2 + round(matched * 95 / len(reference))))
+        text = "\n".join(current_lines).casefold()
+        phase = "Запускаю Java"
+        if any(marker in text for marker in ("modlauncher running", "modlauncher", "fml loader")):
+            progress, phase = max(progress, 7), "Запускаю Forge"
+        if any(marker in text for marker in ("found mod file", "moddiscoverer", "loading mod list")):
+            progress, phase = max(progress, 18), "Сканирую моды"
+        if any(marker in text for marker in ("constructing mods", "loading mod", "common_setup", "modloading")):
+            progress, phase = max(progress, 42), "Инициализирую моды"
+        if any(marker in text for marker in ("gamedata", "registries", "registering", "registry")):
+            progress, phase = max(progress, 66), "Регистрирую содержимое"
+        if any(marker in text for marker in ("starting minecraft server version", "starting minecraft server")):
+            progress, phase = max(progress, 78), "Запускаю Minecraft"
+        if "preparing level" in text or "loading level" in text:
+            progress, phase = max(progress, 84), "Загружаю мир"
+        spawn_values = [int(value) for value in re.findall(r"preparing (?:spawn area|start region).*?(\d{1,3})%", text)]
+        if spawn_values:
+            spawn = max(0, min(100, max(spawn_values)))
+            progress, phase = max(progress, 85 + round(spawn * 0.14)), "Подготавливаю спавн"
+        progress = max(1, min(99, progress))
+        detail = (
+            f"Контрольные сообщения запуска: {matched}/{len(reference)}"
+            if reference else "Собираю контрольные сообщения нового запуска"
+        )
+        return {
+            "progress": progress, "label": phase, "ready": False, "detail": detail,
+            "milestones_matched": matched, "milestones_total": len(reference), "start_id": start_id,
+        }
 
     def run(command, timeout=3):
         try:
@@ -168,7 +288,7 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     disk_used = disk.total - disk.free
     code, service_output = run([
         "systemctl", "show", "dragonfyre.service",
-        "--property=ActiveState,SubState,MainPID", "--no-pager",
+        "--property=ActiveState,SubState,MainPID,ExecMainStartTimestampMonotonic", "--no-pager",
     ])
     service = {}
     if code == 0:
@@ -180,6 +300,22 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     sub_state = service.get("SubState", "unknown")
     port = minecraft_port()
     ready, online_players, maximum_players = minecraft_ping(port)
+    try:
+        start_id = int(service.get("ExecMainStartTimestampMonotonic", "0") or 0)
+    except ValueError:
+        start_id = 0
+    log_directory = Path("/opt/minecraft/dragonfyre/logs")
+    latest_log = log_directory / "latest.log"
+    current_lines = read_log_start(latest_log)
+    if start_id:
+        try:
+            boot_epoch = time.time() - float(read_text("/proc/uptime", 128).split()[0])
+            service_started_epoch = boot_epoch + start_id / 1000000
+            if latest_log.stat().st_mtime + 1 < service_started_epoch:
+                current_lines = []
+        except (OSError, IndexError, ValueError):
+            pass
+    reference = startup_reference(log_directory, current_lines)
     if active_state == "failed":
         minecraft_state = "CRASHED"
     elif active_state == "deactivating":
@@ -188,13 +324,14 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
         minecraft_state = "RUNNING" if ready else "STARTING"
     else:
         minecraft_state = "STOPPED"
-    startup = {
-        "RUNNING": {"progress": 100, "label": "Сервер принимает подключения", "ready": True},
-        "STARTING": {"progress": 60, "label": "Запуск Minecraft", "ready": False},
-        "STOPPING": {"progress": 85, "label": "Остановка Minecraft", "ready": False},
-        "CRASHED": {"progress": 0, "label": "Ошибка службы", "ready": False},
-        "STOPPED": {"progress": 0, "label": "Служба остановлена", "ready": False},
-    }[minecraft_state]
+    if minecraft_state in ("RUNNING", "STARTING"):
+        startup = startup_from_log(current_lines, reference, ready, start_id)
+    else:
+        startup = {
+            "STOPPING": {"progress": 85, "label": "Остановка Minecraft", "ready": False},
+            "CRASHED": {"progress": 0, "label": "Ошибка службы", "ready": False},
+            "STOPPED": {"progress": 0, "label": "Служба остановлена", "ready": False},
+        }[minecraft_state]
     collected_at = int(time.time() * 1000)
     snapshot = {
         "hostname": socket.gethostname(),
@@ -266,6 +403,8 @@ class DirectSshStatusClient:
         self._lock = threading.Lock()
         self._client: paramiko.SSHClient | None = None
         self._target = ""
+        self._startup_id: int | str | None = None
+        self._startup_progress = 0
 
     def close(self) -> None:
         with self._lock:
@@ -335,7 +474,32 @@ class DirectSshStatusClient:
             raise ValueError("Сервер вернул некорректное состояние.") from exc
         if not isinstance(value, dict):
             raise ValueError("Сервер вернул некорректное состояние.")
-        return dashboard_envelope(value)
+        return self._stabilize_startup(dashboard_envelope(value))
+
+    def _stabilize_startup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+        minecraft = status.get("minecraft") if isinstance(status.get("minecraft"), dict) else {}
+        startup = minecraft.get("startup") if isinstance(minecraft.get("startup"), dict) else {}
+        state = str(minecraft.get("state") or "").upper()
+        if state == "STARTING":
+            start_id = startup.get("start_id")
+            if start_id != self._startup_id:
+                self._startup_id = start_id
+                self._startup_progress = 0
+            try:
+                current = int(startup.get("progress", 0) or 0)
+            except (TypeError, ValueError):
+                current = 0
+            self._startup_progress = max(self._startup_progress, current)
+            startup["progress"] = self._startup_progress
+        elif state == "RUNNING":
+            self._startup_id = startup.get("start_id")
+            self._startup_progress = 100
+            startup["progress"] = 100
+        else:
+            self._startup_id = None
+            self._startup_progress = 0
+        return payload
 
     def _restart_minecraft(self) -> dict[str, Any]:
         client = self._client
