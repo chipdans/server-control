@@ -37,7 +37,7 @@ from sc_agent.instances import InstanceProfile
 from sc_agent.security import atomic_write_bytes, secure_path_within, validate_instance_id
 
 
-AGENT_VERSION = "2.0.4"
+AGENT_VERSION = "2.0.5"
 PROTOCOL_VERSION = 2
 MAX_EVENT_MESSAGE = 8000
 MAX_EVENT_BUFFER_EVENTS = 2_000
@@ -97,10 +97,10 @@ class Config:
         return cls(
             hub_url=str(raw["hub_url"]).rstrip("/"),
             agent_api_key=str(raw["agent_api_key"]),
-            # Cloudflare Workers Free permits 100,000 requests per day.  Keep
-            # polling responsive without allowing an old config to force the
-            # Agent alone above that account-wide quota.
-            poll_seconds=max(3.0, float(raw.get("poll_seconds", 3))),
+            # Leave enough of the shared Cloudflare Workers Free allowance for
+            # desktop status, power and session requests.  Existing configs
+            # with a shorter interval are clamped automatically.
+            poll_seconds=max(5.0, float(raw.get("poll_seconds", 5))),
             heartbeat_seconds=max(15, int(raw.get("heartbeat_seconds", 15))),
             request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
             minecraft=dict(raw["minecraft"]),

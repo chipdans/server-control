@@ -92,7 +92,7 @@ class AppState:
         self.selected_instance_id = str(selected) if selected else None
 
     def apply_server_snapshot(self, payload: dict[str, Any], protocol: dict[str, Any] | None = None) -> None:
-        """Apply the proven /v1/server/status feed as the connection authority."""
+        """Apply a direct SSH server snapshot as the connection authority."""
 
         with self.lock:
             if protocol is not None:

@@ -108,7 +108,7 @@ class DashboardPage(BasePage):
 
         if state.connected:
             latency = f"{state.latency_ms} мс" if state.latency_ms is not None else "ответ получен"
-            self.hub.set("Подключено", f"Control Hub · {latency}", tone="success")
+            self.hub.set("Подключено", f"Прямой SSH · {latency}", tone="success")
         else:
             self.hub.set("Нет связи", state.last_error or "Повторное подключение…", tone="danger")
 
@@ -186,8 +186,7 @@ class DashboardPage(BasePage):
         )
 
         addresses = mapping(status.get("system")).get("ip_addresses")
-        agent_version = status.get("agent_version", "—")
         self.info.set(
-            f"Agent {agent_version} · IP: {', '.join(str(value) for value in addresses) if isinstance(addresses, list) and addresses else '—'} · "
-            "состояние обновляется каждую секунду, когда окно приложения открыто."
+            f"Прямой SSH · IP: {', '.join(str(value) for value in addresses) if isinstance(addresses, list) and addresses else '—'} · "
+            "Agent для сбора состояния не используется; обновление каждые 5 секунд."
         )

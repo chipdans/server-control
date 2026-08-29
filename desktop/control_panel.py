@@ -12,11 +12,18 @@ from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 from api import ApiClient, ApiError
+from direct_status import DirectSshStatusClient
 from pages_base import BasePage
 from pages_console_v2 import ConsolePage
 from pages_dashboard_v2 import DashboardPage
 from pages_users_v2 import AccountPage, UsersPage
 from state import AppState, LocalPreferences
+
+
+STATUS_POLL_ACTIVE_MS = 5_000
+STATUS_POLL_MINIMIZED_MS = 15_000
+POWER_POLL_MS = 15_000
+SESSION_POLL_MS = 30_000
 
 
 class ControlPanel(ttk.Frame):
@@ -52,6 +59,7 @@ class ControlPanel(ttk.Frame):
         self._session_after: str | None = None
         self._ui_after: str | None = None
         self._message_after: str | None = None
+        self.direct_status = DirectSshStatusClient()
 
         self.connection_var = tk.StringVar(value="Подключение…")
         self.message_var = tk.StringVar(value="Загружаю состояние сервера…")
@@ -197,7 +205,7 @@ class ControlPanel(ttk.Frame):
             minimized = self.winfo_toplevel().state() == "iconic"
         except tk.TclError:
             minimized = False
-        return 5000 if minimized else 1000
+        return STATUS_POLL_MINIMIZED_MS if minimized else STATUS_POLL_ACTIVE_MS
 
     def refresh_now(self) -> None:
         if self.closed or self._status_inflight:
@@ -206,6 +214,10 @@ class ControlPanel(ttk.Frame):
             self.connection_var.set("Вход выполнен")
             self.message_var.set("Для этой учётной записи просмотр состояния отключён.")
             return
+        if not self.state.has_permission("terminal.linux"):
+            self.connection_var.set("Нет прямого SSH")
+            self.message_var.set("Для прямого состояния нужно право доступа к Linux.")
+            return
         self._status_inflight = True
         started = time.monotonic()
 
@@ -213,7 +225,7 @@ class ControlPanel(ttk.Frame):
             self._status_inflight = False
             self.state.latency_ms = max(0, round((time.monotonic() - started) * 1000))
             self.state.apply_server_snapshot(payload)
-            self.connection_var.set("Подключено")
+            self.connection_var.set("Прямой SSH")
             self.connection_label.configure(style="Connection.TLabel")
             self._update_pages()
             self._schedule_status()
@@ -227,7 +239,7 @@ class ControlPanel(ttk.Frame):
             self._schedule_status()
 
         self.run_async(
-            lambda: self.api.request("GET", "/v1/server/status", timeout_seconds=8),
+            lambda: self.direct_status.snapshot(lambda: self.api.terminal_credentials("linux")),
             success,
             failure,
         )
@@ -246,7 +258,7 @@ class ControlPanel(ttk.Frame):
         if self.closed:
             return
         if self._power_inflight or not self.state.has_permission("status.view"):
-            self._power_after = self.after(5000, self._poll_power)
+            self._power_after = self.after(POWER_POLL_MS, self._poll_power)
             return
         self._power_inflight = True
 
@@ -254,11 +266,11 @@ class ControlPanel(ttk.Frame):
             self._power_inflight = False
             self.state.apply_power(payload)
             self._update_pages()
-            self._power_after = self.after(5000, self._poll_power)
+            self._power_after = self.after(POWER_POLL_MS, self._poll_power)
 
         def failure(_error: Exception) -> None:
             self._power_inflight = False
-            self._power_after = self.after(5000, self._poll_power)
+            self._power_after = self.after(POWER_POLL_MS, self._poll_power)
 
         self.run_async(
             lambda: self.api.request("GET", "/v1/power/status", timeout_seconds=9),
@@ -270,7 +282,7 @@ class ControlPanel(ttk.Frame):
         if self.closed:
             return
         if self._session_inflight:
-            self._session_after = self.after(5000, self._validate_session)
+            self._session_after = self.after(SESSION_POLL_MS, self._validate_session)
             return
         self._session_inflight = True
 
@@ -279,7 +291,7 @@ class ControlPanel(ttk.Frame):
             user = payload.get("user")
             if isinstance(user, dict) and user != self.state.user:
                 self.update_identity(user)
-            self._session_after = self.after(5000, self._validate_session)
+            self._session_after = self.after(SESSION_POLL_MS, self._validate_session)
 
         def failure(error: Exception) -> None:
             self._session_inflight = False
@@ -288,7 +300,7 @@ class ControlPanel(ttk.Frame):
                 messagebox.showwarning("Доступ отключён", str(error))
                 self.logout_callback()
                 return
-            self._session_after = self.after(5000, self._validate_session)
+            self._session_after = self.after(SESSION_POLL_MS, self._validate_session)
 
         self.run_async(lambda: self.api.request("GET", "/v1/me", timeout_seconds=8), success, failure)
 
@@ -331,6 +343,7 @@ class ControlPanel(ttk.Frame):
         if self.closed:
             return
         self.closed = True
+        self.direct_status.close()
         for page in self.pages.values():
             close = getattr(page, "close", None)
             if callable(close):

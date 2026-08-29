@@ -50,6 +50,7 @@ from updater import is_newer, prepare_bootstrap_updater  # noqa: E402
 from updater import _read_limited as read_update_response_limited  # noqa: E402
 from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
+from direct_status import dashboard_envelope  # noqa: E402
 from state import AppState  # noqa: E402
 from ssh_terminal import connection_targets  # noqa: E402
 from sc_agent.backups import BackupManager  # noqa: E402
@@ -63,6 +64,19 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_direct_ssh_snapshot_uses_dashboard_shape(self) -> None:
+        payload = dashboard_envelope({
+            "hostname": "ChipdanServer",
+            "ip_addresses": ["192.168.0.108"],
+            "collected_at": 1_700_000_000_000,
+            "metrics": {"cpu": {"percent": 12.5}},
+            "minecraft": {"id": "dragonfyre", "state": "RUNNING"},
+        })
+        self.assertTrue(payload["online"])
+        self.assertEqual(payload["source"], "direct_ssh")
+        self.assertEqual(payload["status"]["server"]["hostname"], "ChipdanServer")
+        self.assertEqual(payload["status"]["instances"][0]["state"], "RUNNING")
+
     def test_public_ssh_listener_rejects_normal_accounts(self) -> None:
         config = (ROOT / "agent" / "servercontrol-admin-sshd.conf").read_text(encoding="utf-8")
         installer = (ROOT / "agent" / "install-v2-console.sh").read_text(encoding="utf-8")
@@ -164,9 +178,10 @@ class ProjectTests(unittest.TestCase):
         self.assertNotIn("redacted", diagnostic)
         self.assertNotIn("unit-test-auth-placeholder", diagnostic)
 
-    def test_desktop_core_status_does_not_depend_on_combined_sync(self) -> None:
+    def test_desktop_core_status_uses_direct_ssh(self) -> None:
         source = (ROOT / "desktop" / "control_panel.py").read_text(encoding="utf-8")
-        self.assertIn('"/v1/server/status"', source)
+        self.assertIn("direct_status.snapshot", source)
+        self.assertNotIn('"/v1/server/status"', source)
         self.assertIn('"/v1/power/status"', source)
         self.assertNotIn('"/v1/sync', source)
 
@@ -324,7 +339,7 @@ class ProjectTests(unittest.TestCase):
                 "commands": {"allow_shell_commands": []},
             }), encoding="utf-8")
             config = Config.load(path)
-            self.assertEqual(config.poll_seconds, 3.0)
+            self.assertEqual(config.poll_seconds, 5.0)
             self.assertEqual(config.heartbeat_seconds, 15)
 
     def test_debian_release_files_use_posix_line_endings(self) -> None:
