@@ -9,10 +9,13 @@ import socket
 import textwrap
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Callable
 
 import paramiko
 
+from direct_instances import MAX_MANAGER_RESPONSE_BYTES, manager_command
 from ssh_terminal import HostFingerprintPolicy, connection_targets, load_private_key
 
 
@@ -266,9 +269,43 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
         except (OSError, ValueError, json.JSONDecodeError):
             return False, None, None
 
-    def minecraft_port():
+    def active_minecraft_profile():
+        fallback = {
+            "id": "dragonfyre", "name": "Dragonfyre",
+            "directory": "/opt/minecraft/dragonfyre", "port": 25565,
+        }
+        path = Path("/etc/server-control/minecraft-instances.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return fallback
+        values = data.get("instances") if isinstance(data.get("instances"), list) else []
+        active = str(data.get("active") or "")
+        selected = next(
+            (item for item in values if isinstance(item, dict) and str(item.get("id") or "") == active),
+            None,
+        )
+        if not selected:
+            return fallback
+        directory = Path(str(selected.get("directory") or fallback["directory"]))
+        try:
+            directory.resolve(strict=False).relative_to(Path("/opt/minecraft").resolve(strict=False))
+        except ValueError:
+            return fallback
+        return {
+            "id": str(selected.get("id") or fallback["id"]),
+            "name": str(selected.get("name") or selected.get("id") or fallback["name"]),
+            "directory": str(directory),
+            "port": selected.get("port", fallback["port"]),
+        }
+
+    def minecraft_port(directory, configured):
         port = 25565
-        for line in read_text("/opt/minecraft/dragonfyre/server.properties", 1048576).splitlines():
+        try:
+            port = int(configured)
+        except (TypeError, ValueError):
+            pass
+        for line in read_text(str(directory / "server.properties"), 1048576).splitlines():
             if line.startswith("server-port="):
                 try:
                     port = int(line.partition("=")[2].strip())
@@ -298,13 +335,15 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
                 service[key] = value
     active_state = service.get("ActiveState", "unknown")
     sub_state = service.get("SubState", "unknown")
-    port = minecraft_port()
+    active_profile = active_minecraft_profile()
+    minecraft_directory = Path(active_profile["directory"])
+    port = minecraft_port(minecraft_directory, active_profile.get("port"))
     ready, online_players, maximum_players = minecraft_ping(port)
     try:
         start_id = int(service.get("ExecMainStartTimestampMonotonic", "0") or 0)
     except ValueError:
         start_id = 0
-    log_directory = Path("/opt/minecraft/dragonfyre/logs")
+    log_directory = minecraft_directory / "logs"
     latest_log = log_directory / "latest.log"
     current_lines = read_log_start(latest_log)
     if start_id:
@@ -349,7 +388,8 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             "collected_at": collected_at,
         },
         "minecraft": {
-            "id": "dragonfyre", "name": "Dragonfyre", "service": "dragonfyre.service",
+            "id": active_profile["id"], "name": active_profile["name"],
+            "directory": str(minecraft_directory), "service": "dragonfyre.service",
             "active": active_state in ("active", "activating", "deactivating"),
             "state": minecraft_state, "service_state": active_state, "service_sub_state": sub_state,
             "pid": int(service.get("MainPID", "0") or 0) or None,
@@ -386,7 +426,7 @@ def dashboard_envelope(snapshot: dict[str, Any]) -> dict[str, Any]:
             },
             "minecraft": minecraft,
             "instances": [minecraft] if minecraft else [],
-            "selected_instance_id": "dragonfyre" if minecraft else None,
+            "selected_instance_id": str(minecraft.get("id")) if minecraft.get("id") else None,
             "system": {
                 "ip_addresses": snapshot.get("ip_addresses")
                 if isinstance(snapshot.get("ip_addresses"), list)
@@ -517,6 +557,27 @@ class DirectSshStatusClient:
             raise RuntimeError(error or output or f"Перезапуск завершился с кодом {code}.")
         return {"ok": True}
 
+    def _execute_instance_request(self, payload: dict[str, Any], timeout: int = 900) -> dict[str, Any]:
+        client = self._client
+        transport = client.get_transport() if client else None
+        if not client or not transport or not transport.is_active():
+            raise paramiko.SSHException("SSH-соединение закрыто.")
+        _stdin, stdout, stderr = client.exec_command(manager_command(payload), timeout=max(30, timeout))
+        raw = stdout.read(MAX_MANAGER_RESPONSE_BYTES + 1)
+        error = stderr.read(256 * 1024).decode("utf-8", "replace").strip()
+        code = stdout.channel.recv_exit_status()
+        if len(raw) > MAX_MANAGER_RESPONSE_BYTES:
+            raise ValueError("Менеджер сборок вернул слишком большой ответ.")
+        if code != 0:
+            raise RuntimeError(error or f"Операция со сборкой завершилась с кодом {code}.")
+        try:
+            result = json.loads(raw.decode("utf-8", "replace"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Менеджер сборок вернул некорректный ответ.") from exc
+        if not isinstance(result, dict):
+            raise ValueError("Менеджер сборок вернул некорректный ответ.")
+        return result
+
     def snapshot(self, credentials: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         with self._lock:
             for attempt in range(2):
@@ -550,3 +611,70 @@ class DirectSshStatusClient:
                     if attempt:
                         raise RuntimeError(f"Прямой SSH недоступен: {error}") from error
             raise RuntimeError("Прямой SSH недоступен.")
+
+    def instance_request(
+        self,
+        credentials: Callable[[], dict[str, Any]],
+        payload: dict[str, Any],
+        *,
+        timeout: int = 900,
+    ) -> dict[str, Any]:
+        """Run one instance-manager operation directly over the admin SSH channel."""
+
+        with self._lock:
+            try:
+                if self._client is None:
+                    self._connect(credentials())
+                return self._execute_instance_request(dict(payload), timeout)
+            except (OSError, socket.timeout, paramiko.SSHException, EOFError) as error:
+                if self._client:
+                    self._client.close()
+                self._client = None
+                self._target = ""
+                raise RuntimeError(
+                    "SSH-соединение прервалось. Обновите список сборок, чтобы проверить результат операции."
+                ) from error
+
+    def import_instance_archive(
+        self,
+        credentials: Callable[[], dict[str, Any]],
+        archive: str | Path,
+        payload: dict[str, Any],
+        *,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Upload one server ZIP over SFTP and import it into an isolated directory."""
+
+        source = Path(archive).resolve(strict=True)
+        if source.suffix.casefold() != ".zip":
+            raise ValueError("Выберите серверный ZIP-архив.")
+        if source.stat().st_size > 12 * 1024 * 1024 * 1024:
+            raise ValueError("ZIP больше допустимого размера 12 GB.")
+        with self._lock:
+            if self._client is None:
+                self._connect(credentials())
+            client = self._client
+            transport = client.get_transport() if client else None
+            if not client or not transport or not transport.is_active():
+                raise paramiko.SSHException("SSH-соединение закрыто.")
+            sftp = client.open_sftp()
+            remote_path = ""
+            try:
+                home = sftp.normalize(".").rstrip("/")
+                upload_directory = f"{home}/.server-control-upload"
+                try:
+                    sftp.mkdir(upload_directory, mode=0o700)
+                except OSError:
+                    pass
+                remote_path = f"{upload_directory}/server-control-{uuid.uuid4().hex}.zip"
+                sftp.put(str(source), remote_path, callback=progress, confirm=True)
+                request = dict(payload)
+                request.update({"action": "import_zip", "archive": remote_path})
+                return self._execute_instance_request(request, timeout=24 * 60 * 60)
+            finally:
+                if remote_path:
+                    try:
+                        sftp.remove(remote_path)
+                    except OSError:
+                        pass
+                sftp.close()

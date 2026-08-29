@@ -21,7 +21,8 @@ class StateCard(ttk.Frame):
         self.value = tk.StringVar(value="Проверяю…")
         self.detail = tk.StringVar(value="")
         self.progress = tk.DoubleVar(value=0)
-        ttk.Label(self, text=title, style="CardTitle.TLabel").pack(anchor="w")
+        self.title = tk.StringVar(value=title)
+        ttk.Label(self, textvariable=self.title, style="CardTitle.TLabel").pack(anchor="w")
         badge = tk.Label(
             self,
             text=icon,
@@ -54,6 +55,9 @@ class StateCard(ttk.Frame):
             self.progress.set(max(0, min(100, float(progress))))
             if not self.bar.winfo_ismapped():
                 self.bar.pack(side="bottom", fill="x", pady=(10, 0))
+
+    def set_title(self, value: str) -> None:
+        self.title.set(value)
 
 
 class DashboardPage(BasePage):
@@ -140,6 +144,7 @@ class DashboardPage(BasePage):
             instance = mapping(values[0])
         if not instance:
             instance = mapping(status.get("minecraft"))
+        self.minecraft.set_title(f"Minecraft · {instance.get('name') or instance.get('id') or 'сборка'}")
         minecraft_state = str(instance.get("state") or ("RUNNING" if instance.get("active") else "STOPPED"))
         minecraft_label = {
             "RUNNING": "Запущен",

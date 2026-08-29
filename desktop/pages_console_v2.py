@@ -78,7 +78,7 @@ class ConsolePage(BasePage):
                 "minecraft",
                 "Minecraft",
                 "Прямая консоль Minecraft",
-                "Прямое подключение к tmux-сессии Dragonfyre. RCON и промежуточная очередь команд не используются.",
+                "Прямое подключение к tmux-сессии активной сборки. RCON и промежуточная очередь команд не используются.",
             )
         self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
 

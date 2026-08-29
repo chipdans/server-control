@@ -17,12 +17,24 @@ PERMISSION_LABELS = (
     ("terminal.linux", "Linux-консоль с правами администратора"),
     ("terminal.minecraft", "Прямая Minecraft-консоль"),
     ("server.power", "Управление питанием сервера"),
+    ("minecraft.view", "Просмотр установленных сборок"),
+    ("minecraft.start", "Запуск и переключение сборок"),
+    ("minecraft.stop", "Остановка Minecraft"),
+    ("minecraft.restart", "Перезапуск Minecraft"),
+    ("minecraft.instances.manage", "Добавление, импорт и клонирование сборок"),
+    ("minecraft.settings", "Изменение RAM, порта и названия сборок"),
+    ("minecraft.delete", "Удаление сборок и их файлов"),
     ("users.manage", "Создание и блокировка пользователей"),
 )
 
 PRESETS = {
     "Полный доступ": {key for key, _label in PERMISSION_LABELS},
     "Только Minecraft": {"status.view", "terminal.minecraft"},
+    "Оператор сборок": {
+        "status.view", "terminal.linux", "terminal.minecraft", "minecraft.view",
+        "minecraft.start", "minecraft.stop", "minecraft.restart", "minecraft.instances.manage",
+        "minecraft.settings",
+    },
     "Только просмотр": {"status.view"},
     "Свои настройки": set(),
 }

@@ -16,6 +16,7 @@ from direct_status import DirectSshStatusClient
 from pages_base import BasePage
 from pages_console_v2 import ConsolePage
 from pages_dashboard_v2 import DashboardPage
+from pages_instances_v2 import InstancesPage
 from pages_users_v2 import AccountPage, UsersPage
 from state import AppState, LocalPreferences
 
@@ -116,12 +117,20 @@ class ControlPanel(ttk.Frame):
         ttk.Button(footer, text="Выйти", command=self.logout_callback).pack(side="right")
 
         page_types: list[type[BasePage]] = [DashboardPage]
+        instance_permissions = (
+            "minecraft.view", "minecraft.start", "minecraft.stop", "minecraft.restart",
+            "minecraft.instances.manage", "minecraft.settings", "minecraft.delete",
+        )
+        if self.state.has_permission("terminal.linux") and any(
+            self.state.has_permission(permission) for permission in instance_permissions
+        ):
+            page_types.append(InstancesPage)
         if self.state.has_permission("terminal.linux") or self.state.has_permission("terminal.minecraft"):
             page_types.append(ConsolePage)
         if self.state.has_permission("users.manage"):
             page_types.append(UsersPage)
         page_types.append(AccountPage)
-        nav_icons = {"dashboard": "⌂", "console": "▣", "users": "♙", "account": "○"}
+        nav_icons = {"dashboard": "⌂", "console": "▣", "instances": "◆", "users": "♙", "account": "○"}
         for page_type in page_types:
             page = page_type(self.page_container, self)
             self.pages[page.page_id] = page
@@ -185,6 +194,12 @@ class ControlPanel(ttk.Frame):
                     self._ui_queue.put(lambda completed=result: success(completed))
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def post_ui(self, callback: Callable[[], None]) -> None:
+        """Queue a small UI update from an SFTP or SSH worker thread."""
+
+        if not self.closed:
+            self._ui_queue.put(callback)
 
     def _drain_ui_queue(self) -> None:
         if self.closed:
@@ -335,7 +350,7 @@ class ControlPanel(ttk.Frame):
             return
         if not messagebox.askyesno(
             "Перезапустить Minecraft?",
-            "Dragonfyre будет корректно остановлен и запущен заново. Продолжить?",
+            f"{(self.state.selected_instance() or {}).get('name', 'Активная сборка')} будет корректно остановлена и запущена заново. Продолжить?",
             icon="warning",
         ):
             return

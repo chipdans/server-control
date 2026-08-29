@@ -50,6 +50,7 @@ from updater import is_newer, prepare_bootstrap_updater  # noqa: E402
 from updater import _read_limited as read_update_response_limited  # noqa: E402
 from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
+from direct_instances import MANAGED_INSTANCE_RUNNER_PROGRAM, REMOTE_INSTANCE_MANAGER_PROGRAM, manager_command  # noqa: E402
 from direct_status import dashboard_envelope  # noqa: E402
 from state import AppState  # noqa: E402
 from ssh_terminal import connection_targets  # noqa: E402
@@ -81,6 +82,30 @@ class ProjectTests(unittest.TestCase):
         source = (ROOT / "desktop" / "direct_status.py").read_text(encoding="utf-8")
         self.assertIn('"sudo -n /usr/bin/systemctl restart dragonfyre.service"', source)
         self.assertNotIn("restart_minecraft(self, credentials, service", source)
+
+    def test_direct_instance_manager_embedded_programs_compile(self) -> None:
+        compile(MANAGED_INSTANCE_RUNNER_PROGRAM, "<managed-instance-runner>", "exec")
+        compile(REMOTE_INSTANCE_MANAGER_PROGRAM, "<direct-instance-manager>", "exec")
+        command = manager_command({"action": "start", "id": "dragonfyre"})
+        self.assertTrue(command.startswith("sudo -n /usr/bin/python3 -c "))
+        self.assertIn("dragonfyre", command)
+
+    def test_direct_instance_manager_detects_a_server_pack_without_running_it(self) -> None:
+        namespace: dict[str, object] = {"__name__": "embedded_manager_test"}
+        exec(compile(REMOTE_INSTANCE_MANAGER_PROGRAM, "<direct-instance-manager>", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "start.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (root / "server.properties").write_text("server-port=25570\n", encoding="utf-8")
+            (root / "manifest.json").write_text(
+                json.dumps({"minecraft": {"version": "1.20.1", "modLoaders": [{"id": "forge-47.4.0"}]}}),
+                encoding="utf-8",
+            )
+            detected = namespace["detect"](root)  # type: ignore[operator]
+        self.assertEqual(detected["startup_command"], ["/bin/bash", "start.sh"])
+        self.assertEqual(detected["minecraft_version"], "1.20.1")
+        self.assertEqual(detected["loader"], "Forge")
+        self.assertEqual(detected["port"], 25570)
 
     def test_public_ssh_listener_rejects_normal_accounts(self) -> None:
         config = (ROOT / "agent" / "servercontrol-admin-sshd.conf").read_text(encoding="utf-8")
