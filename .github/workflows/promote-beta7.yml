@@ -1,0 +1,18 @@
+name: Promote Server Control beta 7
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/promote-beta7.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark beta 7 as latest stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit v2.0.0-beta.7 --repo "${{ github.repository }}" --prerelease=false --latest
