@@ -18,7 +18,7 @@ PERMISSION_LABELS = (
     ("server.services", "Службы"), ("server.processes", "Процессы"), ("minecraft.view", "Просмотр Minecraft"),
     ("minecraft.start", "Запуск"), ("minecraft.stop", "Остановка"), ("minecraft.restart", "Перезапуск"),
     ("minecraft.kill", "Force kill"), ("minecraft.console", "Консоль"), ("minecraft.players", "Игроки"),
-    ("minecraft.instances.manage", "Создание сборок"), ("minecraft.settings", "Настройки сборок"),
+    ("minecraft.instances.manage", "Создание сборок"), ("minecraft.settings", "Настройки сборок и server.properties"),
     ("minecraft.files.read", "Чтение файлов"), ("minecraft.files.write", "Изменение файлов"),
     ("minecraft.backups", "Создание backups"), ("minecraft.restore", "Восстановление"),
     ("minecraft.delete", "Удаление сборок"), ("logs.view", "Журналы"), ("audit.view", "Аудит"),

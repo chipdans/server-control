@@ -116,6 +116,7 @@ os.execve(runner[0], runner, environment)
 REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     r"""
     import fcntl
+    import hashlib
     import json
     import os
     import pwd
@@ -146,6 +147,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     MAX_ARCHIVE_BYTES = 12 * 1024 * 1024 * 1024
     MAX_EXTRACTED_BYTES = 40 * 1024 * 1024 * 1024
     MAX_ARCHIVE_FILES = 250000
+    MAX_PROPERTIES_BYTES = 1024 * 1024
 
     RUNNER_PROGRAM = __RUNNER_PROGRAM__
 
@@ -179,7 +181,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     WantedBy=multi-user.target
     '''
 
-    def atomic_write(path, content, mode=0o640, group=None):
+    def atomic_write(path, content, mode=0o640, group=None, user=None):
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
         try:
@@ -188,8 +190,10 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                 output.flush()
                 os.fsync(output.fileno())
             os.chmod(temporary, mode)
-            if group:
-                os.chown(temporary, 0, grp.getgrnam(group).gr_gid)
+            if group or user:
+                uid = pwd.getpwnam(user).pw_uid if user else 0
+                gid = grp.getgrnam(group).gr_gid if group else -1
+                os.chown(temporary, uid, gid)
             os.replace(temporary, path)
         finally:
             try:
@@ -260,7 +264,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         atomic_write(STORE, payload, mode=0o640, group="minecraft")
 
     def properties_port(directory):
-        path = directory / "server.properties"
+        path = safe_properties_path(directory)
         if not path.is_file():
             return 25565
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -273,9 +277,57 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                     pass
         return 25565
 
-    def set_property(directory, key, value):
+    def safe_properties_path(directory):
+        directory = safe_directory(directory)
         path = directory / "server.properties"
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines() if path.is_file() else []
+        if path.is_symlink():
+            raise ValueError("server.properties не должен быть символической ссылкой")
+        try:
+            path.resolve(strict=False).relative_to(directory)
+        except ValueError:
+            raise ValueError("Некорректный путь server.properties")
+        if path.exists() and not path.is_file():
+            raise ValueError("server.properties не является обычным файлом")
+        return path
+
+    def read_properties(directory):
+        path = safe_properties_path(directory)
+        if not path.is_file():
+            return ""
+        if path.stat().st_size > MAX_PROPERTIES_BYTES:
+            raise ValueError("server.properties больше допустимого размера 1 MB")
+        return path.read_text(encoding="utf-8-sig", errors="replace")
+
+    def parse_properties(content):
+        values = {}
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "!")):
+                continue
+            key, separator, value = line.partition("=")
+            if not separator:
+                key, separator, value = line.partition(":")
+            key = key.strip()
+            if separator and key:
+                values[key] = value.strip()
+        return values
+
+    def write_properties(directory, content):
+        if not isinstance(content, str) or "\0" in content:
+            raise ValueError("Некорректное содержимое server.properties")
+        encoded = content.encode("utf-8")
+        if len(encoded) > MAX_PROPERTIES_BYTES:
+            raise ValueError("server.properties больше допустимого размера 1 MB")
+        normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+        if normalized and not normalized.endswith("\n"):
+            normalized += "\n"
+        path = safe_properties_path(directory)
+        atomic_write(path, normalized, mode=0o660, group="minecraft", user="minecraft")
+        return normalized
+
+    def set_property(directory, key, value):
+        content = read_properties(directory)
+        lines = content.splitlines()
         output = []
         found = False
         for line in lines:
@@ -287,7 +339,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                 output.append(line)
         if not found:
             output.append(key + "=" + str(value))
-        path.write_text("\n".join(output) + "\n", encoding="utf-8")
+        write_properties(directory, "\n".join(output) + "\n")
 
     def detect(directory):
         start = []
@@ -520,6 +572,73 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         action = str(payload.get("action") or "list")
         if action == "list":
             return public_list(data)
+
+        if action == "properties_get":
+            value = find(data, payload.get("id"))
+            directory = safe_directory(value["directory"])
+            content = read_properties(directory)
+            return {
+                "ok": True,
+                "instance_id": value["id"],
+                "content": content,
+                "values": parse_properties(content),
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "active": value["id"] == data["active"],
+                "service": service_state(),
+            }
+
+        if action == "properties_set":
+            value = find(data, payload.get("id"))
+            directory = safe_directory(value["directory"])
+            previous_content = read_properties(directory)
+            previous_sha256 = hashlib.sha256(previous_content.encode("utf-8")).hexdigest()
+            previous_port = int(value.get("port", 25565))
+            expected = str(payload.get("expected_sha256") or "")
+            if expected and expected != previous_sha256:
+                raise RuntimeError("server.properties изменился после открытия. Откройте настройки заново, чтобы не потерять новые данные.")
+            updated = write_properties(directory, payload.get("content"))
+            values = parse_properties(updated)
+            try:
+                configured_port = int(values.get("server-port", value.get("port", 25565)))
+            except (TypeError, ValueError):
+                configured_port = int(value.get("port", 25565))
+            if 1 <= configured_port <= 65535:
+                value["port"] = configured_port
+                save_store(data)
+            running = value["id"] == data["active"] and service_state()["active_state"] in {"active", "activating"}
+            restarted = False
+            if payload.get("restart") is True and running:
+                result = command(["/usr/bin/systemctl", "restart", "dragonfyre.service"], timeout=220, check=False)
+                if result.returncode != 0:
+                    write_properties(directory, previous_content)
+                    value["port"] = previous_port
+                    save_store(data)
+                    command(["/usr/bin/systemctl", "restart", "dragonfyre.service"], timeout=220, check=False)
+                    raise RuntimeError(result.stderr.strip() or "Настройки сохранены, но Minecraft не удалось перезапустить")
+                time.sleep(2)
+                restarted_state = service_state()
+                restart_loop = restarted_state["sub_state"] == "auto-restart" and restarted_state["restart_count"] > 0
+                if restarted_state["active_state"] in {"failed", "inactive"} or restart_loop:
+                    journal = command(
+                        ["/usr/bin/journalctl", "-u", "dragonfyre.service", "-n", "12", "--no-pager"],
+                        timeout=30,
+                        check=False,
+                    ).stdout.strip()
+                    write_properties(directory, previous_content)
+                    value["port"] = previous_port
+                    save_store(data)
+                    command(["/usr/bin/systemctl", "reset-failed", "dragonfyre.service"], timeout=30, check=False)
+                    command(["/usr/bin/systemctl", "restart", "dragonfyre.service"], timeout=220, check=False)
+                    raise RuntimeError("Новые настройки вызвали ошибку запуска и были отменены.\n" + journal[-6000:])
+                restarted = True
+            return {
+                "ok": True,
+                "properties_saved": True,
+                "restart_required": running and not restarted,
+                "restarted": restarted,
+                "content_sha256": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+                **public_list(data),
+            }
 
         if action == "import_existing":
             identifier = valid_id(payload.get("id"))

@@ -14,6 +14,12 @@ from widgets import enable_clipboard_paste
 
 
 INSTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+ONLINE_MODE_LABELS = {
+    "Только лицензия Microsoft / Mojang": "true",
+    "Без лицензии (offline-mode)": "false",
+}
+DIFFICULTY_LABELS = {"Мирная": "peaceful", "Лёгкая": "easy", "Нормальная": "normal", "Сложная": "hard"}
+GAMEMODE_LABELS = {"Выживание": "survival", "Творческий": "creative", "Приключение": "adventure", "Наблюдатель": "spectator"}
 
 
 def mapping(value: Any) -> dict[str, Any]:
@@ -42,6 +48,44 @@ def ram_text(value: Any) -> str:
 def slug(value: str) -> str:
     result = re.sub(r"[^a-z0-9_-]+", "-", value.casefold()).strip("-")
     return result[:48] or f"server-{int(time.time())}"
+
+
+def parse_server_properties(content: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "!")):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            key, separator, value = line.partition(":")
+        key = key.strip()
+        if separator and key:
+            values[key] = value.strip()
+    return values
+
+
+def update_server_properties(content: str, values: dict[str, str]) -> str:
+    pending = {str(key): str(value).replace("\r", " ").replace("\n", " ") for key, value in values.items()}
+    output: list[str] = []
+    written: set[str] = set()
+    for line in content.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        stripped = line.strip()
+        key = ""
+        if stripped and not stripped.startswith(("#", "!")):
+            key = line.partition("=")[0].strip() if "=" in line else line.partition(":")[0].strip() if ":" in line else ""
+        if key in pending:
+            if key not in written:
+                output.append(f"{key}={pending[key]}")
+                written.add(key)
+        else:
+            output.append(line)
+    if output and output[-1] and any(key not in written for key in pending):
+        output.append("")
+    for key, value in pending.items():
+        if key not in written:
+            output.append(f"{key}={value}")
+    return "\n".join(output).rstrip("\n") + "\n"
 
 
 class InstancesPage(BasePage):
@@ -124,6 +168,7 @@ class InstancesPage(BasePage):
             ttk.Button(row, text="↻  Перезапустить", command=self.restart).pack(side="left", fill="x", expand=True, padx=(3, 0))
         if panel.state.has_permission("minecraft.settings"):
             ttk.Button(actions, text="Настройки сборки", command=self.settings).pack(fill="x", pady=3)
+            ttk.Button(actions, text="⚙  Настройки сервера", style="Accent.TButton", command=self.server_settings).pack(fill="x", pady=3)
         if panel.state.has_permission("minecraft.delete"):
             ttk.Button(actions, text="Удалить сборку", style="Danger.TButton", command=self.delete).pack(fill="x", pady=3)
 
@@ -567,6 +612,348 @@ class InstancesPage(BasePage):
 
         ttk.Button(frame, text="Сохранить", style="Accent.TButton", command=submit).grid(row=5, column=1, sticky="e", pady=(12, 0))
         frame.columnconfigure(1, weight=1)
+
+    def server_settings(self) -> None:
+        item = self.selected()
+        if not item or not self._set_busy(True, "Читаю server.properties напрямую с сервера…"):
+            return
+
+        def failure(error: Exception) -> None:
+            self.busy = False
+            self.status_var.set("Не удалось открыть настройки сервера")
+            messagebox.showerror("Настройки сервера", str(error), parent=self)
+
+        def loaded(result: dict[str, Any]) -> None:
+            self.busy = False
+            self.status_var.set("Настройки сервера загружены")
+            content = str(result.get("content") or "")
+            original_sha256 = str(result.get("sha256") or "")
+            properties = parse_server_properties(content)
+
+            dialog = tk.Toplevel(self)
+            dialog.title(f"Настройки сервера · {item.get('name')}")
+            dialog.transient(self.winfo_toplevel())
+            dialog.grab_set()
+            dialog.geometry("980x760")
+            dialog.minsize(860, 650)
+            root = ttk.Frame(dialog, padding=18)
+            root.pack(fill="both", expand=True)
+            ttk.Label(root, text="Настройки Minecraft-сервера", font=("Segoe UI Semibold", 18)).pack(anchor="w")
+            ttk.Label(
+                root,
+                text=f"Сборка: {item.get('name')} · {item.get('directory')}",
+                style="Subtle.TLabel",
+            ).pack(anchor="w", pady=(3, 12))
+
+            reverse_online = {value: label for label, value in ONLINE_MODE_LABELS.items()}
+            reverse_difficulty = {value: label for label, value in DIFFICULTY_LABELS.items()}
+            reverse_gamemode = {value: label for label, value in GAMEMODE_LABELS.items()}
+            online_mode = tk.StringVar(value=reverse_online.get(properties.get("online-mode", "true").casefold(), next(iter(ONLINE_MODE_LABELS))))
+            difficulty = tk.StringVar(value=reverse_difficulty.get(properties.get("difficulty", "normal").casefold(), "Нормальная"))
+            gamemode = tk.StringVar(value=reverse_gamemode.get(properties.get("gamemode", "survival").casefold(), "Выживание"))
+
+            text_defaults = {
+                "motd": "A Minecraft Server",
+                "server-port": str(item.get("port") or 25565),
+                "max-players": "20",
+                "view-distance": "10",
+                "simulation-distance": "10",
+                "spawn-protection": "16",
+                "level-name": "world",
+                "level-seed": "",
+                "player-idle-timeout": "0",
+                "op-permission-level": "4",
+                "max-world-size": "29999984",
+                "network-compression-threshold": "256",
+                "rate-limit": "0",
+                "entity-broadcast-range-percentage": "100",
+            }
+            text_values = {key: tk.StringVar(value=properties.get(key, default)) for key, default in text_defaults.items()}
+            bool_defaults = {
+                "pvp": True,
+                "allow-flight": False,
+                "white-list": False,
+                "enforce-whitelist": False,
+                "enable-command-block": False,
+                "hardcore": False,
+                "force-gamemode": False,
+                "enforce-secure-profile": True,
+                "allow-nether": True,
+                "spawn-monsters": True,
+                "spawn-animals": True,
+                "spawn-npcs": True,
+                "enable-status": True,
+                "hide-online-players": False,
+            }
+            bool_values = {
+                key: tk.BooleanVar(value=str(properties.get(key, str(default))).casefold() == "true")
+                for key, default in bool_defaults.items()
+            }
+
+            notebook = ttk.Notebook(root)
+            notebook.pack(fill="both", expand=True)
+            basic = ttk.Frame(notebook, padding=14)
+            raw = ttk.Frame(notebook, padding=12)
+            notebook.add(basic, text="Основные настройки")
+            notebook.add(raw, text="Полный server.properties")
+            basic.columnconfigure(0, weight=1)
+            basic.columnconfigure(1, weight=1)
+
+            access = ttk.LabelFrame(basic, text="Доступ и игровой процесс", padding=12)
+            access.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+            world = ttk.LabelFrame(basic, text="Мир и подключение", padding=12)
+            world.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+            access.columnconfigure(1, weight=1)
+            world.columnconfigure(1, weight=1)
+
+            def combo(parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, choices: tuple[str, ...]) -> ttk.Combobox:
+                ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+                box = ttk.Combobox(parent, textvariable=variable, values=choices, state="readonly", width=31)
+                box.grid(row=row, column=1, sticky="ew", pady=4)
+                return box
+
+            def entry(parent: ttk.Frame, row: int, label: str, key: str) -> None:
+                ttk.Label(parent, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+                enable_clipboard_paste(ttk.Entry(parent, textvariable=text_values[key], width=31)).grid(row=row, column=1, sticky="ew", pady=4)
+
+            combo(access, 0, "Проверка лицензии", online_mode, tuple(ONLINE_MODE_LABELS))
+            combo(access, 1, "Сложность", difficulty, tuple(DIFFICULTY_LABELS))
+            combo(access, 2, "Режим игры", gamemode, tuple(GAMEMODE_LABELS))
+            entry(access, 3, "Максимум игроков", "max-players")
+            combo(access, 4, "Уровень прав операторов", text_values["op-permission-level"], ("1", "2", "3", "4"))
+            entry(access, 5, "AFK-таймаут, минут", "player-idle-timeout")
+            access_checks = (
+                ("pvp", "PvP между игроками"),
+                ("allow-flight", "Разрешить полёт"),
+                ("white-list", "Включить белый список"),
+                ("enforce-whitelist", "Выгонять отсутствующих в белом списке"),
+                ("enable-command-block", "Разрешить командные блоки"),
+                ("hardcore", "Хардкорный режим"),
+                ("force-gamemode", "Принудительно задавать режим игры"),
+                ("enforce-secure-profile", "Требовать защищённый профиль"),
+            )
+            secure_check: ttk.Checkbutton | None = None
+            for row, (key, label) in enumerate(access_checks, start=6):
+                check = ttk.Checkbutton(access, text=label, variable=bool_values[key])
+                check.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+                if key == "enforce-secure-profile":
+                    secure_check = check
+
+            entry(world, 0, "Название в списке (MOTD)", "motd")
+            entry(world, 1, "Порт сервера", "server-port")
+            entry(world, 2, "Дальность прорисовки", "view-distance")
+            entry(world, 3, "Дальность симуляции", "simulation-distance")
+            entry(world, 4, "Защита спавна", "spawn-protection")
+            entry(world, 5, "Папка мира", "level-name")
+            entry(world, 6, "Сид мира", "level-seed")
+            entry(world, 7, "Максимальный размер мира", "max-world-size")
+            entry(world, 8, "Сжатие сети", "network-compression-threshold")
+            entry(world, 9, "Лимит пакетов", "rate-limit")
+            entry(world, 10, "Дальность сущностей, %", "entity-broadcast-range-percentage")
+            world_checks = (
+                ("allow-nether", "Разрешить Нижний мир"),
+                ("spawn-monsters", "Спавнить монстров"),
+                ("spawn-animals", "Спавнить животных"),
+                ("spawn-npcs", "Спавнить NPC"),
+                ("enable-status", "Отвечать на запрос статуса"),
+                ("hide-online-players", "Скрывать список игроков"),
+            )
+            for row, (key, label) in enumerate(world_checks, start=11):
+                ttk.Checkbutton(world, text=label, variable=bool_values[key]).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+
+            ttk.Label(
+                raw,
+                text="Здесь доступен весь файл без ограничений формы. Можно добавлять параметры модов и любые строки вручную.",
+                style="Subtle.TLabel",
+                wraplength=860,
+            ).pack(anchor="w", pady=(0, 8))
+            raw_toolbar = ttk.Frame(raw)
+            raw_toolbar.pack(fill="x", pady=(0, 8))
+            raw_body = ttk.Frame(raw)
+            raw_body.pack(fill="both", expand=True)
+            editor = enable_clipboard_paste(tk.Text(
+                raw_body,
+                wrap="none",
+                undo=True,
+                maxundo=200,
+                background="#0d141a",
+                foreground="#d7e1e9",
+                insertbackground="#ffffff",
+                selectbackground="#315a7d",
+                font=("Cascadia Mono", 10),
+            ))
+            vertical = ttk.Scrollbar(raw_body, orient="vertical", command=editor.yview)
+            horizontal = ttk.Scrollbar(raw_body, orient="horizontal", command=editor.xview)
+            editor.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+            editor.grid(row=0, column=0, sticky="nsew")
+            vertical.grid(row=0, column=1, sticky="ns")
+            horizontal.grid(row=1, column=0, sticky="ew")
+            raw_body.rowconfigure(0, weight=1)
+            raw_body.columnconfigure(0, weight=1)
+            editor.insert("1.0", content)
+
+            def raw_content() -> str:
+                return editor.get("1.0", "end-1c")
+
+            def set_raw(value: str) -> None:
+                editor.delete("1.0", "end")
+                editor.insert("1.0", value)
+                editor.edit_modified(False)
+
+            def update_access_mode(*_args: object) -> None:
+                offline = ONLINE_MODE_LABELS.get(online_mode.get()) == "false"
+                if offline:
+                    bool_values["enforce-secure-profile"].set(False)
+                if secure_check is not None:
+                    secure_check.configure(state="disabled" if offline else "normal")
+
+            online_mode.trace_add("write", update_access_mode)
+            update_access_mode()
+
+            def form_values() -> dict[str, str]:
+                numeric_limits = {
+                    "server-port": (1, 65535),
+                    "max-players": (1, 10000),
+                    "view-distance": (2, 64),
+                    "simulation-distance": (2, 64),
+                    "spawn-protection": (0, 65535),
+                    "player-idle-timeout": (0, 2147483647),
+                    "op-permission-level": (1, 4),
+                    "max-world-size": (1, 29999984),
+                    "network-compression-threshold": (-1, 65535),
+                    "rate-limit": (0, 2147483647),
+                    "entity-broadcast-range-percentage": (10, 1000),
+                }
+                for key, (minimum, maximum) in numeric_limits.items():
+                    try:
+                        number = int(text_values[key].get().strip())
+                    except ValueError as error:
+                        raise ValueError(f"Поле «{key}» должно быть целым числом") from error
+                    if not minimum <= number <= maximum:
+                        raise ValueError(f"Поле «{key}»: допустимо от {minimum} до {maximum}")
+                result_values = {key: variable.get().replace("\r", " ").replace("\n", " ") for key, variable in text_values.items()}
+                result_values.update({
+                    "online-mode": ONLINE_MODE_LABELS[online_mode.get()],
+                    "difficulty": DIFFICULTY_LABELS[difficulty.get()],
+                    "gamemode": GAMEMODE_LABELS[gamemode.get()],
+                })
+                result_values.update({key: "true" if variable.get() else "false" for key, variable in bool_values.items()})
+                if result_values["online-mode"] == "false":
+                    result_values["enforce-secure-profile"] = "false"
+                return result_values
+
+            def apply_form_to_text(*, show_error: bool = True) -> bool:
+                try:
+                    set_raw(update_server_properties(raw_content(), form_values()))
+                except ValueError as error:
+                    if show_error:
+                        messagebox.showerror("Настройки сервера", str(error), parent=dialog)
+                    return False
+                return True
+
+            def load_form_from_text() -> None:
+                values = parse_server_properties(raw_content())
+                if values.get("online-mode", "").casefold() in reverse_online:
+                    online_mode.set(reverse_online[values["online-mode"].casefold()])
+                if values.get("difficulty", "").casefold() in reverse_difficulty:
+                    difficulty.set(reverse_difficulty[values["difficulty"].casefold()])
+                if values.get("gamemode", "").casefold() in reverse_gamemode:
+                    gamemode.set(reverse_gamemode[values["gamemode"].casefold()])
+                for key, variable in text_values.items():
+                    if key in values:
+                        variable.set(values[key])
+                for key, variable in bool_values.items():
+                    if values.get(key, "").casefold() in {"true", "false"}:
+                        variable.set(values[key].casefold() == "true")
+
+            ttk.Button(raw_toolbar, text="Применить поля к тексту", command=apply_form_to_text).pack(side="left")
+            ttk.Button(raw_toolbar, text="Прочитать поля из текста", command=load_form_from_text).pack(side="left", padx=7)
+            ttk.Button(raw_toolbar, text="Вернуть исходный файл", command=lambda: set_raw(content)).pack(side="right")
+
+            previous_tab = [0]
+            changing_tab = [False]
+
+            def tab_changed(_event: tk.Event | None = None) -> None:
+                if changing_tab[0]:
+                    return
+                current = notebook.index(notebook.select())
+                if previous_tab[0] == 0 and current == 1 and not apply_form_to_text():
+                    changing_tab[0] = True
+                    notebook.select(0)
+                    changing_tab[0] = False
+                    return
+                if previous_tab[0] == 1 and current == 0:
+                    load_form_from_text()
+                previous_tab[0] = current
+
+            notebook.bind("<<NotebookTabChanged>>", tab_changed)
+
+            footer = ttk.Frame(root)
+            footer.pack(fill="x", pady=(12, 0))
+            ttk.Label(
+                footer,
+                text="Изменения применяются при следующем запуске Minecraft.",
+                style="Subtle.TLabel",
+            ).pack(side="left")
+            service = mapping(result.get("service"))
+            running = bool(result.get("active")) and str(service.get("active_state")) in {"active", "activating"}
+            save_button = ttk.Button(footer, text="Сохранить", style="Accent.TButton")
+            restart_button = ttk.Button(footer, text="Сохранить и перезапустить", style="Success.TButton")
+            if running:
+                restart_button.pack(side="right")
+            save_button.pack(side="right", padx=(8, 8 if running else 0))
+
+            def save(restart: bool) -> None:
+                if notebook.index(notebook.select()) == 0 and not apply_form_to_text():
+                    return
+                updated = raw_content()
+                if len(updated.encode("utf-8")) > 1024 * 1024:
+                    messagebox.showerror("Настройки сервера", "server.properties больше допустимого размера 1 MB.", parent=dialog)
+                    return
+                if not self._set_busy(True, "Сохраняю server.properties…"):
+                    return
+                save_button.configure(state="disabled")
+                restart_button.configure(state="disabled")
+                payload = {
+                    "action": "properties_set",
+                    "id": item["id"],
+                    "content": updated,
+                    "expected_sha256": original_sha256,
+                    "restart": restart,
+                }
+
+                def saved(response: dict[str, Any]) -> None:
+                    self.busy = False
+                    dialog.destroy()
+                    self._apply_result(response, select_id=str(item["id"]))
+                    message = "Настройки сохранены, Minecraft перезапускается" if response.get("restarted") else "Настройки сервера сохранены"
+                    if response.get("restart_required"):
+                        message += " · нужен перезапуск"
+                    self.status_var.set(message)
+                    self.panel.status(message, seconds=15)
+                    self.panel.after(700, self.panel.refresh_now)
+
+                def save_failed(error: Exception) -> None:
+                    self.busy = False
+                    save_button.configure(state="normal")
+                    restart_button.configure(state="normal")
+                    self.status_var.set("Не удалось сохранить настройки")
+                    messagebox.showerror("Настройки сервера", str(error), parent=dialog)
+
+                self.panel.run_async(
+                    lambda: self.panel.direct_status.instance_request(self._credentials, payload, timeout=300),
+                    saved,
+                    save_failed,
+                )
+
+            save_button.configure(command=lambda: save(False))
+            restart_button.configure(command=lambda: save(True))
+
+        self.panel.run_async(
+            lambda: self.panel.direct_status.instance_request(self._credentials, {"action": "properties_get", "id": item["id"]}),
+            loaded,
+            failure,
+        )
 
     def delete(self) -> None:
         item = self.selected()

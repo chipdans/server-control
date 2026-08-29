@@ -52,6 +52,7 @@ from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
 from direct_instances import MANAGED_INSTANCE_RUNNER_PROGRAM, REMOTE_INSTANCE_MANAGER_PROGRAM, manager_command  # noqa: E402
 from direct_status import dashboard_envelope  # noqa: E402
+from pages_instances_v2 import parse_server_properties, update_server_properties  # noqa: E402
 from state import AppState  # noqa: E402
 from ssh_terminal import connection_targets  # noqa: E402
 from sc_agent.backups import BackupManager  # noqa: E402
@@ -88,6 +89,8 @@ class ProjectTests(unittest.TestCase):
         compile(REMOTE_INSTANCE_MANAGER_PROGRAM, "<direct-instance-manager>", "exec")
         self.assertIn('/var/lib/server-control-minecraft/instances.json', MANAGED_INSTANCE_RUNNER_PROGRAM)
         self.assertIn('LEGACY_STORE = CONFIG_DIR / "minecraft-instances.json"', REMOTE_INSTANCE_MANAGER_PROGRAM)
+        self.assertIn('action == "properties_get"', REMOTE_INSTANCE_MANAGER_PROGRAM)
+        self.assertIn('action == "properties_set"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         command = manager_command({"action": "start", "id": "dragonfyre"})
         self.assertTrue(command.startswith("sudo -n /usr/bin/python3 -c "))
         self.assertIn("dragonfyre", command)
@@ -108,6 +111,17 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(detected["minecraft_version"], "1.20.1")
         self.assertEqual(detected["loader"], "Forge")
         self.assertEqual(detected["port"], 25570)
+
+    def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
+        original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"
+        updated = update_server_properties(original, {"online-mode": "false", "difficulty": "hard", "pvp": "true"})
+        parsed = parse_server_properties(updated)
+        self.assertIn("# Minecraft server properties", updated)
+        self.assertIn("mod-custom=value", updated)
+        self.assertEqual(updated.count("online-mode="), 1)
+        self.assertEqual(parsed["online-mode"], "false")
+        self.assertEqual(parsed["difficulty"], "hard")
+        self.assertEqual(parsed["pvp"], "true")
 
     def test_direct_status_detects_systemd_restart_loop(self) -> None:
         source = (ROOT / "desktop" / "direct_status.py").read_text(encoding="utf-8")
