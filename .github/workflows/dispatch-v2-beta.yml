@@ -1,0 +1,23 @@
+name: Dispatch Server Control 2 beta 2
+
+on:
+  push:
+    branches:
+      - "v2"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start beta 2 release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run release.yml
+          --repo "${{ github.repository }}"
+          --ref v2
+          -f tag=v2.0.0-beta.2
