@@ -165,7 +165,9 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --clobber
           } else {
-            $releaseFlags = @("--target", "${{ github.sha }}")
+            $releaseTarget = "${{ github.sha }}"
+            if ("${{ github.event_name }}" -eq "workflow_dispatch") { $releaseTarget = "${{ github.ref_name }}" }
+            $releaseFlags = @("--target", $releaseTarget)
             if ($tag.Contains("-")) { $releaseFlags += "--prerelease" }
             gh release create $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --title $tag --generate-notes @releaseFlags
           }
