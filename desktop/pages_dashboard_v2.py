@@ -81,6 +81,13 @@ class DashboardPage(BasePage):
         if panel.state.has_permission("terminal.linux") or panel.state.has_permission("terminal.minecraft"):
             ttk.Button(actions, text="▣  Открыть консоли", style="Accent.TButton", command=lambda: panel.select_page("console")).pack(side="right")
         ttk.Button(actions, text="↻  Обновить сейчас", style="Accent.TButton", command=panel.refresh_now).pack(side="right", padx=10)
+        if panel.state.has_permission("minecraft.restart"):
+            ttk.Button(
+                actions,
+                text="↻  Перезапустить Minecraft",
+                style="Accent.TButton",
+                command=panel.restart_minecraft,
+            ).pack(side="right")
 
         metrics = ttk.Frame(self)
         metrics.pack(fill="x")
@@ -93,7 +100,7 @@ class DashboardPage(BasePage):
             metrics.columnconfigure(column, weight=1)
         metrics.rowconfigure(0, weight=1)
 
-        self.info = tk.StringVar(value="Ожидаю данные Agent…")
+        self.info = tk.StringVar(value="Подключаюсь к серверу напрямую по SSH…")
         info = ttk.Frame(self, style="Card.TFrame", padding=(15, 11))
         info.pack(fill="x", pady=(14, 0))
         ttk.Label(info, text="ⓘ", style="Surface.TLabel", foreground="#2f80ff", font=("Segoe UI Symbol", 13)).pack(side="left", padx=(0, 10))
@@ -121,12 +128,11 @@ class DashboardPage(BasePage):
             self.power.set("Неизвестно", "Состояние розетки ещё не получено", tone="warning")
 
         online = bool(envelope.get("online"))
-        hostname = str(host.get("hostname") or "ChipdanServer")
         if online:
             age = max(0, int((envelope.get("age_ms") or 0) / 1000))
-            self.server.set("Работает", f"●  {hostname} · Agent отвечал {age} с назад", tone="accent")
+            self.server.set("Работает", f"Отвечал {age} с назад", tone="accent")
         else:
-            self.server.set("Не отвечает", f"{hostname} · показаны последние известные данные", tone="danger")
+            self.server.set("Не отвечает", "Показаны последние известные данные", tone="danger")
 
         values = status.get("instances") if isinstance(status.get("instances"), list) else []
         instance = next((mapping(item) for item in values if mapping(item).get("id") == "dragonfyre"), None)

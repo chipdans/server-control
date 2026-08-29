@@ -77,6 +77,11 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(payload["status"]["server"]["hostname"], "ChipdanServer")
         self.assertEqual(payload["status"]["instances"][0]["state"], "RUNNING")
 
+    def test_direct_minecraft_restart_is_fixed_to_dragonfyre_service(self) -> None:
+        source = (ROOT / "desktop" / "direct_status.py").read_text(encoding="utf-8")
+        self.assertIn('"sudo -n /usr/bin/systemctl restart dragonfyre.service"', source)
+        self.assertNotIn("restart_minecraft(self, credentials, service", source)
+
     def test_public_ssh_listener_rejects_normal_accounts(self) -> None:
         config = (ROOT / "agent" / "servercontrol-admin-sshd.conf").read_text(encoding="utf-8")
         installer = (ROOT / "agent" / "install-v2-console.sh").read_text(encoding="utf-8")
@@ -381,6 +386,7 @@ class ProjectTests(unittest.TestCase):
         self.assertFalse(is_newer("v0.1.0", "0.1.1"))
         self.assertTrue(is_newer("v2.0.0", "2.0.0-beta.1"))
         self.assertTrue(is_newer("v2.0.0-beta.2", "2.0.0-beta.1"))
+        self.assertTrue(is_newer("v2.0.0-beta.4", "2.0.0-beta.3"))
         self.assertFalse(is_newer("v2.0.0-beta.1", "2.0.0"))
         self.assertFalse(is_newer("latest", "2.0.0"))
 

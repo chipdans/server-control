@@ -337,6 +337,22 @@ class DirectSshStatusClient:
             raise ValueError("Сервер вернул некорректное состояние.")
         return dashboard_envelope(value)
 
+    def _restart_minecraft(self) -> dict[str, Any]:
+        client = self._client
+        transport = client.get_transport() if client else None
+        if not client or not transport or not transport.is_active():
+            raise paramiko.SSHException("SSH-соединение закрыто.")
+        _stdin, stdout, stderr = client.exec_command(
+            "sudo -n /usr/bin/systemctl restart dragonfyre.service",
+            timeout=180,
+        )
+        output = stdout.read(64 * 1024).decode("utf-8", "replace").strip()
+        error = stderr.read(64 * 1024).decode("utf-8", "replace").strip()
+        code = stdout.channel.recv_exit_status()
+        if code != 0:
+            raise RuntimeError(error or output or f"Перезапуск завершился с кодом {code}.")
+        return {"ok": True}
+
     def snapshot(self, credentials: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         with self._lock:
             for attempt in range(2):
@@ -344,6 +360,24 @@ class DirectSshStatusClient:
                     if self._client is None:
                         self._connect(credentials())
                     return self._execute()
+                except (OSError, socket.timeout, paramiko.SSHException, EOFError) as error:
+                    if self._client:
+                        self._client.close()
+                    self._client = None
+                    self._target = ""
+                    if attempt:
+                        raise RuntimeError(f"Прямой SSH недоступен: {error}") from error
+            raise RuntimeError("Прямой SSH недоступен.")
+
+    def restart_minecraft(self, credentials: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """Restart only the fixed Dragonfyre service over the verified SSH connection."""
+
+        with self._lock:
+            for attempt in range(2):
+                try:
+                    if self._client is None:
+                        self._connect(credentials())
+                    return self._restart_minecraft()
                 except (OSError, socket.timeout, paramiko.SSHException, EOFError) as error:
                     if self._client:
                         self._client.close()

@@ -54,6 +54,7 @@ class ControlPanel(ttk.Frame):
         self._status_inflight = False
         self._power_inflight = False
         self._session_inflight = False
+        self._minecraft_restart_inflight = False
         self._status_after: str | None = None
         self._power_after: str | None = None
         self._session_after: str | None = None
@@ -62,7 +63,7 @@ class ControlPanel(ttk.Frame):
         self.direct_status = DirectSshStatusClient()
 
         self.connection_var = tk.StringVar(value="Подключение…")
-        self.message_var = tk.StringVar(value="Загружаю состояние сервера…")
+        self.message_var = tk.StringVar(value="")
         self.identity_var = tk.StringVar()
         self.page_title_var = tk.StringVar(value="Состояние")
         self._build()
@@ -72,7 +73,7 @@ class ControlPanel(ttk.Frame):
         self.after(1500, self._validate_session)
 
     def _build(self) -> None:
-        sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(18, 24), width=276)
+        sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(18, 24), width=296)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
         brand = ttk.Frame(sidebar, style="Sidebar.TFrame")
@@ -92,7 +93,7 @@ class ControlPanel(ttk.Frame):
             resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
             source = resource_root / "assets" / "neco_arc_sitting.png"
             original = tk.PhotoImage(file=str(source))
-            self._neco_image = original.subsample(6, 6)
+            self._neco_image = original.subsample(5, 5)
             ttk.Label(sidebar, image=self._neco_image, style="SidebarSubtle.TLabel").pack(side="bottom", pady=(12, 0))
         except (OSError, tk.TclError):
             self._neco_image = None
@@ -110,7 +111,6 @@ class ControlPanel(ttk.Frame):
         self.page_container.pack(fill="both", expand=True)
         footer = ttk.Frame(self.content, style="Footer.TFrame", padding=(26, 12))
         footer.pack(fill="x")
-        ttk.Label(footer, text="◌", style="FooterSubtle.TLabel", font=("Segoe UI", 15)).pack(side="left", padx=(0, 10))
         ttk.Label(footer, textvariable=self.message_var, style="FooterSubtle.TLabel").pack(side="left", fill="x", expand=True)
         ttk.Label(footer, text=f"v{self.client_version}", style="FooterSubtle.TLabel").pack(side="right", padx=12)
         ttk.Button(footer, text="Выйти", command=self.logout_callback).pack(side="right")
@@ -330,6 +330,35 @@ class ControlPanel(ttk.Frame):
             lambda error: self.status(str(error), error=True),
         )
 
+    def restart_minecraft(self) -> None:
+        if self._minecraft_restart_inflight:
+            return
+        if not messagebox.askyesno(
+            "Перезапустить Minecraft?",
+            "Dragonfyre будет корректно остановлен и запущен заново. Продолжить?",
+            icon="warning",
+        ):
+            return
+        self._minecraft_restart_inflight = True
+        self.status("Перезапускаю Minecraft…", seconds=180)
+
+        def success(_result: dict[str, Any]) -> None:
+            self._minecraft_restart_inflight = False
+            self.status("Minecraft перезапущен. Ожидаю готовность сервера…", seconds=12)
+            self.after(800, self.refresh_now)
+
+        def failure(error: Exception) -> None:
+            self._minecraft_restart_inflight = False
+            self.status(str(error), error=True)
+
+        self.run_async(
+            lambda: self.direct_status.restart_minecraft(
+                lambda: self.api.terminal_credentials("linux")
+            ),
+            success,
+            failure,
+        )
+
     def status(self, message: str, *, error: bool = False, seconds: int = 10) -> None:
         self.message_var.set(("Ошибка: " if error else "") + message)
         if self._message_after:
@@ -337,7 +366,7 @@ class ControlPanel(ttk.Frame):
                 self.after_cancel(self._message_after)
             except tk.TclError:
                 pass
-        self._message_after = self.after(seconds * 1000, lambda: self.message_var.set("Готово"))
+        self._message_after = self.after(seconds * 1000, lambda: self.message_var.set(""))
 
     def close(self) -> None:
         if self.closed:
