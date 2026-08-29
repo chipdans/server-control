@@ -27,8 +27,8 @@ def display_bytes(value: Any, *, per_second: bool = False) -> str:
     amount = numeric_value(value)
     if amount is None:
         return "—"
-    suffix = "/с" if per_second else ""
-    units = ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ")
+    suffix = "/s" if per_second else ""
+    units = ("B", "Kb", "Mb", "Gb", "Tb")
     index = 0
     while amount >= 1024 and index < len(units) - 1:
         amount /= 1024
@@ -579,26 +579,93 @@ class TextEditor(ttk.Frame):
         return "break"
 
 
-class MetricCard(ttk.LabelFrame):
-    def __init__(self, parent: tk.Misc, title: str) -> None:
-        super().__init__(parent, text=title, padding=12)
+class MetricCard(ttk.Frame):
+    """Dark dashboard metric with a compact live graph or usage bar."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        *,
+        icon: str = "◆",
+        accent: str = "#2f80ff",
+        mode: str = "bar",
+    ) -> None:
+        super().__init__(parent, style="Card.TFrame", padding=15, height=182)
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+        self.accent = accent
+        self.mode = mode
+        self.history: list[float] = []
+        self._sample_id: Any = object()
         self.value = tk.StringVar(value="—")
         self.detail = tk.StringVar(value="")
-        self.progress = tk.DoubleVar(value=0)
-        ttk.Label(self, textvariable=self.value, font=("Segoe UI", 13, "bold")).pack(anchor="w")
-        ttk.Label(self, textvariable=self.detail, style="Subtle.TLabel").pack(anchor="w", pady=(3, 5))
-        self.bar = ttk.Progressbar(self, maximum=100, variable=self.progress)
-        self.bar.pack(fill="x")
+        self.progress: float | None = None
 
-    def set(self, value: str, *, detail: str = "", progress: float | None = None) -> None:
+        header = ttk.Frame(self, style="Surface.TFrame")
+        header.pack(fill="x")
+        badge = tk.Label(
+            header,
+            text=icon,
+            background="#10233a",
+            foreground=accent,
+            font=("Segoe UI Symbol", 14, "bold"),
+            padx=8,
+            pady=5,
+        )
+        badge.pack(side="left")
+        ttk.Label(header, text=title, style="MetricTitle.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Label(self, textvariable=self.value, style="MetricValue.TLabel").pack(anchor="w", pady=(14, 0))
+        ttk.Label(self, textvariable=self.detail, style="MetricDetail.TLabel").pack(anchor="w", pady=(3, 7))
+        self.graph = tk.Canvas(self, height=46, background="#0c1724", highlightthickness=0)
+        self.graph.pack(side="bottom", fill="x")
+        self.graph.bind("<Configure>", lambda _event: self._draw())
+
+    def set(
+        self,
+        value: str,
+        *,
+        detail: str = "",
+        progress: float | None = None,
+        sample_id: Any = None,
+    ) -> None:
         self.value.set(value)
         self.detail.set(detail)
-        if progress is None:
-            self.bar.pack_forget()
-        else:
-            if not self.bar.winfo_ismapped():
-                self.bar.pack(fill="x")
-            self.progress.set(max(0, min(100, progress)))
+        self.progress = None if progress is None else max(0.0, min(100.0, float(progress)))
+        if self.mode == "line" and self.progress is not None and sample_id != self._sample_id:
+            self.history.append(self.progress)
+            self.history = self.history[-28:]
+            self._sample_id = sample_id
+        self.after_idle(self._draw)
+
+    def _draw(self) -> None:
+        try:
+            width = max(20, self.graph.winfo_width())
+            height = max(20, self.graph.winfo_height())
+        except tk.TclError:
+            return
+        self.graph.delete("all")
+        if self.mode == "line":
+            for fraction in (0.25, 0.5, 0.75):
+                y = round(height * fraction)
+                self.graph.create_line(0, y, width, y, fill="#17283a", dash=(2, 4))
+            values = self.history or ([self.progress] if self.progress is not None else [])
+            if len(values) == 1:
+                values = [values[0], values[0]]
+            if values:
+                points: list[float] = []
+                for index, item in enumerate(values):
+                    x = index * (width - 2) / max(1, len(values) - 1) + 1
+                    y = height - 3 - item * (height - 7) / 100
+                    points.extend((x, y))
+                polygon = [1, height - 2, *points, width - 1, height - 2]
+                self.graph.create_polygon(polygon, fill="#102541", outline="")
+                self.graph.create_line(*points, fill=self.accent, width=2, smooth=True)
+            return
+        self.graph.create_rectangle(0, 15, width, 31, fill="#172333", outline="#26364a")
+        if self.progress is not None:
+            filled = max(2, round(width * self.progress / 100))
+            self.graph.create_rectangle(1, 16, filled, 30, fill=self.accent, outline=self.accent)
 
 
 class CommandPalette(tk.Toplevel):

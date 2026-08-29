@@ -42,12 +42,12 @@ class UsersPage(BasePage):
     def __init__(self, parent: tk.Misc, panel: Any) -> None:
         super().__init__(parent, panel)
         self.users: dict[str, dict[str, Any]] = {}
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Button(toolbar, text="Создать пользователя", command=self.create).pack(side="left")
-        ttk.Button(toolbar, text="Изменить логин и права", command=self.edit).pack(side="left", padx=6)
+        toolbar = ttk.Frame(self, style="Card.TFrame", padding=(14, 11))
+        toolbar.pack(fill="x", pady=(0, 12))
+        ttk.Button(toolbar, text="＋  Создать пользователя", style="Accent.TButton", command=self.create).pack(side="left")
+        ttk.Button(toolbar, text="Изменить логин и права", command=self.edit).pack(side="left", padx=8)
         ttk.Button(toolbar, text="Включить / заблокировать", command=self.toggle).pack(side="left")
-        ttk.Button(toolbar, text="Задать новый пароль", command=self.reset_password).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Задать новый пароль", command=self.reset_password).pack(side="left", padx=8)
         ttk.Button(toolbar, text="Отозвать сеансы", command=self.revoke).pack(side="left")
         ttk.Button(toolbar, text="Удалить", style="Danger.TButton", command=self.delete).pack(side="right")
 
@@ -62,11 +62,13 @@ class UsersPage(BasePage):
             self.tree.heading(column, text=label)
             self.tree.column(column, width=width, stretch=column == "permissions")
         self.tree.pack(fill="both", expand=True)
+        note = ttk.Frame(self, style="Card.TFrame", padding=(14, 10))
+        note.pack(fill="x", pady=(10, 0))
         ttk.Label(
-            self,
+            note,
             text="Владелец всегда имеет все права. Его логин и пароль меняются на странице «Моя учётная запись».",
-            style="Subtle.TLabel",
-        ).pack(anchor="w", pady=(8, 0))
+            style="SurfaceSubtle.TLabel",
+        ).pack(anchor="w")
 
     def on_show(self) -> None:
         self.refresh()
@@ -250,8 +252,8 @@ class AccountPage(BasePage):
 
     def __init__(self, parent: tk.Misc, panel: Any) -> None:
         super().__init__(parent, panel)
-        form = ttk.LabelFrame(self, text="Изменение логина и пароля", padding=18)
-        form.pack(anchor="nw", fill="x", padx=4, pady=4)
+        form = ttk.LabelFrame(self, text="Изменение логина и пароля", style="Card.TLabelframe", padding=24)
+        form.pack(anchor="nw", fill="x", pady=4)
         self.username = tk.StringVar(value=str(panel.state.user.get("username", "")))
         self.current_password = tk.StringVar()
         self.new_password = tk.StringVar()
@@ -263,14 +265,14 @@ class AccountPage(BasePage):
             ("Повторите новый пароль", self.confirm_password, True),
         )
         for row, (label, variable, secret) in enumerate(rows):
-            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Label(form, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=5)
             enable_clipboard_paste(ttk.Entry(form, textvariable=variable, show="•" if secret else "", width=42)).grid(row=row, column=1, sticky="ew", pady=5)
         ttk.Label(
             form,
             text="После сохранения остальные активные сеансы этой учётной записи будут отозваны.",
-            style="Subtle.TLabel",
+            style="SurfaceSubtle.TLabel",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 4))
-        ttk.Button(form, text="Сохранить изменения", command=self.save).grid(row=5, column=1, sticky="e", pady=(8, 0))
+        ttk.Button(form, text="Сохранить изменения", style="Accent.TButton", command=self.save).grid(row=5, column=1, sticky="e", pady=(12, 0))
         form.columnconfigure(1, weight=1)
 
     def on_show(self) -> None:

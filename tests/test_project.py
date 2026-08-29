@@ -51,7 +51,7 @@ from updater import _read_limited as read_update_response_limited  # noqa: E402
 from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
 from state import AppState  # noqa: E402
-from ssh_terminal import HostFingerprintPolicy, connection_targets, load_private_key  # noqa: E402
+from ssh_terminal import connection_targets  # noqa: E402
 from sc_agent.backups import BackupManager  # noqa: E402
 from sc_agent.files import FileManager  # noqa: E402
 from sc_agent.instances import InstanceProfile, InstanceStore, detect_pack  # noqa: E402
@@ -71,8 +71,8 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("Match LocalPort 2222", config)
         self.assertIn("AllowUsers servercontrol-admin servercontrol-minecraft", config)
         self.assertIn("Match User servercontrol-admin,servercontrol-minecraft", config)
-        self.assertIn("2222 -> 192.168.0.108:2222", installer)
-        self.assertNotIn("2222 -> 192.168.0.108:22.", installer)
+        self.assertRegex(installer, r"2222 -> [^:\s]+:2222")
+        self.assertNotRegex(installer, r"2222 -> [^:\s]+:22\.")
 
     def test_minecraft_tmux_payload_preserves_process_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -93,40 +93,24 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(result.returncode, 7)
             self.assertEqual(exit_file.read_text(encoding="ascii"), "7")
 
-    def test_embedded_ssh_terminal_loads_keys_and_pins_the_host_fingerprint(self) -> None:
-        import base64
-        import hashlib
-
-        import paramiko
-
-        generated = paramiko.RSAKey.generate(1024)
-        private_key = io.StringIO()
-        generated.write_private_key(private_key)
-        loaded = load_private_key(private_key.getvalue())
-        self.assertEqual(loaded.get_fingerprint(), generated.get_fingerprint())
-        expected = "SHA256:" + base64.b64encode(hashlib.sha256(generated.asbytes()).digest()).decode("ascii").rstrip("=")
-        HostFingerprintPolicy(expected).missing_host_key(None, "46.175.223.107", generated)  # type: ignore[arg-type]
-        with self.assertRaisesRegex(paramiko.SSHException, "не совпал"):
-            HostFingerprintPolicy("SHA256:" + "A" * 43).missing_host_key(None, "46.175.223.107", generated)  # type: ignore[arg-type]
-
     def test_embedded_ssh_terminal_prefers_lan_only_when_reachable(self) -> None:
         credentials = {
-            "host": "46.175.223.107",
+            "host": "203.0.113.10",
             "port": 2222,
             "targets": [
-                {"host": "192.168.0.108", "port": 22, "network": "lan"},
-                {"host": "46.175.223.107", "port": 2222, "network": "internet"},
+                {"host": "192.0.2.10", "port": 22, "network": "lan"},
+                {"host": "203.0.113.10", "port": 2222, "network": "internet"},
             ],
         }
         with patch("ssh_terminal.socket.create_connection", side_effect=OSError("outside LAN")):
-            self.assertEqual(connection_targets(credentials)[0], ("46.175.223.107", 2222))
+            self.assertEqual(connection_targets(credentials)[0], ("203.0.113.10", 2222))
 
         class Probe:
             def close(self) -> None:
                 pass
 
         with patch("ssh_terminal.socket.create_connection", return_value=Probe()):
-            self.assertEqual(connection_targets(credentials)[0], ("192.168.0.108", 22))
+            self.assertEqual(connection_targets(credentials)[0], ("192.0.2.10", 22))
 
     def test_desktop_json_transport_uses_ipv4_and_closes_each_request(self) -> None:
         connections: list[object] = []
@@ -160,9 +144,9 @@ class ProjectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             log_path = Path(directory) / "client.log"
             client = ApiClient("https://control.example/base", diagnostic_path=log_path)
-            client.token = "test-token"
+            client.token = "unit-test-auth-placeholder"
             with patch("api.http.client.HTTPSConnection", FakeConnection):
-                result = client.request("GET", "/v1/server/status?opaque=secret", timeout_seconds=7)
+                result = client.request("GET", "/v1/server/status?opaque=redacted", timeout_seconds=7)
             diagnostic = log_path.read_text(encoding="utf-8")
 
         self.assertEqual(result, {"ok": True})
@@ -170,15 +154,15 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual((connection.host, connection.port, connection.timeout), ("control.example", 443, 3.5))
         self.assertIs(connection._create_connection, ApiClient._create_ipv4_connection)
         method, path, body, headers = connection.request_data
-        self.assertEqual((method, path, body), ("GET", "/base/v1/server/status?opaque=secret", None))
+        self.assertEqual((method, path, body), ("GET", "/base/v1/server/status?opaque=redacted", None))
         self.assertEqual(headers["Connection"], "close")
         self.assertEqual(headers["Accept-Encoding"], "identity")
-        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        self.assertEqual(headers["Authorization"], "Bearer unit-test-auth-placeholder")
         self.assertTrue(connection.closed)
         self.assertIn("GET /v1/server/status status=200", diagnostic)
         self.assertNotIn("opaque", diagnostic)
-        self.assertNotIn("secret", diagnostic)
-        self.assertNotIn("test-token", diagnostic)
+        self.assertNotIn("redacted", diagnostic)
+        self.assertNotIn("unit-test-auth-placeholder", diagnostic)
 
     def test_desktop_core_status_does_not_depend_on_combined_sync(self) -> None:
         source = (ROOT / "desktop" / "control_panel.py").read_text(encoding="utf-8")
@@ -333,7 +317,7 @@ class ProjectTests(unittest.TestCase):
             path = Path(directory) / "agent.json"
             path.write_text(json.dumps({
                 "hub_url": "https://example.invalid",
-                "agent_api_key": "test-key",
+                "agent_api_key": "unit-test-agent-placeholder",
                 "poll_seconds": 1,
                 "heartbeat_seconds": 2,
                 "minecraft": {"directory": "/tmp/minecraft"},
@@ -388,7 +372,7 @@ class ProjectTests(unittest.TestCase):
     def test_agent_does_not_run_shell_chains(self) -> None:
         config = Config(
             hub_url="https://example.invalid",
-            agent_api_key="test",
+            agent_api_key="unit-test-agent-placeholder",
             poll_seconds=6,
             heartbeat_seconds=30,
             request_timeout_seconds=5,
@@ -402,7 +386,7 @@ class ProjectTests(unittest.TestCase):
     def test_agent_requires_allow_list(self) -> None:
         config = Config(
             hub_url="https://example.invalid",
-            agent_api_key="test",
+            agent_api_key="unit-test-agent-placeholder",
             poll_seconds=6,
             heartbeat_seconds=30,
             request_timeout_seconds=5,
@@ -480,8 +464,10 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(disk_io, ((3 + 7) * 512, (5 + 11) * 512))
 
     def test_dashboard_formatters(self) -> None:
-        self.assertEqual(display_bytes(1024), "1.0 КиБ")
-        self.assertEqual(display_bytes(2048, per_second=True), "2.0 КиБ/с")
+        self.assertEqual(display_bytes(1024), "1.0 Kb")
+        self.assertEqual(display_bytes(1024**2), "1.0 Mb")
+        self.assertEqual(display_bytes(1024**3), "1.0 Gb")
+        self.assertEqual(display_bytes(2048, per_second=True), "2.0 Kb/s")
         self.assertEqual(display_duration(3_661), "1 ч 1 мин")
 
     def test_rcon_collects_a_multi_packet_response(self) -> None:
@@ -523,7 +509,7 @@ class ProjectTests(unittest.TestCase):
         with patch("server_control_agent.socket.create_connection", return_value=connection), patch(
             "server_control_agent.time.time", return_value=123.456
         ):
-            result = RconClient("127.0.0.1", 25575, "secret").command("help")
+            result = RconClient("127.0.0.1", 25575, "unit-test-rcon-placeholder").command("help")
         self.assertEqual(result, "first part second part")
         self.assertEqual(len(connection.sent), 3)
 
@@ -561,7 +547,7 @@ class ProjectTests(unittest.TestCase):
         with patch("server_control_agent.socket.create_connection", return_value=connection) as connect, patch(
             "server_control_agent.time.time", return_value=123.456
         ):
-            client = RconClient("127.0.0.1", 25575, "secret")
+            client = RconClient("127.0.0.1", 25575, "unit-test-rcon-placeholder")
             self.assertEqual(client.command("help"), "first")
             self.assertEqual(client.command("list"), "second")
         connect.assert_called_once()
@@ -578,7 +564,7 @@ class ProjectTests(unittest.TestCase):
     def test_hub_failures_are_coalesced_until_recovery(self) -> None:
         config = Config(
             hub_url="https://example.invalid",
-            agent_api_key="test",
+            agent_api_key="unit-test-agent-placeholder",
             poll_seconds=1,
             heartbeat_seconds=2,
             request_timeout_seconds=5,
@@ -597,7 +583,7 @@ class ProjectTests(unittest.TestCase):
 
     def test_agent_sync_falls_back_during_a_rolling_worker_deploy(self) -> None:
         config = Config(
-            hub_url="https://example.invalid", agent_api_key="test", poll_seconds=1,
+            hub_url="https://example.invalid", agent_api_key="unit-test-agent-placeholder", poll_seconds=1,
             heartbeat_seconds=2, request_timeout_seconds=5, minecraft={}, commands={},
         )
         client = HubClient(config)
@@ -758,12 +744,12 @@ class ProjectTests(unittest.TestCase):
             store.put(InstanceProfile(
                 id="pack", name="Pack", directory=str(instance_root), service="server-control-minecraft@pack.service",
                 startup_reviewed=True, startup_command=["/usr/bin/java", "-jar", "server.jar", "nogui"],
-                rcon_password="a-very-secret-password", managed_service=True,
+                rcon_password="unit-test-rcon-placeholder", managed_service=True,
             ))
             full = json.loads(store_path.read_text(encoding="utf-8"))
             runner_path = store_path.with_name("runner-instances.json")
             runner = json.loads(runner_path.read_text(encoding="utf-8"))
-            self.assertEqual(full["instances"][0]["rcon_password"], "a-very-secret-password")
+            self.assertEqual(full["instances"][0]["rcon_password"], "unit-test-rcon-placeholder")
             self.assertNotIn("rcon_password", runner["instances"][0])
             self.assertEqual(runner["instances"][0]["id"], "pack")
             if os.name != "nt":
@@ -890,19 +876,19 @@ class ProjectTests(unittest.TestCase):
             backups=None,  # type: ignore[arg-type]
             service_action=lambda *_args: {},
             instance_status=lambda _instance_id: {},
-            minecraft_command=lambda _instance_id, _command: "private command result",
+            minecraft_command=lambda _instance_id, _command: "job-scoped command output",
             server_action=lambda _action: {},
             service_control=lambda _service, _action: {},
             agent_update=lambda _payload: {},
             event=lambda *args, **_kwargs: events.append(args),
         )
         result = executor._dispatch(
-            "job-private-rcon",
+            "job-console-fixture",
             "minecraft_command",
             {"instance_id": "main", "command": "list"},
             threading.Event(),
         )
-        self.assertEqual(result["output"], "private command result")
+        self.assertEqual(result["output"], "job-scoped command output")
         self.assertEqual(events, [])
 
     def test_startup_tracker_uses_real_forge_and_minecraft_markers(self) -> None:

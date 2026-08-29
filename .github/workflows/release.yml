@@ -76,7 +76,7 @@ jobs:
       - name: Build Windows client
         run: >-
           pyinstaller --noconfirm --clean --onefile --windowed
-          --name ServerControl desktop/main.py
+          --name ServerControl --add-data "desktop/assets;assets" desktop/main.py
 
       - name: Build updater
         run: >-

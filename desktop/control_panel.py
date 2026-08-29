@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
@@ -40,6 +42,7 @@ class ControlPanel(ttk.Frame):
         self.current_page = "dashboard"
         self.pages: dict[str, BasePage] = {}
         self.page_buttons: dict[str, ttk.Button] = {}
+        self._neco_image: tk.PhotoImage | None = None
         self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._status_inflight = False
         self._power_inflight = False
@@ -61,26 +64,47 @@ class ControlPanel(ttk.Frame):
         self.after(1500, self._validate_session)
 
     def _build(self) -> None:
-        sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(10, 14))
+        sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(18, 24), width=276)
         sidebar.pack(side="left", fill="y")
-        ttk.Label(sidebar, text="Server Control", style="SidebarTitle.TLabel").pack(anchor="w", padx=8)
+        sidebar.pack_propagate(False)
+        brand = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        brand.pack(fill="x")
+        ttk.Label(brand, text="◆", style="SidebarAccent.TLabel").pack(side="left")
+        ttk.Label(brand, text="Server Control", style="SidebarTitle.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
         self._update_identity_label()
-        ttk.Label(sidebar, textvariable=self.identity_var, style="SidebarSubtle.TLabel").pack(anchor="w", padx=8, pady=(4, 16))
+        identity = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        identity.pack(fill="x", pady=(10, 24))
+        ttk.Label(identity, text="●", style="SidebarOnline.TLabel").pack(side="left")
+        ttk.Label(identity, textvariable=self.identity_var, style="SidebarSubtle.TLabel").pack(side="left", padx=(7, 0))
+
+        nav = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        nav.pack(fill="x")
+
+        try:
+            resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+            source = resource_root / "assets" / "neco_arc_sitting.png"
+            original = tk.PhotoImage(file=str(source))
+            self._neco_image = original.subsample(6, 6)
+            ttk.Label(sidebar, image=self._neco_image, style="SidebarSubtle.TLabel").pack(side="bottom", pady=(12, 0))
+        except (OSError, tk.TclError):
+            self._neco_image = None
 
         self.content = ttk.Frame(self)
         self.content.pack(side="left", fill="both", expand=True)
-        header = ttk.Frame(self.content, padding=(16, 10))
+        header = ttk.Frame(self.content, style="Header.TFrame", padding=(34, 26, 34, 12))
         header.pack(fill="x")
-        ttk.Label(header, textvariable=self.page_title_var, font=("Segoe UI", 17, "bold")).pack(side="left")
-        ttk.Label(header, textvariable=self.connection_var, style="Connection.TLabel").pack(side="left", padx=16)
-        ttk.Button(header, text="Проверить обновление", command=self.check_client_update).pack(side="right")
+        ttk.Label(header, textvariable=self.page_title_var, font=("Segoe UI Semibold", 25)).pack(side="left")
+        self.connection_label = ttk.Label(header, textvariable=self.connection_var, style="Connection.TLabel")
+        self.connection_label.pack(side="left", padx=18)
+        ttk.Button(header, text="↻  Проверить обновление", style="Accent.TButton", command=self.check_client_update).pack(side="right")
 
-        self.page_container = ttk.Frame(self.content, padding=(16, 6, 16, 8))
+        self.page_container = ttk.Frame(self.content, padding=(18, 2, 18, 10))
         self.page_container.pack(fill="both", expand=True)
-        footer = ttk.Frame(self.content, padding=(16, 7))
+        footer = ttk.Frame(self.content, style="Footer.TFrame", padding=(26, 12))
         footer.pack(fill="x")
-        ttk.Label(footer, textvariable=self.message_var, style="Subtle.TLabel").pack(side="left", fill="x", expand=True)
-        ttk.Label(footer, text=f"v{self.client_version}", style="Subtle.TLabel").pack(side="right", padx=12)
+        ttk.Label(footer, text="◌", style="FooterSubtle.TLabel", font=("Segoe UI", 15)).pack(side="left", padx=(0, 10))
+        ttk.Label(footer, textvariable=self.message_var, style="FooterSubtle.TLabel").pack(side="left", fill="x", expand=True)
+        ttk.Label(footer, text=f"v{self.client_version}", style="FooterSubtle.TLabel").pack(side="right", padx=12)
         ttk.Button(footer, text="Выйти", command=self.logout_callback).pack(side="right")
 
         page_types: list[type[BasePage]] = [DashboardPage]
@@ -89,12 +113,13 @@ class ControlPanel(ttk.Frame):
         if self.state.has_permission("users.manage"):
             page_types.append(UsersPage)
         page_types.append(AccountPage)
+        nav_icons = {"dashboard": "⌂", "console": "▣", "users": "♙", "account": "○"}
         for page_type in page_types:
             page = page_type(self.page_container, self)
             self.pages[page.page_id] = page
             button = ttk.Button(
-                sidebar,
-                text=page.title,
+                nav,
+                text=f"{nav_icons.get(page.page_id, '•')}   {page.title}",
                 style="Nav.TButton",
                 command=lambda name=page.page_id: self.select_page(name),
             )
@@ -111,6 +136,8 @@ class ControlPanel(ttk.Frame):
         page.pack(fill="both", expand=True)
         self.current_page = name
         self.page_title_var.set(page.title)
+        for page_id, button in self.page_buttons.items():
+            button.configure(style="NavActive.TButton" if page_id == name else "Nav.TButton")
         page.on_show()
 
     def _update_identity_label(self) -> None:
@@ -187,6 +214,7 @@ class ControlPanel(ttk.Frame):
             self.state.latency_ms = max(0, round((time.monotonic() - started) * 1000))
             self.state.apply_server_snapshot(payload)
             self.connection_var.set("Подключено")
+            self.connection_label.configure(style="Connection.TLabel")
             self._update_pages()
             self._schedule_status()
 
@@ -194,6 +222,7 @@ class ControlPanel(ttk.Frame):
             self._status_inflight = False
             self.state.mark_disconnected(error)
             self.connection_var.set("Нет связи")
+            self.connection_label.configure(style="ConnectionError.TLabel")
             self._update_pages()
             self._schedule_status()
 

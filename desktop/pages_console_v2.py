@@ -17,11 +17,11 @@ class TerminalTab(ttk.Frame):
         self.kind = kind
         self.loading = False
 
-        actions = ttk.Frame(self)
-        actions.pack(fill="x", pady=(0, 7))
-        ttk.Label(actions, text=help_text, style="Subtle.TLabel", wraplength=820).pack(side="left")
+        actions = ttk.Frame(self, style="Card.TFrame", padding=(14, 11))
+        actions.pack(fill="x", pady=(0, 10))
+        ttk.Label(actions, text=help_text, style="SurfaceSubtle.TLabel", wraplength=820).pack(side="left", fill="x", expand=True)
         ttk.Button(actions, text="Отключить", command=self.disconnect).pack(side="right")
-        ttk.Button(actions, text="Подключить заново", command=self.connect).pack(side="right", padx=6)
+        ttk.Button(actions, text="↻  Подключить заново", style="Accent.TButton", command=self.connect).pack(side="right", padx=8)
         self.terminal = EmbeddedTerminal(self, title=title)
         self.terminal.pack(fill="both", expand=True)
 

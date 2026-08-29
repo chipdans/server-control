@@ -15,7 +15,7 @@ class BasePage(ttk.Frame):
     title = ""
 
     def __init__(self, parent: tk.Misc, panel: "ControlPanel") -> None:
-        super().__init__(parent, padding=16)
+        super().__init__(parent, padding=(16, 12, 16, 16))
         self.panel = panel
 
     def update_state(self, _changes: dict[str, Any] | None = None) -> None:
@@ -38,4 +38,3 @@ class EmptyState(ttk.Frame):
         ttk.Label(self, text=detail, style="Subtle.TLabel", wraplength=560, justify="center").pack(pady=(8, 14))
         if action:
             ttk.Button(self, text=action[0], command=action[1]).pack()
-

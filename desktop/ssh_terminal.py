@@ -280,19 +280,19 @@ class EmbeddedTerminal(ttk.Frame):
         ttk.Label(toolbar, text=title, font=("Segoe UI", 11, "bold")).pack(side="left")
         ttk.Label(toolbar, textvariable=self.status_var, style="Subtle.TLabel").pack(side="left", padx=12)
 
-        terminal_frame = tk.Frame(self, background="#05080a", highlightthickness=1, highlightbackground="#34424d")
+        terminal_frame = tk.Frame(self, background="#050b13", highlightthickness=1, highlightbackground="#2b3d54")
         terminal_frame.pack(fill="both", expand=True)
         self.text = tk.Text(
             terminal_frame,
-            background="#05080a",
-            foreground="#d8f3dc",
+            background="#050b13",
+            foreground="#d9e7f7",
             insertbackground="#ffffff",
-            selectbackground="#355070",
+            selectbackground="#245da3",
             selectforeground="#ffffff",
             relief="flat",
             borderwidth=0,
-            padx=10,
-            pady=8,
+            padx=14,
+            pady=12,
             wrap="none",
             undo=False,
             font=("Cascadia Mono", 10),

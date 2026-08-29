@@ -15,6 +15,7 @@ import tempfile
 import threading
 import queue
 import tkinter as tk
+import ctypes
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
@@ -36,7 +37,7 @@ from widgets import (
 )
 
 
-APP_VERSION = "2.0.0-beta.1"
+APP_VERSION = "2.0.0-beta.2"
 APP_TITLE = "Server Control"
 
 
@@ -77,7 +78,7 @@ class ServerControlApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"{APP_TITLE} {APP_VERSION}")
-        self.root.minsize(1024, 680)
+        self.root.minsize(1160, 740)
         self.root.option_add("*tearOff", False)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.closed = False
@@ -87,12 +88,13 @@ class ServerControlApp:
         self.api: ApiClient | None = None
         self.user: dict[str, Any] | None = None
         self.preferences = LocalPreferences(preferences_path())
-        geometry = str(self.preferences.get("window_geometry", "1280x820"))
+        geometry = str(self.preferences.get("window_geometry", "1400x900"))
         try:
             self.root.geometry(geometry)
         except tk.TclError:
-            self.root.geometry("1280x820")
-        self._configure_style(str(self.preferences.get("theme", "dark")))
+            self.root.geometry("1400x900")
+        self._configure_style("dark")
+        self.root.after(20, self._enable_dark_titlebar)
         self.root.after(30, self._drain_ui_queue)
         try:
             self.config = load_configuration()
@@ -104,16 +106,20 @@ class ServerControlApp:
             self.show_configuration_error(str(error))
 
     def _configure_style(self, theme: str) -> None:
-        dark = theme != "light"
+        dark = True
         colors = {
-            "bg": "#10171d" if dark else "#f4f6f8",
-            "panel": "#172129" if dark else "#ffffff",
-            "sidebar": "#0b1116" if dark else "#e8edf2",
-            "text": "#e6eef5" if dark else "#17212b",
-            "muted": "#91a0ad" if dark else "#5f6b7a",
-            "accent": "#3f8cff",
-            "danger": "#ff6b6b" if dark else "#a61b1b",
-            "warning": "#ffd166" if dark else "#8a5a00",
+            "bg": "#07101b",
+            "panel": "#0c1724",
+            "panel_alt": "#101d2c",
+            "sidebar": "#081321",
+            "border": "#26364a",
+            "text": "#eef4ff",
+            "muted": "#91a0b5",
+            "accent": "#2f80ff",
+            "danger": "#ff545d",
+            "success": "#62d84e",
+            "warning": "#ffad33",
+            "purple": "#a767ff",
         }
         self.root.configure(background=colors["bg"])
         style = ttk.Style(self.root)
@@ -123,28 +129,83 @@ class ServerControlApp:
             pass
         style.configure(".", background=colors["bg"], foreground=colors["text"], fieldbackground=colors["panel"], font=("Segoe UI", 10))
         style.configure("TFrame", background=colors["bg"])
-        style.configure("TLabelframe", background=colors["bg"], foreground=colors["text"], bordercolor="#34424d")
-        style.configure("TLabelframe.Label", background=colors["bg"], foreground=colors["text"], font=("Segoe UI", 10, "bold"))
+        style.configure("Surface.TFrame", background=colors["panel"])
+        style.configure("Card.TFrame", background=colors["panel"], borderwidth=1, relief="solid")
+        style.configure("Header.TFrame", background=colors["bg"])
+        style.configure("Footer.TFrame", background="#08121f")
+        style.configure("TLabelframe", background=colors["panel"], foreground=colors["text"], bordercolor=colors["border"], relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=colors["panel"], foreground=colors["text"], font=("Segoe UI Semibold", 10))
+        style.configure("Card.TLabelframe", background=colors["panel"], foreground=colors["text"], bordercolor=colors["border"], relief="solid", borderwidth=1)
+        style.configure("Card.TLabelframe.Label", background=colors["panel"], foreground=colors["text"], font=("Segoe UI Semibold", 11))
         style.configure("TLabel", background=colors["bg"], foreground=colors["text"])
+        style.configure("Surface.TLabel", background=colors["panel"], foreground=colors["text"])
+        style.configure("CardTitle.TLabel", background=colors["panel"], foreground="#d9e4f5", font=("Segoe UI Semibold", 10))
+        style.configure("CardValue.TLabel", background=colors["panel"], foreground=colors["text"], font=("Segoe UI Semibold", 17))
+        style.configure("MetricValue.TLabel", background=colors["panel"], foreground=colors["text"], font=("Segoe UI Semibold", 19))
+        style.configure("MetricTitle.TLabel", background=colors["panel"], foreground="#d9e4f5", font=("Segoe UI Semibold", 10))
+        style.configure("MetricDetail.TLabel", background=colors["panel"], foreground=colors["muted"])
         style.configure("Subtle.TLabel", foreground=colors["muted"])
+        style.configure("SurfaceSubtle.TLabel", background=colors["panel"], foreground=colors["muted"])
+        style.configure("SurfaceWarning.TLabel", background=colors["panel"], foreground=colors["warning"])
+        style.configure("FooterSubtle.TLabel", background="#08121f", foreground=colors["muted"])
         style.configure("Warning.TLabel", foreground=colors["warning"])
-        style.configure("Connection.TLabel", foreground="#63e6be")
+        style.configure("Connection.TLabel", foreground=colors["success"], background="#10271f", padding=(11, 5), font=("Segoe UI Semibold", 9))
+        style.configure("ConnectionError.TLabel", foreground=colors["danger"], background="#2b151c", padding=(11, 5), font=("Segoe UI Semibold", 9))
+        for name, value in (
+            ("StateNeutral", colors["text"]),
+            ("StateSuccess", colors["success"]),
+            ("StateDanger", colors["danger"]),
+            ("StateAccent", colors["accent"]),
+            ("StatePurple", colors["purple"]),
+            ("StateWarning", colors["warning"]),
+        ):
+            style.configure(f"{name}.TLabel", background=colors["panel"], foreground=value, font=("Segoe UI Semibold", 17))
         style.configure("Sidebar.TFrame", background=colors["sidebar"])
-        style.configure("SidebarTitle.TLabel", background=colors["sidebar"], foreground=colors["text"], font=("Segoe UI", 15, "bold"))
+        style.configure("SidebarTitle.TLabel", background=colors["sidebar"], foreground=colors["text"], font=("Segoe UI Semibold", 16))
         style.configure("SidebarSubtle.TLabel", background=colors["sidebar"], foreground=colors["muted"])
-        style.configure("Nav.TButton", anchor="w", padding=(10, 7), background=colors["sidebar"], foreground=colors["text"], borderwidth=0)
-        style.map("Nav.TButton", background=[("active", "#23313c")])
-        style.configure("TButton", padding=(9, 5), background=colors["panel"], foreground=colors["text"])
-        style.configure("Danger.TButton", foreground=colors["danger"])
-        style.configure("TEntry", padding=5, fieldbackground=colors["panel"], foreground=colors["text"], insertcolor=colors["text"])
-        style.configure("TCombobox", padding=4, fieldbackground=colors["panel"], foreground=colors["text"])
-        style.configure("Treeview", background=colors["panel"], fieldbackground=colors["panel"], foreground=colors["text"], rowheight=25)
-        style.configure("Treeview.Heading", background="#25323c" if dark else "#e1e7ec", foreground=colors["text"], padding=5)
+        style.configure("SidebarAccent.TLabel", background=colors["sidebar"], foreground=colors["accent"], font=("Segoe UI", 24, "bold"))
+        style.configure("SidebarOnline.TLabel", background=colors["sidebar"], foreground=colors["success"])
+        style.configure("Nav.TButton", anchor="w", padding=(15, 12), background=colors["sidebar"], foreground="#aebbd0", borderwidth=0, font=("Segoe UI", 10))
+        style.map("Nav.TButton", background=[("active", "#101f32")], foreground=[("active", "#d8e7ff")])
+        style.configure("NavActive.TButton", anchor="w", padding=(15, 12), background="#10233a", foreground="#4b96ff", bordercolor="#1f4e87", borderwidth=1, relief="solid", font=("Segoe UI Semibold", 10))
+        style.map("NavActive.TButton", background=[("active", "#153052")], foreground=[("active", "#69a7ff")])
+        style.configure("TButton", padding=(12, 8), background=colors["panel_alt"], foreground=colors["text"], bordercolor=colors["border"], borderwidth=1, relief="solid")
+        style.map("TButton", background=[("active", "#15263a"), ("pressed", "#0b1522")], bordercolor=[("active", "#3d536d")])
+        style.configure("Accent.TButton", background="#10294c", foreground="#4a94ff", bordercolor="#2f80ff")
+        style.map("Accent.TButton", background=[("active", "#163966")])
+        style.configure("Success.TButton", background="#10271f", foreground=colors["success"], bordercolor="#34743b")
+        style.map("Success.TButton", background=[("active", "#163727")])
+        style.configure("Danger.TButton", background="#2a151c", foreground=colors["danger"], bordercolor="#91303a")
+        style.map("Danger.TButton", background=[("active", "#3a1a23")])
+        style.configure("TEntry", padding=8, fieldbackground=colors["panel_alt"], foreground=colors["text"], insertcolor=colors["text"], bordercolor=colors["border"], lightcolor=colors["border"], darkcolor=colors["border"])
+        style.configure("TCombobox", padding=7, fieldbackground=colors["panel_alt"], background=colors["panel_alt"], foreground=colors["text"], arrowcolor=colors["muted"])
+        style.configure("TCheckbutton", background=colors["panel"], foreground=colors["text"], padding=4)
+        style.map("TCheckbutton", background=[("active", colors["panel"])])
+        style.configure("Treeview", background=colors["panel"], fieldbackground=colors["panel"], foreground=colors["text"], rowheight=34, bordercolor=colors["border"], lightcolor=colors["border"], darkcolor=colors["border"])
+        style.configure("Treeview.Heading", background=colors["panel_alt"], foreground="#cbd8ea", padding=(9, 8), relief="flat", font=("Segoe UI Semibold", 9))
         style.map("Treeview", background=[("selected", colors["accent"])], foreground=[("selected", "#ffffff")])
         style.configure("TNotebook", background=colors["bg"])
-        style.configure("TNotebook.Tab", padding=(12, 6), background=colors["panel"], foreground=colors["text"])
-        style.map("TNotebook.Tab", background=[("selected", colors["accent"])], foreground=[("selected", "#ffffff")])
-        style.configure("Horizontal.TProgressbar", troughcolor=colors["panel"], background=colors["accent"])
+        style.configure("TNotebook.Tab", padding=(18, 10), background=colors["panel"], foreground=colors["muted"], borderwidth=0)
+        style.map("TNotebook.Tab", background=[("selected", "#10233a"), ("active", colors["panel_alt"])], foreground=[("selected", "#5d9fff")])
+        style.configure("Horizontal.TProgressbar", troughcolor="#172333", background=colors["accent"], bordercolor="#172333", lightcolor=colors["accent"], darkcolor=colors["accent"])
+        style.configure("Purple.Horizontal.TProgressbar", troughcolor="#172333", background=colors["purple"], bordercolor="#172333", lightcolor=colors["purple"], darkcolor=colors["purple"])
+        style.configure("Vertical.TScrollbar", background=colors["panel_alt"], troughcolor=colors["bg"], arrowcolor=colors["muted"])
+        style.configure("Horizontal.TScrollbar", background=colors["panel_alt"], troughcolor=colors["bg"], arrowcolor=colors["muted"])
+
+    def _enable_dark_titlebar(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            self.root.update_idletasks()
+            handle = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            enabled = ctypes.c_int(1)
+            for attribute in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    handle, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)
+                ) == 0:
+                    break
+        except (AttributeError, OSError, tk.TclError):
+            pass
 
     def clear(self) -> None:
         if self.panel:
@@ -163,21 +224,21 @@ class ServerControlApp:
 
     def show_login(self) -> None:
         self.clear()
-        frame = ttk.Frame(self.root, padding=40)
+        frame = ttk.Frame(self.root, padding=38, style="Card.TFrame")
         frame.place(relx=0.5, rely=0.46, anchor="center")
-        ttk.Label(frame, text="Server Control", font=("Segoe UI", 24, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        ttk.Label(frame, text=f"Прямые SSH-консоли Debian и Minecraft · {APP_VERSION}", style="Subtle.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 20))
+        ttk.Label(frame, text="◆  Server Control", style="Surface.TLabel", font=("Segoe UI Semibold", 24)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(frame, text=f"Прямые SSH-консоли Debian и Minecraft · {APP_VERSION}", style="SurfaceSubtle.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 24))
         username = tk.StringVar()
         password = tk.StringVar()
         status = tk.StringVar()
-        ttk.Label(frame, text="Логин").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="Логин", style="Surface.TLabel").grid(row=2, column=0, sticky="w", pady=7)
         username_entry = enable_clipboard_paste(ttk.Entry(frame, textvariable=username, width=36))
         username_entry.grid(row=2, column=1, sticky="ew", pady=5)
-        ttk.Label(frame, text="Пароль").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Label(frame, text="Пароль", style="Surface.TLabel").grid(row=3, column=0, sticky="w", pady=7)
         password_entry = enable_clipboard_paste(ttk.Entry(frame, textvariable=password, show="•", width=36))
         password_entry.grid(row=3, column=1, sticky="ew", pady=5)
-        ttk.Label(frame, textvariable=status, style="Warning.TLabel", wraplength=440).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
-        button = ttk.Button(frame, text="Войти")
+        ttk.Label(frame, textvariable=status, style="SurfaceWarning.TLabel", wraplength=440).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
+        button = ttk.Button(frame, text="Войти", style="Accent.TButton")
         button.grid(row=5, column=1, sticky="e", pady=(12, 0))
         ttk.Button(frame, text="Первоначальная настройка", command=self.show_setup).grid(row=5, column=0, sticky="w", pady=(12, 0))
 

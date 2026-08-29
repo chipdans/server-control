@@ -8,6 +8,8 @@ Type=simple
 User=minecraft
 Group=minecraft
 WorkingDirectory=/opt/minecraft/dragonfyre
+Environment=HOME=/opt/minecraft
+Environment=SHELL=/bin/bash
 RuntimeDirectory=server-control-minecraft
 RuntimeDirectoryMode=0750
 ExecStart=/usr/bin/python3 /opt/server-control/current/minecraft_tmux_runner.py --session dragonfyre --workdir /opt/minecraft/dragonfyre --exit-file /run/server-control-minecraft/dragonfyre.exit -- /bin/bash /opt/minecraft/dragonfyre/start.sh

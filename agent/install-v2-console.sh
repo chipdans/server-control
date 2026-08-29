@@ -30,6 +30,12 @@ fi
 install -d -m 0700 -o servercontrol-admin -g servercontrol-admin /home/servercontrol-admin/.ssh
 install -d -m 0700 -o servercontrol-minecraft -g servercontrol-minecraft /home/servercontrol-minecraft/.ssh
 install -d -m 0700 /etc/server-control/ssh
+cat > /etc/server-control/tmux-dragonfyre.conf <<'EOF'
+set-option -g default-shell /bin/bash
+set-option -g prefix None
+set-option -g prefix2 None
+EOF
+chmod 0644 /etc/server-control/tmux-dragonfyre.conf
 
 ADMIN_KEY_PATH=/etc/server-control/ssh/servercontrol_admin
 MINECRAFT_KEY_PATH=/etc/server-control/ssh/servercontrol_minecraft
@@ -83,10 +89,12 @@ install -m 0644 "$SOURCE_DIR/dragonfyre-tmux.service" /etc/systemd/system/dragon
 
 python3 - <<'PY'
 import json
+import os
 from pathlib import Path
 
 config_path = Path("/etc/server-control/agent-config.json")
 if config_path.is_file():
+    original = config_path.stat()
     config = json.loads(config_path.read_text(encoding="utf-8"))
     minecraft = config.setdefault("minecraft", {})
     minecraft["console_mode"] = "tmux"
@@ -94,7 +102,8 @@ if config_path.is_file():
     minecraft["rcon_password"] = ""
     temporary = config_path.with_suffix(".json.v2-new")
     temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
+    os.chown(temporary, original.st_uid, original.st_gid)
+    temporary.chmod(original.st_mode & 0o7777)
     temporary.replace(config_path)
 
 properties_path = Path("/opt/minecraft/dragonfyre/server.properties")
@@ -113,6 +122,13 @@ if properties_path.is_file():
         output.append("enable-rcon=false")
     properties_path.write_text("\n".join(output) + "\n", encoding="utf-8")
 PY
+
+# The Agent reads this file as the unprivileged servercontrol user.  Repair
+# permissions from early v2 installers which replaced it as root:root 0600.
+if id servercontrol >/dev/null 2>&1 && [ -f /etc/server-control/agent-config.json ]; then
+  chown root:servercontrol /etc/server-control/agent-config.json
+  chmod 0640 /etc/server-control/agent-config.json
+fi
 
 systemctl daemon-reload
 systemctl enable dragonfyre.service

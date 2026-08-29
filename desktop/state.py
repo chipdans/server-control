@@ -216,7 +216,7 @@ class LocalPreferences:
         "recent_files": [],
         "favourite_files": [],
         "recent_actions": [],
-        "window_geometry": "1280x820",
+        "window_geometry": "1400x900",
     }
 
     def __init__(self, path: Path) -> None:
