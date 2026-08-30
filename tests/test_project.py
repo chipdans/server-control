@@ -140,8 +140,13 @@ class ProjectTests(unittest.TestCase):
                 'dependency_requirement: "linear"\n'
                 'title: "Getting Started"\n'
                 'description: [\n  "Build a safe shelter"\n]\n'
+                'description: "Русский текст про Ars Nouveau"\n'
                 'item: "minecraft:stone"\n',
                 encoding="utf-8",
+            )
+            (pack / "config" / "ftbquests" / "quests_BACKUP_3B").mkdir(parents=True)
+            (pack / "config" / "ftbquests" / "quests_BACKUP_3B" / "old.snbt").write_text(
+                'title: "Backup Quest Must Be Ignored"\n', encoding="utf-8",
             )
             (pack / "config" / "ftbquests" / "quests" / "chapter.json").write_text(
                 json.dumps({
@@ -168,7 +173,10 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("Build a safe shelter", texts)
         self.assertIn("Boss Fight", texts)
         self.assertIn("Main Chapter", texts)
-        self.assertTrue({"minecraft:stone", "disabled", "circle", "linear"}.isdisjoint(texts))
+        self.assertTrue({
+            "minecraft:stone", "disabled", "circle", "linear", "Русский текст про Ars Nouveau",
+            "Backup Quest Must Be Ignored",
+        }.isdisjoint(texts))
 
     def test_client_translation_export_applies_only_enabled_resourcepacks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -179,11 +187,28 @@ class ProjectTests(unittest.TestCase):
             with zipfile.ZipFile(client / "mods" / "example.jar", "w") as jar:
                 jar.writestr(
                     "assets/example/lang/en_us.json",
-                    json.dumps({"hello": "Hello world", "stone": "Stone Block", "axe": "Battle Axe"}),
+                    json.dumps({
+                        "hello": "Hello world",
+                        "stone": "Stone Block",
+                        "axe": "Battle Axe",
+                        "enchantment.level.12": "XII",
+                        "tooltip.shift": "[SHIFT]",
+                        "config.example.tooltip": "Advanced Netherite settings",
+                        "message.example.partial": "Perfect! Let me get to it!",
+                        "itemGroup.example": "Example Mod",
+                    }),
                 )
                 jar.writestr(
                     "assets/example/lang/ru_ru.json",
-                    json.dumps({"hello": "Привет, мир", "stone": "Stone Block"}, ensure_ascii=False),
+                    json.dumps({
+                        "hello": "Привет, мир",
+                        "stone": "Stone Block",
+                        "enchantment.level.12": "XII",
+                        "tooltip.shift": "[SHIFT]",
+                        "config.example.tooltip": "Настройки Advanced Netherite",
+                        "message.example.partial": "Идеально! Let me get to it!",
+                        "itemGroup.example": "Example Mod",
+                    }, ensure_ascii=False),
                 )
             with zipfile.ZipFile(client / "resourcepacks" / "active.zip", "w") as pack:
                 pack.writestr(
@@ -217,13 +242,17 @@ class ProjectTests(unittest.TestCase):
             result = build_combined_translation_export(client, server_archive, destination)
             with zipfile.ZipFile(destination) as archive:
                 tasks = json.loads(archive.read("translation-export/translation_tasks.json"))
+                reviews = json.loads(archive.read("translation-export/review_required.json"))
                 manifest = json.loads(archive.read("translation-export/manifest.json"))
 
         self.assertEqual(result["tasks"], 2)
         self.assertEqual([task["source_text"] for task in tasks], ["Server Quest", "Battle Axe"])
         self.assertEqual(tasks[1]["task_id"], "translation-000002")
+        self.assertEqual({task["source_text"] for task in reviews}, {"Perfect! Let me get to it!", "Example Mod"})
+        self.assertNotIn("Advanced Netherite settings", {task["source_text"] for task in reviews})
         self.assertEqual(manifest["client_scan"]["enabled_resourcepacks"], ["active.zip"])
         self.assertEqual(manifest["statistics"]["mods"]["incomplete"][0]["needs_translation"], 1)
+        self.assertEqual(manifest["statistics"]["review_required"], 2)
 
     def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
         original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"

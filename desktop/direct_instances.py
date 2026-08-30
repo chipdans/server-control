@@ -158,6 +158,12 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         "lore", "question", "answer", "message", "label", "display_name",
         "chapter_title", "quest_title", "task_title", "reward_title",
     }
+    ENGLISH_GRAMMAR_WORDS = {
+        "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "click",
+        "do", "does", "for", "from", "get", "has", "have", "if", "in", "into", "is", "it",
+        "let", "me", "not", "of", "on", "only", "or", "that", "the", "this", "to", "use",
+        "was", "when", "will", "with", "you", "your",
+    }
 
     RUNNER_PROGRAM = __RUNNER_PROGRAM__
 
@@ -627,19 +633,37 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         if not latin_words:
             return False
         if re.search(r"[а-яё]", text, re.IGNORECASE):
-            return len(latin_words) >= 2 or sum(len(word) for word in latin_words) >= 12
+            grammar = sum(word.casefold() in ENGLISH_GRAMMAR_WORDS for word in latin_words)
+            latin_letters = sum(len(word) for word in latin_words)
+            cyrillic_letters = len(re.findall(r"[а-яё]", text, re.IGNORECASE))
+            ratio = latin_letters / max(1, latin_letters + cyrillic_letters)
+            return grammar >= 2 or (grammar >= 1 and ratio >= 0.35) or (len(latin_words) >= 3 and ratio >= 0.45)
         if not re.search(r"\s", text) and re.fullmatch(r"[a-z0-9_.:/+@#-]+", text, re.IGNORECASE) and re.search(r"[_.:/]", text):
             return False
         return True
 
+    def nontranslatable_text(value):
+        text = re.sub(r"§.", "", str(value or "")).strip()
+        if not text or re.fullmatch(r"[MDCLXVI]+", text):
+            return True
+        if re.fullmatch(r"[\[(]?(?:SHIFT|CTRL|CONTROL|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})[\])]?", text, re.IGNORECASE):
+            return True
+        if text.casefold() in {"true", "false", "on", "off", "yes", "no", "default", "none", "auto", "enabled", "disabled"}:
+            return True
+        if re.fullmatch(r"(?:https?://\S+|[a-z0-9_.-]+:[a-z0-9_./-]+|/[a-z0-9_./#:-]+)", text, re.IGNORECASE):
+            return True
+        return False
+
     def translation_reason(source, current):
+        if nontranslatable_text(source):
+            return ""
         if current is None:
             return "missing" if looks_english(source) else ""
         source_normalized = normalized_translation(source)
         current_normalized = normalized_translation(current)
         if source_normalized and source_normalized == current_normalized and looks_english(source):
             return "identical_to_english"
-        if looks_english(current):
+        if not nontranslatable_text(current) and looks_english(current):
             return "contains_english"
         return ""
 
@@ -743,13 +767,15 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         }
 
     def quest_candidate_files(directory):
-        roots = [
-            directory / "config" / "ftbquests",
-            directory / "defaultconfigs" / "ftbquests",
-            directory / "world" / "serverconfig" / "ftbquests",
-            directory / "config" / "betterquesting",
-            directory / "kubejs" / "data",
+        active_ftb_roots = [
+            directory / "config" / "ftbquests" / "quests",
+            directory / "world" / "serverconfig" / "ftbquests" / "quests",
         ]
+        selected_ftb = next((root for root in active_ftb_roots if root.is_dir() and not root.is_symlink()), None)
+        if selected_ftb is None:
+            fallback = directory / "defaultconfigs" / "ftbquests" / "quests"
+            selected_ftb = fallback if fallback.is_dir() and not fallback.is_symlink() else None
+        roots = [root for root in (selected_ftb, directory / "config" / "betterquesting", directory / "kubejs" / "data") if root is not None]
         candidates = []
         seen = set()
         for root in roots:
@@ -761,6 +787,9 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                     if len(candidates) >= MAX_QUEST_FILES:
                         return candidates, True
                     if path.is_symlink() or not path.is_file() or path.suffix.casefold() not in {".snbt", ".json", ".json5", ".lang"}:
+                        continue
+                    lowered_parts = {part.casefold() for part in path.relative_to(root).parts}
+                    if any(re.search(r"(?:^|[_. -])(?:backup|backups|archive|disabled|old|copy)(?:$|[_. -])", part) for part in lowered_parts):
                         continue
                     relative = path.relative_to(directory).as_posix()
                     lowered = relative.casefold()
@@ -781,7 +810,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         elif isinstance(value, list):
             for index, item in enumerate(value):
                 results.extend(quest_json_strings(item, (*path, str(index))))
-        elif isinstance(value, str) and looks_english(value):
+        elif isinstance(value, str) and not nontranslatable_text(value) and looks_english(value):
             field = next((part.casefold() for part in reversed(path) if not part.isdigit()), "")
             if field in TRANSLATABLE_QUEST_FIELDS:
                 results.append((".".join(path), value))
@@ -815,7 +844,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                     value = json.loads('"' + match.group(1) + '"')
                 except json.JSONDecodeError:
                     value = match.group(1).replace('\\"', '"')
-                if looks_english(value):
+                if not nontranslatable_text(value) and looks_english(value):
                     results.append((line_number, field, value))
             if active_field:
                 active_list_depth += fragment.count("[") - fragment.count("]") if not field_match else 0
@@ -833,6 +862,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         copied = []
         language_sets = []
         handled = set()
+        quest_task_by_text = {}
         candidate_set = {str(path): path for path in candidates}
         for english_path in candidates:
             if english_path.stem.casefold() != "en_us":
@@ -919,16 +949,23 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                     found = [(None, field, text) for field, text in quest_json_strings(parsed)]
             if not found:
                 found = quest_text_strings(content)
+            if path.name.casefold() == "data.snbt":
+                found = [item for item in found if str(item[1] or "").casefold() != "title"]
             if not found:
                 continue
             files_with_tasks += 1
-            strings_found += len(found)
             target = export_root / "quests" / "source" / Path(relative)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
             copied.append(relative)
             for line_number, field, text in found:
-                append_translation_task(tasks, {
+                signature = (str(field or "").casefold(), normalized_translation(text))
+                occurrence = {"source_file": relative, "line": line_number, "field": field or None}
+                existing_index = quest_task_by_text.get(signature)
+                if existing_index is not None:
+                    tasks[existing_index].setdefault("occurrences", []).append(occurrence)
+                    continue
+                appended = append_translation_task(tasks, {
                     "kind": "quest_text",
                     "reason": "contains_english",
                     "source_file": relative,
@@ -936,7 +973,11 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                     "field": field or None,
                     "source_text": text,
                     "current_text": None,
+                    "occurrences": [occurrence],
                 })
+                if appended:
+                    quest_task_by_text[signature] = len(tasks) - 1
+                    strings_found += 1
         return {
             "files_scanned": files_scanned,
             "files_with_tasks": files_with_tasks,

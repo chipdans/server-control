@@ -18,6 +18,16 @@ MAX_EXPORT_BYTES = 512 * 1024 * 1024
 MAX_TASKS = 250_000
 MAX_ARCHIVE_MEMBERS = 250_000
 LANG_PATH = re.compile(r"^assets/([^/]+)/lang/(en_us|ru_ru)\.(json|lang)$", re.IGNORECASE)
+ENGLISH_GRAMMAR_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "click",
+    "do", "does", "for", "from", "get", "has", "have", "if", "in", "into", "is", "it",
+    "let", "me", "not", "of", "on", "only", "or", "that", "the", "this", "to", "use",
+    "was", "when", "will", "with", "you", "your",
+}
+VISIBLE_OBJECT_KEY_PREFIXES = (
+    "advancement.", "affix.", "biome.", "block.", "effect.", "enchantment.", "entity.",
+    "gem_", "gui.", "item.", "message.", "mob.", "perk.", "quest.", "stat.", "tooltip.",
+)
 
 
 def _normalized(value: Any) -> str:
@@ -39,16 +49,73 @@ def _looks_english(value: Any) -> bool:
     return True
 
 
-def _translation_reason(source: Any, current: Any | None) -> str:
+def _nontranslatable_value(value: Any, key: Any = "") -> bool:
+    text = re.sub(r"§.", "", str(value or "")).strip()
+    lowered_key = str(key or "").casefold()
+    if not text or lowered_key in {"_comment", "comment", "credits", "author"}:
+        return True
+    if re.fullmatch(r"[MDCLXVI]+", text):
+        return True
+    if re.fullmatch(r"[\[(]?(?:SHIFT|CTRL|CONTROL|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})[\])]?", text, re.IGNORECASE):
+        return True
+    if text.casefold() in {"true", "false", "on", "off", "yes", "no", "default", "none", "auto", "enabled", "disabled"}:
+        return True
+    if re.fullmatch(r"(?:https?://\S+|[a-z0-9_.-]+:[a-z0-9_./-]+|/[a-z0-9_./#:-]+)", text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[dMyHhmsS:/ ._-]{4,}", text) and re.search(r"[dMyHhmsS]", text):
+        return True
+    if ("music_disc" in lowered_key or ".sound." in lowered_key or ".sounds." in lowered_key) and re.fullmatch(
+        r"[^\n]{1,80}\s[-–—]\s[^\n]{1,80}", text
+    ):
+        return True
+    return False
+
+
+def _punctuation_equivalent(first: Any, second: Any) -> bool:
+    normalize = lambda value: re.sub(r"[^0-9a-zа-яё]+", "", str(value or "").casefold())
+    return bool(normalize(first)) and normalize(first) == normalize(second)
+
+
+def _mixed_english_review(value: Any) -> bool:
+    text = re.sub(r"https?://\S+", "", str(value or ""))
+    text = re.sub(r"(?:[#/]?[a-z0-9_.-]+:[a-z0-9_./-]+|/[a-z0-9_./#:-]+)", "", text, flags=re.IGNORECASE)
+    latin = re.findall(r"[A-Za-z]{2,}", text)
+    cyrillic_letters = re.findall(r"[А-Яа-яЁё]", text)
+    if not latin or not cyrillic_letters:
+        return False
+    grammar = sum(word.casefold() in ENGLISH_GRAMMAR_WORDS for word in latin)
+    latin_letters = sum(len(word) for word in latin)
+    ratio = latin_letters / max(1, latin_letters + len(cyrillic_letters))
+    return grammar >= 2 or (grammar >= 1 and ratio >= 0.35) or (len(latin) >= 3 and ratio >= 0.45)
+
+
+def _ambiguous_short_name(value: Any, key: Any) -> bool:
+    words = re.findall(r"[A-Za-z][A-Za-z'’-]*", str(value or ""))
+    if not 1 <= len(words) <= 4 or str(key or "").casefold().startswith(VISIBLE_OBJECT_KEY_PREFIXES):
+        return False
+    return all(word[:1].isupper() or word.isupper() for word in words)
+
+
+def _translation_decision(source: Any, current: Any | None, key: Any) -> tuple[str, str]:
+    if _nontranslatable_value(source, key):
+        return "", ""
     if current is None:
-        return "missing" if _looks_english(source) else ""
+        return ("needs_translation", "missing") if _looks_english(source) else ("", "")
     source_normalized = _normalized(source)
     current_normalized = _normalized(current)
     if source_normalized and source_normalized == current_normalized and _looks_english(source):
-        return "identical_to_english"
+        if _ambiguous_short_name(source, key):
+            return "review_required", "ambiguous_name"
+        return "needs_translation", "identical_to_english"
+    if _punctuation_equivalent(source, current) or _nontranslatable_value(current, key):
+        return "", ""
+    if re.search(r"[а-яё]", str(current), re.IGNORECASE):
+        return ("review_required", "mixed_language") if _mixed_english_review(current) else ("", "")
     if _looks_english(current):
-        return "contains_english"
-    return ""
+        if _ambiguous_short_name(current, key):
+            return "review_required", "ambiguous_name"
+        return "needs_translation", "contains_english"
+    return "", ""
 
 
 def _parse_language(payload: bytes, suffix: str) -> dict[str, str]:
@@ -276,8 +343,14 @@ def _extract_server_export(archive_path: Path, target: Path) -> Path:
     return export_root
 
 
-def _append_mod_tasks(export_root: Path, catalog: _Catalog, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+def _append_mod_tasks(
+    export_root: Path,
+    catalog: _Catalog,
+    tasks: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+) -> dict[str, Any]:
     summaries: list[dict[str, Any]] = []
+    review_counts: dict[str, int] = {}
     english_namespaces = catalog.values["en_us"]
     russian_namespaces = catalog.values["ru_ru"]
     for namespace in sorted(english_namespaces):
@@ -287,8 +360,22 @@ def _append_mod_tasks(export_root: Path, catalog: _Catalog, tasks: list[dict[str
         reasons = {"missing": 0, "identical_to_english": 0, "contains_english": 0}
         for key, english_text in english.items():
             current = russian.get(key)
-            reason = _translation_reason(english_text, current)
-            if not reason:
+            category, reason = _translation_decision(english_text, current, key)
+            if category == "review_required":
+                review_counts[namespace] = review_counts.get(namespace, 0) + 1
+                reviews.append({
+                    "review_id": f"review-{len(reviews) + 1:06d}",
+                    "kind": "mod_language",
+                    "reason": reason,
+                    "source_file": catalog.origins["en_us"].get(namespace, {}).get(key),
+                    "target_file": f"assets/{namespace}/lang/ru_ru.json",
+                    "namespace": namespace,
+                    "key": key,
+                    "source_text": english_text,
+                    "current_text": current,
+                })
+                continue
+            if category != "needs_translation":
                 continue
             reasons[reason] += 1
             missing[key] = english_text
@@ -322,6 +409,8 @@ def _append_mod_tasks(export_root: Path, catalog: _Catalog, tasks: list[dict[str
         "jars_scanned": 0,
         "lang_files_scanned": catalog.lang_files,
         "incomplete": summaries,
+        "review_required": len(reviews),
+        "review_namespaces": review_counts,
         "errors": catalog.errors[:200],
     }
 
@@ -352,7 +441,8 @@ def build_combined_translation_export(
         if not isinstance(tasks, list):
             raise ValueError("Сервер вернул некорректный список заданий перевода.")
         shutil.rmtree(export_root / "mods", ignore_errors=True)
-        mods = _append_mod_tasks(export_root, catalog, tasks)
+        reviews: list[dict[str, Any]] = []
+        mods = _append_mod_tasks(export_root, catalog, tasks, reviews)
         try:
             manifest = json.loads((export_root / "manifest.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -370,6 +460,7 @@ def build_combined_translation_export(
             "statistics": {
                 **statistics,
                 "translation_tasks": len(tasks),
+                "review_required": len(reviews),
                 "task_limit_reached": len(tasks) >= MAX_TASKS,
                 "mods": mods,
                 "quests": quests,
@@ -377,6 +468,7 @@ def build_combined_translation_export(
         })
         _write_json(export_root / "manifest.json", manifest)
         _write_json(export_root / "translation_tasks.json", tasks)
+        _write_json(export_root / "review_required.json", reviews)
 
         instance = manifest.get("instance") if isinstance(manifest.get("instance"), dict) else {}
         quest_files = int(quests.get("files_with_tasks") or 0)
@@ -391,6 +483,7 @@ def build_combined_translation_export(
             f"- Модов/пространств с неполным итоговым переводом: {len(mods['incomplete'])}",
             f"- Файлов серверных квестов с английским текстом: {quest_files}",
             f"- Всего заданий на перевод: {len(tasks)}",
+            f"- Сомнительных смешанных строк для отдельной проверки: {len(reviews)}",
             "",
             "## Неполные итоговые переводы модов",
             "",
@@ -406,11 +499,13 @@ def build_combined_translation_export(
             "Передайте весь ZIP для перевода. Переводится только source_text; task_id, ключи, пути, плейсхолдеры и структура файлов сохраняются.",
             "Переводы модов рассчитаны по итоговым ресурсам клиента: встроенные lang-файлы, KubeJS/OpenLoader и активные ресурспаки.",
             "Квесты взяты с сервера, поэтому соответствуют выбранной серверной сборке.",
+            "Основные задания находятся в translation_tasks.json. Сомнительные смешанные строки вынесены в review_required.json и автоматически переводить их не нужно.",
             "",
         ])
         (export_root / "REPORT.md").write_text("\n".join(report), encoding="utf-8")
         (export_root / "README.txt").write_text(
             "Отправьте этот ZIP в ChatGPT и попросите перевести задания из translation_tasks.json.\n"
+            "review_required.json содержит только сомнительные строки для ручной проверки.\n"
             "Не меняйте task_id, ключи, пути, управляющие коды и плейсхолдеры.\n",
             encoding="utf-8",
         )
@@ -432,6 +527,7 @@ def build_combined_translation_export(
         "tasks": len(tasks),
         "mods_incomplete": len(mods["incomplete"]),
         "quest_files": quest_files,
+        "review_required": len(reviews),
         "task_limit_reached": len(tasks) >= MAX_TASKS,
         "client": client,
     }

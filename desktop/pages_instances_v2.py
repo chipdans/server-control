@@ -1082,12 +1082,14 @@ class InstancesPage(BasePage):
             tasks = int(result.get("tasks") or 0)
             mods = int(result.get("mods_incomplete") or 0)
             quests = int(result.get("quest_files") or 0)
+            reviews = int(result.get("review_required") or 0)
             client = mapping(result.get("client"))
             packs = client.get("enabled_resourcepacks") if isinstance(client.get("enabled_resourcepacks"), list) else []
             message = (
                 f"Найдено строк: {tasks}\n"
                 f"Модов с неполным итоговым переводом: {mods}\n"
                 f"Файлов серверных квестов: {quests}\n"
+                f"Сомнительных строк для ручной проверки: {reviews}\n"
                 f"Учтено активных ресурспаков: {len(packs)}\n\n"
                 f"Архив сохранён:\n{destination}"
             )
