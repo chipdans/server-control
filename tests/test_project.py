@@ -53,6 +53,8 @@ from api import ApiClient, ApiError  # noqa: E402
 from direct_instances import MANAGED_INSTANCE_RUNNER_PROGRAM, REMOTE_INSTANCE_MANAGER_PROGRAM, manager_command  # noqa: E402
 from direct_status import dashboard_envelope  # noqa: E402
 from local_translation import build_combined_translation_export  # noqa: E402
+from local_translation import _translation_decision  # noqa: E402
+from pages_dashboard_v2 import selected_minecraft_status  # noqa: E402
 from pages_instances_v2 import parse_server_properties, update_server_properties  # noqa: E402
 from state import AppState  # noqa: E402
 from ssh_terminal import connection_targets  # noqa: E402
@@ -67,6 +69,47 @@ from service_control_helper import validated_command  # noqa: E402
 
 
 class ProjectTests(unittest.TestCase):
+    def test_dashboard_tracks_active_minecraft_name(self) -> None:
+        status = {
+            "selected_instance_id": "new-pack",
+            "instances": [
+                {"id": "dragonfyre", "name": "Dragonfyre"},
+                {"id": "new-pack", "name": "Новая сборка"},
+            ],
+        }
+        self.assertEqual(selected_minecraft_status(status, "dragonfyre")["name"], "Новая сборка")
+
+    def test_translation_filter_removes_only_technical_values(self) -> None:
+        ignored = [
+            ("Ctrl + %s", "modifier.cloth-config.ctrl"),
+            ("/lootr barrel | chest", "lootr.commands.usage"),
+            ("dde9f4", "travelerstitles.aether.color"),
+            ("[Quark]\\n", "quark.jei.hint_preamble"),
+            ("Some text here", "book.example.page"),
+            ("RAISES CLOUD HEIGHT", "cloud.height.__COMMENT"),
+            ("§eKiller Queen", "item.vp.killer"),
+            ("Patchouli", "item.patchouli:intro_book.name"),
+            ("Weezer", "item.iceandfire.weezer_blue_album"),
+        ]
+        for value, key in ignored:
+            self.assertEqual(_translation_decision(value, value, key), ("", ""), (value, key))
+        self.assertEqual(
+            _translation_decision("Hold shift to view details.", None, "tooltip.example"),
+            ("needs_translation", "missing"),
+        )
+        self.assertEqual(
+            _translation_decision("/kill doesn't even bother me", None, "legendary.message"),
+            ("needs_translation", "missing"),
+        )
+        self.assertEqual(
+            _translation_decision("[Use Default Language]", None, "ftbquests.gui.language"),
+            ("needs_translation", "missing"),
+        )
+        self.assertEqual(
+            _translation_decision("Killer Queen", "Killer Queen", "item.vp.killer"),
+            ("", ""),
+        )
+
     def test_direct_ssh_snapshot_uses_dashboard_shape(self) -> None:
         payload = dashboard_envelope({
             "hostname": "ChipdanServer",
