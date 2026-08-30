@@ -14,6 +14,22 @@ def mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def selected_minecraft_status(status: dict[str, Any], fallback_selected_id: str | None = None) -> dict[str, Any]:
+    """Select the active profile returned by the latest status poll."""
+
+    values = status.get("instances") if isinstance(status.get("instances"), list) else []
+    selected_id = str(status.get("selected_instance_id") or fallback_selected_id or "")
+    selected = next(
+        (mapping(item) for item in values if str(mapping(item).get("id") or "") == selected_id),
+        None,
+    )
+    if selected:
+        return selected
+    if values:
+        return mapping(values[0])
+    return mapping(status.get("minecraft"))
+
+
 class StateCard(ttk.Frame):
     def __init__(self, parent: tk.Misc, title: str, *, icon: str, accent: str) -> None:
         super().__init__(parent, style="Card.TFrame", padding=18, height=206)
@@ -138,12 +154,7 @@ class DashboardPage(BasePage):
         else:
             self.server.set("Не отвечает", "Показаны последние известные данные", tone="danger")
 
-        values = status.get("instances") if isinstance(status.get("instances"), list) else []
-        instance = next((mapping(item) for item in values if mapping(item).get("id") == "dragonfyre"), None)
-        if not instance and values:
-            instance = mapping(values[0])
-        if not instance:
-            instance = mapping(status.get("minecraft"))
+        instance = selected_minecraft_status(status, state.selected_instance_id)
         self.minecraft.set_title(f"Minecraft · {instance.get('name') or instance.get('id') or 'сборка'}")
         minecraft_state = str(instance.get("state") or ("RUNNING" if instance.get("active") else "STOPPED"))
         minecraft_label = {
