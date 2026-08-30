@@ -153,6 +153,11 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     MAX_LANG_FILE_BYTES = 8 * 1024 * 1024
     MAX_QUEST_FILE_BYTES = 16 * 1024 * 1024
     MAX_QUEST_FILES = 10000
+    TRANSLATABLE_QUEST_FIELDS = {
+        "title", "subtitle", "description", "text", "tooltip", "hover_text",
+        "lore", "question", "answer", "message", "label", "display_name",
+        "chapter_title", "quest_title", "task_title", "reward_title",
+    }
 
     RUNNER_PROGRAM = __RUNNER_PROGRAM__
 
@@ -777,29 +782,46 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
             for index, item in enumerate(value):
                 results.extend(quest_json_strings(item, (*path, str(index))))
         elif isinstance(value, str) and looks_english(value):
-            technical = {"id", "type", "icon", "item", "fluid", "entity", "command", "dependency", "filename", "path"}
-            if not path or not any(part.casefold() in technical for part in path[-2:]):
+            field = next((part.casefold() for part in reversed(path) if not part.isdigit()), "")
+            if field in TRANSLATABLE_QUEST_FIELDS:
                 results.append((".".join(path), value))
         return results
 
     def quest_text_strings(content):
         results = []
-        technical_fields = {"id", "type", "icon", "item", "fluid", "entity", "command", "dependency", "filename", "path", "shape"}
         quoted = re.compile(r'"((?:\\.|[^"\\])*)"')
+        active_field = ""
+        active_list_depth = 0
         for line_number, line in enumerate(content.splitlines(), start=1):
-            field_match = re.match(r"\s*([a-zA-Z0-9_.-]+)\s*[:=]", line)
-            field = field_match.group(1) if field_match else ""
-            if field.casefold() in technical_fields:
-                continue
-            for match in quoted.finditer(line):
-                if line[match.end():].lstrip().startswith(":"):
+            field_match = re.match(r'''\s*["']?([a-zA-Z0-9_.-]+)["']?\s*[:=]''', line)
+            if field_match:
+                field = field_match.group(1).casefold()
+                active_field = ""
+                active_list_depth = 0
+                if field not in TRANSLATABLE_QUEST_FIELDS:
                     continue
+                fragment = line[field_match.end():]
+                list_depth = fragment.count("[") - fragment.count("]")
+                if list_depth > 0:
+                    active_field = field
+                    active_list_depth = list_depth
+            elif active_field:
+                field = active_field
+                fragment = line
+            else:
+                continue
+            for match in quoted.finditer(fragment):
                 try:
                     value = json.loads('"' + match.group(1) + '"')
                 except json.JSONDecodeError:
                     value = match.group(1).replace('\\"', '"')
                 if looks_english(value):
                     results.append((line_number, field, value))
+            if active_field:
+                active_list_depth += fragment.count("[") - fragment.count("]") if not field_match else 0
+                if active_list_depth <= 0:
+                    active_field = ""
+                    active_list_depth = 0
         return results
 
     def scan_quest_translations(directory, export_root, tasks):

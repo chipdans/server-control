@@ -133,7 +133,23 @@ class ProjectTests(unittest.TestCase):
                     json.dumps({"hello": "Привет, мир", "stone": "Stone"}, ensure_ascii=False),
                 )
             (pack / "config" / "ftbquests" / "quests" / "chapter.snbt").write_text(
-                'id: "1234"\ntitle: "Getting Started"\nitem: "minecraft:stone"\n',
+                'id: "1234"\n'
+                'dependencies: ["disabled"]\n'
+                'shape: "circle"\n'
+                'dependency_requirement: "linear"\n'
+                'title: "Getting Started"\n'
+                'description: [\n  "Build a safe shelter"\n]\n'
+                'item: "minecraft:stone"\n',
+                encoding="utf-8",
+            )
+            (pack / "config" / "ftbquests" / "quests" / "chapter.json").write_text(
+                json.dumps({
+                    "title": "Boss Fight",
+                    "dependencies": ["disabled"],
+                    "shape": "circle",
+                    "layout": "linear",
+                    "task": {"type": "item", "item": "minecraft:stone"},
+                }),
                 encoding="utf-8",
             )
             (pack / "config" / "ftbquests" / "quests" / "lang" / "en_us.snbt").write_text(
@@ -144,11 +160,14 @@ class ProjectTests(unittest.TestCase):
             mods = namespace["scan_mod_translations"](pack, export, tasks)  # type: ignore[operator]
             quests = namespace["scan_quest_translations"](pack, export, tasks)  # type: ignore[operator]
         self.assertEqual(mods["incomplete"][0]["needs_translation"], 1)
-        self.assertEqual(quests["files_with_tasks"], 2)
-        self.assertIn("Stone", {task["source_text"] for task in tasks})
-        self.assertIn("Getting Started", {task["source_text"] for task in tasks})
-        self.assertIn("Main Chapter", {task["source_text"] for task in tasks})
-        self.assertNotIn("minecraft:stone", {task["source_text"] for task in tasks})
+        self.assertEqual(quests["files_with_tasks"], 3)
+        texts = {task["source_text"] for task in tasks}
+        self.assertIn("Stone", texts)
+        self.assertIn("Getting Started", texts)
+        self.assertIn("Build a safe shelter", texts)
+        self.assertIn("Boss Fight", texts)
+        self.assertIn("Main Chapter", texts)
+        self.assertTrue({"minecraft:stone", "disabled", "circle", "linear"}.isdisjoint(texts))
 
     def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
         original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"
