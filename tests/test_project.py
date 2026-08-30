@@ -79,6 +79,14 @@ class ProjectTests(unittest.TestCase):
         }
         self.assertEqual(selected_minecraft_status(status, "dragonfyre")["name"], "Новая сборка")
 
+    def test_direct_dashboard_prefers_the_managed_instance_registry(self) -> None:
+        source = (ROOT / "desktop" / "direct_status.py").read_text(encoding="utf-8")
+        managed = 'Path("/var/lib/server-control-minecraft/instances.json")'
+        legacy = 'Path("/etc/server-control/minecraft-instances.json")'
+        self.assertIn(managed, source)
+        self.assertIn(legacy, source)
+        self.assertLess(source.index(managed), source.index(legacy))
+
     def test_translation_filter_removes_only_technical_values(self) -> None:
         ignored = [
             ("Ctrl + %s", "modifier.cloth-config.ctrl"),
