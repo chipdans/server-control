@@ -216,6 +216,7 @@ class LocalPreferences:
         "recent_files": [],
         "favourite_files": [],
         "recent_actions": [],
+        "translation_client_paths": {},
         "window_geometry": "1400x900",
     }
 

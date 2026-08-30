@@ -220,6 +220,24 @@ test("gzip JSON requests are decompressed with the normal size guard", async () 
   assert.equal((await response.json()).user.username, "compressed-owner");
 });
 
+test("password policy accepts six characters and rejects five", async () => {
+  const env = {
+    DB: new FakeD1(), JWT_SECRET: "x".repeat(48), BOOTSTRAP_KEY: "bootstrap-secret",
+    AGENT_API_KEY: "agent-secret", YANDEX_OAUTH_TOKEN: "not-used", YANDEX_DEVICE_ID: "not-used",
+  };
+  const short = await call(
+    env, "POST", "/v1/setup", { username: "owner", password: "12345" },
+    undefined, { "x-bootstrap-key": "bootstrap-secret" },
+  );
+  assert.equal(short.response.status, 400);
+  assert.equal(short.json.error, "weak_password");
+  const accepted = await call(
+    env, "POST", "/v1/setup", { username: "owner", password: "123456" },
+    undefined, { "x-bootstrap-key": "bootstrap-secret" },
+  );
+  assert.equal(accepted.response.status, 201);
+});
+
 test("disabled user loses access even with an already issued token", async () => {
   const env = {
     DB: new FakeD1(),

@@ -285,7 +285,7 @@ class UsersPage(BasePage):
         user_entry = enable_clipboard_paste(ttk.Entry(frame, textvariable=username, state="disabled" if existing else "normal"))
         user_entry.grid(row=0, column=1, sticky="ew", pady=4)
         if not existing:
-            ttk.Label(frame, text="Пароль (от 12 символов)").grid(row=1, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text="Пароль (от 6 символов)").grid(row=1, column=0, sticky="w", pady=4)
             enable_clipboard_paste(ttk.Entry(frame, textvariable=password, show="•")).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text="Набор прав").grid(row=2, column=0, sticky="w", pady=4)
         panel_user_is_owner = self.panel.state.user.get("role") == "owner"

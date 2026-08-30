@@ -37,7 +37,7 @@ from widgets import (
 )
 
 
-APP_VERSION = "2.0.0-beta.10"
+APP_VERSION = "2.0.0-beta.11"
 APP_TITLE = "Server Control"
 
 
@@ -272,7 +272,7 @@ class ServerControlApp:
         frame = ttk.Frame(dialog, padding=20)
         frame.pack(fill="both", expand=True)
         variables = (tk.StringVar(), tk.StringVar(), tk.StringVar())
-        for row, (label, variable, secret) in enumerate((("BOOTSTRAP_KEY", variables[0], True), ("Логин владельца", variables[1], False), ("Пароль (от 12 символов)", variables[2], True))):
+        for row, (label, variable, secret) in enumerate((("BOOTSTRAP_KEY", variables[0], True), ("Логин владельца", variables[1], False), ("Пароль (от 6 символов)", variables[2], True))):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=5)
             enable_clipboard_paste(ttk.Entry(frame, textvariable=variable, show="•" if secret else "", width=36)).grid(row=row, column=1, sticky="ew", pady=5)
 

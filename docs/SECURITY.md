@@ -17,7 +17,7 @@ administrative security boundaries.
 ## Accounts and sessions
 
 - Passwords use PBKDF2-HMAC-SHA-256 with a random per-user salt and 100,000
-  iterations. Password length is 12–128 characters.
+  iterations. Password length is 6–128 characters.
 - Access tokens are signed, time-limited and contain a token version. Every
   request reloads the user from D1 and checks `enabled` and token version.
 - Disable, password reset, revoke-all or permission update increments the token

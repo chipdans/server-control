@@ -143,7 +143,7 @@ class UsersPage(BasePage):
         ttk.Label(frame, text="Логин").grid(row=0, column=0, sticky="w", pady=5)
         enable_clipboard_paste(ttk.Entry(frame, textvariable=username, width=36)).grid(row=0, column=1, sticky="ew", pady=5)
         if not existing:
-            ttk.Label(frame, text="Пароль (от 12 символов)").grid(row=1, column=0, sticky="w", pady=5)
+            ttk.Label(frame, text="Пароль (от 6 символов)").grid(row=1, column=0, sticky="w", pady=5)
             enable_clipboard_paste(ttk.Entry(frame, textvariable=password, show="•", width=36)).grid(row=1, column=1, sticky="ew", pady=5)
         ttk.Label(frame, text="Готовый набор").grid(row=2, column=0, sticky="w", pady=5)
         preset_box = ttk.Combobox(frame, textvariable=preset, values=tuple(PRESETS), state="readonly")
@@ -219,7 +219,7 @@ class UsersPage(BasePage):
             self.panel.select_page("account")
             return
         password = simpledialog.askstring(
-            "Новый пароль", f"Новый пароль для {user.get('username')} (минимум 12 символов)", show="•", parent=self
+            "Новый пароль", f"Новый пароль для {user.get('username')} (минимум 6 символов)", show="•", parent=self
         )
         if not password:
             return

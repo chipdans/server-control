@@ -1129,8 +1129,8 @@ function validateUsername(value) {
 }
 
 function validatePassword(value) {
-  if (typeof value !== "string" || value.length < 12 || value.length > 128) {
-    throw new ApiError(400, "weak_password", "Пароль должен содержать от 12 до 128 символов.");
+  if (typeof value !== "string" || value.length < 6 || value.length > 128) {
+    throw new ApiError(400, "weak_password", "Пароль должен содержать от 6 до 128 символов.");
   }
   return value;
 }

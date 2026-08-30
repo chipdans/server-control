@@ -52,6 +52,7 @@ from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
 from direct_instances import MANAGED_INSTANCE_RUNNER_PROGRAM, REMOTE_INSTANCE_MANAGER_PROGRAM, manager_command  # noqa: E402
 from direct_status import dashboard_envelope  # noqa: E402
+from local_translation import build_combined_translation_export  # noqa: E402
 from pages_instances_v2 import parse_server_properties, update_server_properties  # noqa: E402
 from state import AppState  # noqa: E402
 from ssh_terminal import connection_targets  # noqa: E402
@@ -168,6 +169,61 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("Boss Fight", texts)
         self.assertIn("Main Chapter", texts)
         self.assertTrue({"minecraft:stone", "disabled", "circle", "linear"}.isdisjoint(texts))
+
+    def test_client_translation_export_applies_only_enabled_resourcepacks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = root / "client"
+            (client / "mods").mkdir(parents=True)
+            (client / "resourcepacks").mkdir()
+            with zipfile.ZipFile(client / "mods" / "example.jar", "w") as jar:
+                jar.writestr(
+                    "assets/example/lang/en_us.json",
+                    json.dumps({"hello": "Hello world", "stone": "Stone Block", "axe": "Battle Axe"}),
+                )
+                jar.writestr(
+                    "assets/example/lang/ru_ru.json",
+                    json.dumps({"hello": "Привет, мир", "stone": "Stone Block"}, ensure_ascii=False),
+                )
+            with zipfile.ZipFile(client / "resourcepacks" / "active.zip", "w") as pack:
+                pack.writestr(
+                    "assets/example/lang/ru_ru.json",
+                    json.dumps({"stone": "Каменный блок"}, ensure_ascii=False),
+                )
+            with zipfile.ZipFile(client / "resourcepacks" / "disabled.zip", "w") as pack:
+                pack.writestr(
+                    "assets/example/lang/ru_ru.json",
+                    json.dumps({"axe": "Боевой топор"}, ensure_ascii=False),
+                )
+            (client / "options.txt").write_text('resourcePacks:["vanilla","file/active.zip"]\n', encoding="utf-8")
+
+            server_archive = root / "server.zip"
+            quest_task = {
+                "task_id": "translation-000001",
+                "kind": "quest_text",
+                "source_text": "Server Quest",
+            }
+            with zipfile.ZipFile(server_archive, "w") as archive:
+                archive.writestr(
+                    "translation-export/manifest.json",
+                    json.dumps({
+                        "instance": {"id": "example", "name": "Example"},
+                        "statistics": {"quests": {"files_with_tasks": 1}},
+                    }),
+                )
+                archive.writestr("translation-export/translation_tasks.json", json.dumps([quest_task]))
+
+            destination = root / "translation.zip"
+            result = build_combined_translation_export(client, server_archive, destination)
+            with zipfile.ZipFile(destination) as archive:
+                tasks = json.loads(archive.read("translation-export/translation_tasks.json"))
+                manifest = json.loads(archive.read("translation-export/manifest.json"))
+
+        self.assertEqual(result["tasks"], 2)
+        self.assertEqual([task["source_text"] for task in tasks], ["Server Quest", "Battle Axe"])
+        self.assertEqual(tasks[1]["task_id"], "translation-000002")
+        self.assertEqual(manifest["client_scan"]["enabled_resourcepacks"], ["active.zip"])
+        self.assertEqual(manifest["statistics"]["mods"]["incomplete"][0]["needs_translation"], 1)
 
     def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
         original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"

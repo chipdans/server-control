@@ -164,7 +164,7 @@ not write its health marker.
 
 1. Start `ServerControl.exe`.
 2. Choose **Первоначальная настройка**.
-3. Enter the saved `BOOTSTRAP_KEY`, owner login and a 12–128 character password.
+3. Enter the saved `BOOTSTRAP_KEY`, owner login and a 6–128 character password.
 4. Open **Пользователи** and assign an exact preset or granular permissions.
 5. Revoke `BOOTSTRAP_KEY` from Cloudflare after setup if you do not need to keep
    it; the API also refuses a second owner bootstrap while an owner exists.

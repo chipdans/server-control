@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from pages_base import BasePage
+from local_translation import discover_client_instances
 from widgets import TransferProgress, enable_clipboard_paste
 
 
@@ -960,6 +961,75 @@ class InstancesPage(BasePage):
         item = self.selected()
         if not item:
             return
+        saved_paths = self.panel.preferences.get("translation_client_paths", {})
+        saved = str(saved_paths.get(str(item["id"]), "")) if isinstance(saved_paths, dict) else ""
+        discovered = discover_client_instances()
+        choices = [str(path) for path in discovered]
+        if saved and saved not in choices:
+            choices.insert(0, saved)
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Клиентская сборка для проверки")
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+        dialog.geometry("720x285")
+        frame = ttk.Frame(dialog, style="Card.TFrame", padding=22)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Выберите папку клиентской сборки", style="CardValue.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Моды и русификаторы будут проверены на этом компьютере. Квесты приложение возьмёт с выбранной серверной сборки.",
+            style="SurfaceSubtle.TLabel",
+            wraplength=660,
+        ).pack(anchor="w", pady=(6, 14))
+        client_path = tk.StringVar(value=saved or (choices[0] if choices else ""))
+        path_row = ttk.Frame(frame, style="Surface.TFrame")
+        path_row.pack(fill="x")
+        path_box = ttk.Combobox(path_row, textvariable=client_path, values=choices)
+        path_box.pack(side="left", fill="x", expand=True)
+
+        def browse() -> None:
+            selected = filedialog.askdirectory(
+                parent=dialog,
+                title="Корень клиентской сборки Minecraft",
+                initialdir=client_path.get() or None,
+            )
+            if selected:
+                client_path.set(selected)
+
+        ttk.Button(path_row, text="Обзор…", command=browse).pack(side="left", padx=(8, 0))
+        detected_text = (
+            f"Автоматически найдено профилей: {len(choices)}. Учитываются встроенные переводы, KubeJS, OpenLoader и активные ресурспаки."
+            if choices else
+            "Профили автоматически не найдены. Нажмите «Обзор» и выберите папку, внутри которой находится каталог mods."
+        )
+        ttk.Label(frame, text=detected_text, style="SurfaceSubtle.TLabel", wraplength=660).pack(anchor="w", pady=(12, 0))
+        footer = ttk.Frame(frame, style="Surface.TFrame")
+        footer.pack(side="bottom", fill="x")
+        ttk.Button(footer, text="Отмена", command=dialog.destroy).pack(side="right")
+
+        def submit() -> None:
+            try:
+                root = Path(client_path.get()).expanduser().resolve(strict=True)
+            except OSError as error:
+                messagebox.showerror("Клиентская сборка", f"Папка недоступна:\n{error}", parent=dialog)
+                return
+            if not (root / "mods").is_dir():
+                messagebox.showerror(
+                    "Клиентская сборка",
+                    "В выбранной папке нет каталога mods. Выберите корень профиля Minecraft.",
+                    parent=dialog,
+                )
+                return
+            values = dict(saved_paths) if isinstance(saved_paths, dict) else {}
+            values[str(item["id"])] = str(root)
+            self.panel.preferences.set("translation_client_paths", values)
+            dialog.destroy()
+            self._run_translation_export(item, root)
+
+        ttk.Button(footer, text="Продолжить", style="Accent.TButton", command=submit).pack(side="right", padx=(0, 8))
+
+    def _run_translation_export(self, item: dict[str, Any], client_directory: Path) -> None:
         destination = filedialog.asksaveasfilename(
             parent=self,
             title="Сохранить материалы для перевода",
@@ -973,25 +1043,34 @@ class InstancesPage(BasePage):
         transfer.update_job({
             "stage": "scan",
             "progress": 5,
-            "message": "Проверяю языковые файлы модов и тексты квестов на сервере…",
+            "message": "Получаю актуальные квесты с сервера…",
         })
 
         def download_progress(current: int, total: int) -> None:
-            percent = 20 + (80 * current / total if total else 0)
+            percent = 10 + (20 * current / total if total else 0)
             transfer.update_job({
                 "stage": "download",
                 "progress": percent,
-                "message": "Скачиваю готовый ZIP с материалами для перевода…",
+                "message": "Скачиваю задания квестов…",
                 "transferred_bytes": current,
                 "total_bytes": total,
+            })
+
+        def scan_progress(percent: float, message: str) -> None:
+            transfer.update_job({
+                "stage": "client_scan",
+                "progress": 30 + max(0.0, min(100.0, percent)) * 0.69,
+                "message": message,
             })
 
         def work() -> dict[str, Any]:
             return self.panel.direct_status.export_translation_archive(
                 self._credentials,
                 str(item["id"]),
+                client_directory,
                 destination,
                 progress=download_progress,
+                scan_progress=scan_progress,
                 cancelled=transfer.cancelled,
                 paused=transfer.paused,
             )
@@ -1003,7 +1082,17 @@ class InstancesPage(BasePage):
             tasks = int(result.get("tasks") or 0)
             mods = int(result.get("mods_incomplete") or 0)
             quests = int(result.get("quest_files") or 0)
-            message = f"Найдено строк: {tasks}\nМодов с неполным переводом: {mods}\nФайлов квестов: {quests}\n\nАрхив сохранён:\n{destination}"
+            client = mapping(result.get("client"))
+            packs = client.get("enabled_resourcepacks") if isinstance(client.get("enabled_resourcepacks"), list) else []
+            message = (
+                f"Найдено строк: {tasks}\n"
+                f"Модов с неполным итоговым переводом: {mods}\n"
+                f"Файлов серверных квестов: {quests}\n"
+                f"Учтено активных ресурспаков: {len(packs)}\n\n"
+                f"Архив сохранён:\n{destination}"
+            )
+            if client.get("resourcepack_mode") == "all_installed_options_missing":
+                message += "\n\nФайл options.txt не найден: учтены все установленные ресурспаки."
             if result.get("task_limit_reached"):
                 message += "\n\nДостигнут предел 250 000 строк; это отмечено в отчёте."
             self.status_var.set(f"Архив перевода готов · строк: {tasks}")

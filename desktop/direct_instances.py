@@ -947,7 +947,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
             "errors": errors[:200],
         }
 
-    def build_translation_export(value):
+    def build_translation_export(value, include_mods=True):
         directory = safe_directory(value["directory"])
         for stale in Path("/var/tmp").glob("server-control-translation-*.zip"):
             try:
@@ -960,7 +960,12 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         with tempfile.TemporaryDirectory(prefix="server-control-translation-") as temporary:
             export_root = Path(temporary) / "translation-export"
             export_root.mkdir(parents=True)
-            mods = scan_mod_translations(directory, export_root, tasks)
+            mods = scan_mod_translations(directory, export_root, tasks) if include_mods else {
+                "jars_scanned": 0,
+                "lang_files_scanned": 0,
+                "incomplete": [],
+                "errors": [],
+            }
             quests = scan_quest_translations(directory, export_root, tasks)
             manifest = {
                 "format": "server-control-translation-export-v1",
@@ -1112,7 +1117,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
 
         if action == "translation_scan":
             value = find(data, payload.get("id"))
-            result = build_translation_export(value)
+            result = build_translation_export(value, include_mods=bool(payload.get("include_mods", True)))
             return {"ok": True, "instance_id": value["id"], **result}
 
         if action == "translation_cleanup":
