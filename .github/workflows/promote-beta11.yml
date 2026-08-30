@@ -1,0 +1,18 @@
+name: Promote Server Control beta 11
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/promote-beta11.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark beta 11 as latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit v2.0.0-beta.11 --repo "${{ github.repository }}" --prerelease=false --latest
