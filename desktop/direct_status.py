@@ -278,10 +278,19 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             "id": "dragonfyre", "name": "Dragonfyre",
             "directory": "/opt/minecraft/dragonfyre", "port": 25565,
         }
-        path = Path("/etc/server-control/minecraft-instances.json")
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        data = None
+        for path in (
+            Path("/var/lib/server-control-minecraft/instances.json"),
+            Path("/etc/server-control/minecraft-instances.json"),
+        ):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate, dict):
+                data = candidate
+                break
+        if data is None:
             return fallback
         values = data.get("instances") if isinstance(data.get("instances"), list) else []
         active = str(data.get("active") or "")
