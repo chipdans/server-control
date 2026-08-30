@@ -24,10 +24,11 @@ ENGLISH_GRAMMAR_WORDS = {
     "let", "me", "not", "of", "on", "only", "or", "that", "the", "this", "to", "use",
     "was", "when", "will", "with", "you", "your",
 }
-VISIBLE_OBJECT_KEY_PREFIXES = (
-    "advancement.", "affix.", "biome.", "block.", "effect.", "enchantment.", "entity.",
-    "gem_", "gui.", "item.", "message.", "mob.", "perk.", "quest.", "stat.", "tooltip.",
-)
+NONTRANSLATABLE_KEY_PARTS = ("__comment", ".author", ".credits", ".hex", ".keybind.")
+NONTRANSLATABLE_EXACT_VALUES = {
+    "9minecraft", "aether", "advanced netherite", "ftb library", "killer queen",
+    "modid", "patchouli", "some text here", "the aether", "weezer",
+}
 
 
 def _normalized(value: Any) -> str:
@@ -52,15 +53,26 @@ def _looks_english(value: Any) -> bool:
 def _nontranslatable_value(value: Any, key: Any = "") -> bool:
     text = re.sub(r"§.", "", str(value or "")).strip()
     lowered_key = str(key or "").casefold()
-    if not text or lowered_key in {"_comment", "comment", "credits", "author"}:
+    if (
+        not text
+        or lowered_key in {"_comment", "comment", "credits", "author"}
+        or any(part in lowered_key for part in NONTRANSLATABLE_KEY_PARTS)
+        or _normalized(text) in NONTRANSLATABLE_EXACT_VALUES
+    ):
         return True
     if re.fullmatch(r"[MDCLXVI]+", text):
         return True
-    if re.fullmatch(r"[\[(]?(?:SHIFT|CTRL|CONTROL|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})[\])]?", text, re.IGNORECASE):
+    if re.fullmatch(r"(?:[\[(])?(?:(?:SHIFT|CTRL|CONTROL|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})(?:\s*\+?\s*|\+))+(?:%s)?(?:[\])])?", text, re.IGNORECASE):
         return True
     if text.casefold() in {"true", "false", "on", "off", "yes", "no", "default", "none", "auto", "enabled", "disabled"}:
         return True
-    if re.fullmatch(r"(?:https?://\S+|[a-z0-9_.-]+:[a-z0-9_./-]+|/[a-z0-9_./#:-]+)", text, re.IGNORECASE):
+    if re.fullmatch(r"(?:https?://\S+|[a-z0-9_.-]+:[a-z0-9_./-]+)", text, re.IGNORECASE):
+        return True
+    if text.startswith("/") and "command" in lowered_key and ("usage" in lowered_key or "syntax" in lowered_key):
+        return True
+    if lowered_key.endswith((".color", ".colour")) and re.fullmatch(r"#?[0-9a-f]{6,8}", text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"\[[A-Za-z0-9_. -]+\](?:\\n|\n)", text):
         return True
     if re.fullmatch(r"[dMyHhmsS:/ ._-]{4,}", text) and re.search(r"[dMyHhmsS]", text):
         return True
@@ -91,7 +103,7 @@ def _mixed_english_review(value: Any) -> bool:
 
 def _ambiguous_short_name(value: Any, key: Any) -> bool:
     words = re.findall(r"[A-Za-z][A-Za-z'’-]*", str(value or ""))
-    if not 1 <= len(words) <= 4 or str(key or "").casefold().startswith(VISIBLE_OBJECT_KEY_PREFIXES):
+    if not 1 <= len(words) <= 4:
         return False
     return all(word[:1].isupper() or word.isupper() for word in words)
 
