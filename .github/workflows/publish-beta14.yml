@@ -1,4 +1,4 @@
-name: Publish beta 14
+name: Promote beta 14
 
 on:
   push:
@@ -9,22 +9,12 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
-  publish:
+  promote:
     runs-on: ubuntu-latest
     steps:
-      - name: Create release tag
+      - name: Make release latest
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v2.0.0-beta.14
-        run: |
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/${TAG}" \
-            -f sha="${GITHUB_SHA}"
-
-      - name: Start release build
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref main -f tag=v2.0.0-beta.14
+        run: gh release edit v2.0.0-beta.14 --repo "${GITHUB_REPOSITORY}" --prerelease=false --latest
