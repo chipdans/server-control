@@ -148,6 +148,11 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
     MAX_EXTRACTED_BYTES = 40 * 1024 * 1024 * 1024
     MAX_ARCHIVE_FILES = 250000
     MAX_PROPERTIES_BYTES = 1024 * 1024
+    MAX_TRANSLATION_TASKS = 250000
+    MAX_TRANSLATION_ARCHIVE_BYTES = 512 * 1024 * 1024
+    MAX_LANG_FILE_BYTES = 8 * 1024 * 1024
+    MAX_QUEST_FILE_BYTES = 16 * 1024 * 1024
+    MAX_QUEST_FILES = 10000
 
     RUNNER_PROGRAM = __RUNNER_PROGRAM__
 
@@ -568,6 +573,449 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
             shutil.rmtree(staging)
             temporary.rename(staging)
 
+    def safe_export_name(value):
+        result = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value or "")).strip("._")
+        return result[:120] or "unknown"
+
+    def write_export_json(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def parse_language_payload(payload, suffix):
+        text = payload.decode("utf-8-sig", "replace")
+        if suffix.casefold() == ".json":
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                return {}
+            if not isinstance(value, dict):
+                return {}
+            return {str(key): str(item) for key, item in value.items() if isinstance(item, (str, int, float, bool))}
+        values = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "!", "//")):
+                continue
+            key, separator, value = line.partition("=")
+            if not separator:
+                key, separator, value = line.partition(":")
+            key = key.strip().strip('"\'')
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                try:
+                    value = json.loads(value) if value[0] == '"' else value[1:-1]
+                except json.JSONDecodeError:
+                    value = value[1:-1]
+            if separator and key:
+                values[key] = str(value)
+        return values
+
+    def normalized_translation(value):
+        text = re.sub(r"§.", "", str(value or ""))
+        text = re.sub(r"%(?:\d+\$)?[a-zA-Z%]", "", text)
+        text = re.sub(r"\{[^{}]*\}", "", text)
+        return re.sub(r"\s+", " ", text).strip().casefold()
+
+    def looks_english(value):
+        text = normalized_translation(value)
+        latin_words = re.findall(r"[a-zA-Z]{3,}", text)
+        if not latin_words:
+            return False
+        if re.search(r"[а-яё]", text, re.IGNORECASE):
+            return len(latin_words) >= 2 or sum(len(word) for word in latin_words) >= 12
+        if not re.search(r"\s", text) and re.fullmatch(r"[a-z0-9_.:/+@#-]+", text, re.IGNORECASE) and re.search(r"[_.:/]", text):
+            return False
+        return True
+
+    def translation_reason(source, current):
+        if current is None:
+            return "missing" if looks_english(source) else ""
+        source_normalized = normalized_translation(source)
+        current_normalized = normalized_translation(current)
+        if source_normalized and source_normalized == current_normalized and looks_english(source):
+            return "identical_to_english"
+        if looks_english(current):
+            return "contains_english"
+        return ""
+
+    def append_translation_task(tasks, task):
+        if len(tasks) >= MAX_TRANSLATION_TASKS:
+            return False
+        value = dict(task)
+        value["task_id"] = "translation-%06d" % (len(tasks) + 1)
+        tasks.append(value)
+        return True
+
+    def scan_mod_translations(directory, export_root, tasks):
+        mods_dir = directory / "mods"
+        summaries = []
+        jars_scanned = 0
+        lang_files_scanned = 0
+        errors = []
+        if not mods_dir.is_dir():
+            return {"jars_scanned": 0, "lang_files_scanned": 0, "incomplete": [], "errors": []}
+        for jar_index, jar in enumerate(sorted(mods_dir.glob("*.jar"), key=lambda path: path.name.casefold())[:2000], start=1):
+            if jar.is_symlink() or not jar.is_file():
+                continue
+            jars_scanned += 1
+            try:
+                with zipfile.ZipFile(jar) as source_zip:
+                    names = set(source_zip.namelist())
+                    english_files = sorted(
+                        name for name in names
+                        if re.fullmatch(r"assets/[^/]+/lang/en_us\.(?:json|lang)", name, re.IGNORECASE)
+                    )
+                    for english_name in english_files:
+                        info = source_zip.getinfo(english_name)
+                        if info.file_size > MAX_LANG_FILE_BYTES:
+                            errors.append(jar.name + ": " + english_name + " больше 8 MB")
+                            continue
+                        lang_files_scanned += 1
+                        suffix = Path(english_name).suffix.casefold()
+                        english = parse_language_payload(source_zip.read(info), suffix)
+                        if not english:
+                            continue
+                        namespace = english_name.split("/")[1]
+                        russian_candidates = [
+                            english_name.replace("en_us" + suffix, "ru_ru" + suffix),
+                            english_name.rsplit("/", 1)[0] + "/ru_ru.json",
+                            english_name.rsplit("/", 1)[0] + "/ru_ru.lang",
+                        ]
+                        russian = {}
+                        russian_name = ""
+                        for candidate in russian_candidates:
+                            if candidate not in names:
+                                continue
+                            candidate_info = source_zip.getinfo(candidate)
+                            if candidate_info.file_size <= MAX_LANG_FILE_BYTES:
+                                russian = parse_language_payload(source_zip.read(candidate_info), Path(candidate).suffix)
+                                russian_name = candidate
+                                break
+                        missing = {}
+                        reason_counts = {"missing": 0, "identical_to_english": 0, "contains_english": 0}
+                        for key, english_text in english.items():
+                            current = russian.get(key)
+                            reason = translation_reason(english_text, current)
+                            if not reason:
+                                continue
+                            reason_counts[reason] += 1
+                            missing[key] = english_text
+                            append_translation_task(tasks, {
+                                "kind": "mod_language",
+                                "reason": reason,
+                                "source_file": jar.name + "!/" + english_name,
+                                "target_file": jar.name + "!/" + english_name.replace("en_us", "ru_ru"),
+                                "namespace": namespace,
+                                "key": key,
+                                "source_text": english_text,
+                                "current_text": current,
+                            })
+                        if not missing:
+                            continue
+                        target = export_root / "mods" / ("%03d_%s" % (jar_index, safe_export_name(jar.stem))) / safe_export_name(namespace)
+                        write_export_json(target / "en_us.json", english)
+                        write_export_json(target / "current_ru_ru.json", russian)
+                        write_export_json(target / "translation_template_ru_ru.json", {**russian, **missing})
+                        summary = {
+                            "jar": jar.name,
+                            "namespace": namespace,
+                            "english_file": english_name,
+                            "russian_file": russian_name or None,
+                            "english_keys": len(english),
+                            "russian_keys": len(russian),
+                            "needs_translation": len(missing),
+                            "reasons": reason_counts,
+                            "template": str((target / "translation_template_ru_ru.json").relative_to(export_root)),
+                        }
+                        summaries.append(summary)
+            except (OSError, zipfile.BadZipFile, KeyError, RuntimeError) as error:
+                errors.append(jar.name + ": " + str(error))
+        return {
+            "jars_scanned": jars_scanned,
+            "lang_files_scanned": lang_files_scanned,
+            "incomplete": summaries,
+            "errors": errors[:200],
+        }
+
+    def quest_candidate_files(directory):
+        roots = [
+            directory / "config" / "ftbquests",
+            directory / "defaultconfigs" / "ftbquests",
+            directory / "world" / "serverconfig" / "ftbquests",
+            directory / "config" / "betterquesting",
+            directory / "kubejs" / "data",
+        ]
+        candidates = []
+        seen = set()
+        for root in roots:
+            if not root.is_dir() or root.is_symlink():
+                continue
+            try:
+                iterator = root.rglob("*")
+                for path in iterator:
+                    if len(candidates) >= MAX_QUEST_FILES:
+                        return candidates, True
+                    if path.is_symlink() or not path.is_file() or path.suffix.casefold() not in {".snbt", ".json", ".json5", ".lang"}:
+                        continue
+                    relative = path.relative_to(directory).as_posix()
+                    lowered = relative.casefold()
+                    if root == directory / "kubejs" / "data" and not any(token in lowered for token in ("ftbquest", "/quests/", "/quest/")):
+                        continue
+                    if relative not in seen:
+                        seen.add(relative)
+                        candidates.append(path)
+            except OSError:
+                continue
+        return candidates, False
+
+    def quest_json_strings(value, path=()):
+        results = []
+        if isinstance(value, dict):
+            for key, item in value.items():
+                results.extend(quest_json_strings(item, (*path, str(key))))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                results.extend(quest_json_strings(item, (*path, str(index))))
+        elif isinstance(value, str) and looks_english(value):
+            technical = {"id", "type", "icon", "item", "fluid", "entity", "command", "dependency", "filename", "path"}
+            if not path or not any(part.casefold() in technical for part in path[-2:]):
+                results.append((".".join(path), value))
+        return results
+
+    def quest_text_strings(content):
+        results = []
+        technical_fields = {"id", "type", "icon", "item", "fluid", "entity", "command", "dependency", "filename", "path", "shape"}
+        quoted = re.compile(r'"((?:\\.|[^"\\])*)"')
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            field_match = re.match(r"\s*([a-zA-Z0-9_.-]+)\s*[:=]", line)
+            field = field_match.group(1) if field_match else ""
+            if field.casefold() in technical_fields:
+                continue
+            for match in quoted.finditer(line):
+                if line[match.end():].lstrip().startswith(":"):
+                    continue
+                try:
+                    value = json.loads('"' + match.group(1) + '"')
+                except json.JSONDecodeError:
+                    value = match.group(1).replace('\\"', '"')
+                if looks_english(value):
+                    results.append((line_number, field, value))
+        return results
+
+    def scan_quest_translations(directory, export_root, tasks):
+        candidates, file_limit_reached = quest_candidate_files(directory)
+        files_scanned = 0
+        files_with_tasks = 0
+        strings_found = 0
+        errors = []
+        copied = []
+        language_sets = []
+        handled = set()
+        candidate_set = {str(path): path for path in candidates}
+        for english_path in candidates:
+            if english_path.stem.casefold() != "en_us":
+                continue
+            try:
+                if english_path.stat().st_size > MAX_LANG_FILE_BYTES:
+                    continue
+                english = parse_language_payload(english_path.read_bytes(), english_path.suffix)
+            except OSError:
+                continue
+            if not english:
+                continue
+            russian_path = None
+            for suffix in (english_path.suffix, ".json", ".snbt", ".lang"):
+                candidate = english_path.with_name("ru_ru" + suffix)
+                if str(candidate) in candidate_set:
+                    russian_path = candidate
+                    break
+            russian = {}
+            if russian_path is not None:
+                try:
+                    if russian_path.stat().st_size <= MAX_LANG_FILE_BYTES:
+                        russian = parse_language_payload(russian_path.read_bytes(), russian_path.suffix)
+                except OSError:
+                    russian = {}
+            relative = english_path.relative_to(directory).as_posix()
+            missing = {}
+            reasons = {"missing": 0, "identical_to_english": 0, "contains_english": 0}
+            for key, english_text in english.items():
+                current = russian.get(key)
+                reason = translation_reason(english_text, current)
+                if not reason:
+                    continue
+                reasons[reason] += 1
+                missing[key] = english_text
+                append_translation_task(tasks, {
+                    "kind": "quest_language",
+                    "reason": reason,
+                    "source_file": relative,
+                    "target_file": str(english_path.with_name("ru_ru" + english_path.suffix).relative_to(directory).as_posix()),
+                    "key": key,
+                    "source_text": english_text,
+                    "current_text": current,
+                })
+            handled.add(str(english_path))
+            if russian_path is not None:
+                handled.add(str(russian_path))
+            files_scanned += 1 + (1 if russian_path is not None else 0)
+            if not missing:
+                continue
+            files_with_tasks += 1
+            strings_found += len(missing)
+            target = export_root / "quests" / "lang" / ("%03d_%s" % (len(language_sets) + 1, safe_export_name(english_path.parent.name)))
+            write_export_json(target / "en_us.json", english)
+            write_export_json(target / "current_ru_ru.json", russian)
+            write_export_json(target / "translation_template_ru_ru.json", {**russian, **missing})
+            language_sets.append({
+                "english_file": relative,
+                "russian_file": russian_path.relative_to(directory).as_posix() if russian_path is not None else None,
+                "needs_translation": len(missing),
+                "reasons": reasons,
+                "template": str((target / "translation_template_ru_ru.json").relative_to(export_root)),
+            })
+        for path in candidates:
+            if str(path) in handled:
+                continue
+            try:
+                if path.stat().st_size > MAX_QUEST_FILE_BYTES:
+                    errors.append(path.relative_to(directory).as_posix() + ": файл больше 16 MB")
+                    continue
+                content = path.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError as error:
+                errors.append(str(path) + ": " + str(error))
+                continue
+            files_scanned += 1
+            relative = path.relative_to(directory).as_posix()
+            found = []
+            if path.suffix.casefold() == ".json":
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError:
+                    parsed = None
+                if parsed is not None:
+                    found = [(None, field, text) for field, text in quest_json_strings(parsed)]
+            if not found:
+                found = quest_text_strings(content)
+            if not found:
+                continue
+            files_with_tasks += 1
+            strings_found += len(found)
+            target = export_root / "quests" / "source" / Path(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            copied.append(relative)
+            for line_number, field, text in found:
+                append_translation_task(tasks, {
+                    "kind": "quest_text",
+                    "reason": "contains_english",
+                    "source_file": relative,
+                    "line": line_number,
+                    "field": field or None,
+                    "source_text": text,
+                    "current_text": None,
+                })
+        return {
+            "files_scanned": files_scanned,
+            "files_with_tasks": files_with_tasks,
+            "strings_found": strings_found,
+            "source_files": copied,
+            "language_sets": language_sets,
+            "file_limit_reached": file_limit_reached,
+            "errors": errors[:200],
+        }
+
+    def build_translation_export(value):
+        directory = safe_directory(value["directory"])
+        for stale in Path("/var/tmp").glob("server-control-translation-*.zip"):
+            try:
+                if re.fullmatch(r"server-control-translation-[0-9a-f]{32}\.zip", stale.name) and time.time() - stale.stat().st_mtime > 86400:
+                    stale.unlink()
+            except OSError:
+                pass
+        export_path = Path("/var/tmp/server-control-translation-" + uuid.uuid4().hex + ".zip")
+        tasks = []
+        with tempfile.TemporaryDirectory(prefix="server-control-translation-") as temporary:
+            export_root = Path(temporary) / "translation-export"
+            export_root.mkdir(parents=True)
+            mods = scan_mod_translations(directory, export_root, tasks)
+            quests = scan_quest_translations(directory, export_root, tasks)
+            manifest = {
+                "format": "server-control-translation-export-v1",
+                "generated_at": int(time.time()),
+                "instance": {
+                    "id": value["id"],
+                    "name": value.get("name"),
+                    "minecraft_version": value.get("minecraft_version"),
+                    "loader": value.get("loader"),
+                    "loader_version": value.get("loader_version"),
+                },
+                "statistics": {
+                    "translation_tasks": len(tasks),
+                    "task_limit_reached": len(tasks) >= MAX_TRANSLATION_TASKS,
+                    "mods": mods,
+                    "quests": quests,
+                },
+            }
+            write_export_json(export_root / "manifest.json", manifest)
+            write_export_json(export_root / "translation_tasks.json", tasks)
+            report = [
+                "# Проверка перевода Minecraft-сборки",
+                "",
+                "Сборка: %s (`%s`)" % (value.get("name") or value["id"], value["id"]),
+                "",
+                "- Просканировано JAR модов: %d" % mods["jars_scanned"],
+                "- Модов/пространств с неполным переводом: %d" % len(mods["incomplete"]),
+                "- Просканировано файлов квестов: %d" % quests["files_scanned"],
+                "- Файлов квестов с английским текстом: %d" % quests["files_with_tasks"],
+                "- Всего заданий на перевод: %d" % len(tasks),
+                "",
+                "## Неполные переводы модов",
+                "",
+            ]
+            for item in mods["incomplete"]:
+                report.append("- `%s` / `%s`: %d строк → `%s`" % (
+                    item["jar"], item["namespace"], item["needs_translation"], item["template"],
+                ))
+            report.extend([
+                "",
+                "## Как использовать архив",
+                "",
+                "Передайте весь ZIP для перевода. Ключи JSON, task_id, пути и формат файлов менять нельзя; переводится только текст.",
+                "Файлы `translation_template_ru_ru.json` содержат существующий русский перевод и английские строки, которые нужно заменить.",
+                "В `quests/source` лежат только файлы квестов, где найден вероятно непереведённый текст.",
+                "",
+            ])
+            (export_root / "REPORT.md").write_text("\n".join(report), encoding="utf-8")
+            (export_root / "README.txt").write_text(
+                "Отправьте этот ZIP в ChatGPT и попросите перевести все задания из translation_tasks.json.\n"
+                "Сохраняйте ключи, task_id, управляющие коды, плейсхолдеры (%s, %1$s, {0}) и структуру файлов.\n",
+                encoding="utf-8",
+            )
+            temporary_zip = export_path.with_suffix(".tmp")
+            try:
+                with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
+                    for path in sorted(export_root.rglob("*")):
+                        if path.is_file() and not path.is_symlink():
+                            output.write(path, (Path("translation-export") / path.relative_to(export_root)).as_posix())
+                if temporary_zip.stat().st_size > MAX_TRANSLATION_ARCHIVE_BYTES:
+                    raise ValueError("Архив перевода больше допустимого размера 512 MB")
+                os.chmod(temporary_zip, 0o644)
+                os.replace(temporary_zip, export_path)
+            finally:
+                try:
+                    temporary_zip.unlink()
+                except OSError:
+                    pass
+        return {
+            "archive": str(export_path),
+            "size": export_path.stat().st_size,
+            "tasks": len(tasks),
+            "mods_incomplete": len(mods["incomplete"]),
+            "quest_files": quests["files_with_tasks"],
+            "task_limit_reached": len(tasks) >= MAX_TRANSLATION_TASKS,
+        }
+
     def dispatch(payload, data):
         action = str(payload.get("action") or "list")
         if action == "list":
@@ -639,6 +1087,21 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                 "content_sha256": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
                 **public_list(data),
             }
+
+        if action == "translation_scan":
+            value = find(data, payload.get("id"))
+            result = build_translation_export(value)
+            return {"ok": True, "instance_id": value["id"], **result}
+
+        if action == "translation_cleanup":
+            archive = Path(str(payload.get("archive") or ""))
+            if not re.fullmatch(r"/var/tmp/server-control-translation-[0-9a-f]{32}\.zip", str(archive)):
+                raise ValueError("Некорректный путь архива перевода")
+            try:
+                archive.unlink()
+            except FileNotFoundError:
+                pass
+            return {"ok": True}
 
         if action == "import_existing":
             identifier = valid_id(payload.get("id"))

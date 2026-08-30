@@ -22,7 +22,7 @@ PERMISSION_LABELS = (
     ("minecraft.stop", "Остановка Minecraft"),
     ("minecraft.restart", "Перезапуск Minecraft"),
     ("minecraft.instances.manage", "Добавление, импорт и клонирование сборок"),
-    ("minecraft.settings", "Настройки сборок и server.properties"),
+    ("minecraft.settings", "Настройки сборок, server.properties и экспорт перевода"),
     ("minecraft.delete", "Удаление сборок и их файлов"),
     ("users.manage", "Создание и блокировка пользователей"),
 )

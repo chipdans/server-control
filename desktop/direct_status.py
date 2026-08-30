@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import re
 import shlex
 import socket
 import textwrap
@@ -693,3 +695,78 @@ class DirectSshStatusClient:
                     except OSError:
                         pass
                 sftp.close()
+
+    def export_translation_archive(
+        self,
+        credentials: Callable[[], dict[str, Any]],
+        instance_id: str,
+        destination: str | Path,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        paused: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Build the translation report remotely and download it over SFTP."""
+
+        target = Path(destination).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".part-" + uuid.uuid4().hex)
+        remote_path = ""
+        sftp = None
+        with self._lock:
+            try:
+                if self._client is None:
+                    self._connect(credentials())
+                client = self._client
+                transport = client.get_transport() if client else None
+                if not client or not transport or not transport.is_active():
+                    raise paramiko.SSHException("SSH-соединение закрыто.")
+                scan = self._execute_instance_request(
+                    {"action": "translation_scan", "id": str(instance_id)},
+                    timeout=60 * 60,
+                )
+                remote_path = str(scan.get("archive") or "")
+                if not re.fullmatch(r"/var/tmp/server-control-translation-[0-9a-f]{32}\.zip", remote_path):
+                    raise ValueError("Сервер вернул некорректный путь архива перевода.")
+                if cancelled and cancelled():
+                    raise RuntimeError("Выгрузка перевода отменена.")
+                sftp = client.open_sftp()
+                remote_size = int(sftp.stat(remote_path).st_size)
+                if remote_size < 1 or remote_size > 512 * 1024 * 1024:
+                    raise ValueError("Некорректный размер архива перевода.")
+
+                def transferred(current: int, total: int) -> None:
+                    while paused and paused():
+                        if cancelled and cancelled():
+                            raise RuntimeError("Выгрузка перевода отменена.")
+                        time.sleep(0.1)
+                    if cancelled and cancelled():
+                        raise RuntimeError("Выгрузка перевода отменена.")
+                    if progress:
+                        progress(current, total)
+
+                sftp.get(remote_path, str(temporary), callback=transferred)
+                if temporary.stat().st_size != remote_size:
+                    raise IOError("Архив перевода скачан не полностью.")
+                os.replace(temporary, target)
+                scan["local_path"] = str(target)
+                scan["size"] = remote_size
+                return scan
+            finally:
+                if sftp is not None:
+                    try:
+                        sftp.close()
+                    except OSError:
+                        pass
+                if remote_path:
+                    try:
+                        self._execute_instance_request(
+                            {"action": "translation_cleanup", "archive": remote_path},
+                            timeout=60,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass

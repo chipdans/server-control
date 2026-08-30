@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from pages_base import BasePage
-from widgets import enable_clipboard_paste
+from widgets import TransferProgress, enable_clipboard_paste
 
 
 INSTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -169,6 +169,7 @@ class InstancesPage(BasePage):
         if panel.state.has_permission("minecraft.settings"):
             ttk.Button(actions, text="Настройки сборки", command=self.settings).pack(fill="x", pady=3)
             ttk.Button(actions, text="⚙  Настройки сервера", style="Accent.TButton", command=self.server_settings).pack(fill="x", pady=3)
+            ttk.Button(actions, text="🌐  Проверка перевода", command=self.export_translation).pack(fill="x", pady=3)
         if panel.state.has_permission("minecraft.delete"):
             ttk.Button(actions, text="Удалить сборку", style="Danger.TButton", command=self.delete).pack(fill="x", pady=3)
 
@@ -954,6 +955,68 @@ class InstancesPage(BasePage):
             loaded,
             failure,
         )
+
+    def export_translation(self) -> None:
+        item = self.selected()
+        if not item:
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self,
+            title="Сохранить материалы для перевода",
+            initialfile=f"{item['id']}-translation-export.zip",
+            defaultextension=".zip",
+            filetypes=(("ZIP", "*.zip"),),
+        )
+        if not destination or not self._set_busy(True, "Сканирую переводы модов и квестов…"):
+            return
+        transfer = TransferProgress(self, f"Проверка перевода · {item.get('name')}")
+        transfer.update_job({
+            "stage": "scan",
+            "progress": 5,
+            "message": "Проверяю языковые файлы модов и тексты квестов на сервере…",
+        })
+
+        def download_progress(current: int, total: int) -> None:
+            percent = 20 + (80 * current / total if total else 0)
+            transfer.update_job({
+                "stage": "download",
+                "progress": percent,
+                "message": "Скачиваю готовый ZIP с материалами для перевода…",
+                "transferred_bytes": current,
+                "total_bytes": total,
+            })
+
+        def work() -> dict[str, Any]:
+            return self.panel.direct_status.export_translation_archive(
+                self._credentials,
+                str(item["id"]),
+                destination,
+                progress=download_progress,
+                cancelled=transfer.cancelled,
+                paused=transfer.paused,
+            )
+
+        def success(result: dict[str, Any]) -> None:
+            self.busy = False
+            transfer.update_job({"stage": "complete", "progress": 100, "message": "Архив готов"})
+            transfer.finish()
+            tasks = int(result.get("tasks") or 0)
+            mods = int(result.get("mods_incomplete") or 0)
+            quests = int(result.get("quest_files") or 0)
+            message = f"Найдено строк: {tasks}\nМодов с неполным переводом: {mods}\nФайлов квестов: {quests}\n\nАрхив сохранён:\n{destination}"
+            if result.get("task_limit_reached"):
+                message += "\n\nДостигнут предел 250 000 строк; это отмечено в отчёте."
+            self.status_var.set(f"Архив перевода готов · строк: {tasks}")
+            self.panel.status("Материалы для перевода сохранены", seconds=15)
+            messagebox.showinfo("Проверка перевода завершена", message, parent=self)
+
+        def failure(error: Exception) -> None:
+            self.busy = False
+            transfer.finish()
+            self.status_var.set("Проверка перевода завершилась ошибкой")
+            messagebox.showerror("Проверка перевода", str(error), parent=self)
+
+        self.panel.run_async(work, success, failure)
 
     def delete(self) -> None:
         item = self.selected()

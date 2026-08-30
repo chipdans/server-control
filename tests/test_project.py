@@ -91,6 +91,8 @@ class ProjectTests(unittest.TestCase):
         self.assertIn('LEGACY_STORE = CONFIG_DIR / "minecraft-instances.json"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         self.assertIn('action == "properties_get"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         self.assertIn('action == "properties_set"', REMOTE_INSTANCE_MANAGER_PROGRAM)
+        self.assertIn('action == "translation_scan"', REMOTE_INSTANCE_MANAGER_PROGRAM)
+        self.assertIn('action == "translation_cleanup"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         command = manager_command({"action": "start", "id": "dragonfyre"})
         self.assertTrue(command.startswith("sudo -n /usr/bin/python3 -c "))
         self.assertIn("dragonfyre", command)
@@ -111,6 +113,42 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(detected["minecraft_version"], "1.20.1")
         self.assertEqual(detected["loader"], "Forge")
         self.assertEqual(detected["port"], 25570)
+
+    def test_translation_scanner_extracts_missing_mod_and_quest_text(self) -> None:
+        namespace: dict[str, object] = {"__name__": "translation_scanner_test"}
+        exec(compile(REMOTE_INSTANCE_MANAGER_PROGRAM, "<direct-instance-manager>", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = root / "pack"
+            export = root / "export"
+            (pack / "mods").mkdir(parents=True)
+            (pack / "config" / "ftbquests" / "quests" / "lang").mkdir(parents=True)
+            with zipfile.ZipFile(pack / "mods" / "example.jar", "w") as jar:
+                jar.writestr(
+                    "assets/example/lang/en_us.json",
+                    json.dumps({"hello": "Hello world", "stone": "Stone", "technical": "minecraft:stone"}),
+                )
+                jar.writestr(
+                    "assets/example/lang/ru_ru.json",
+                    json.dumps({"hello": "Привет, мир", "stone": "Stone"}, ensure_ascii=False),
+                )
+            (pack / "config" / "ftbquests" / "quests" / "chapter.snbt").write_text(
+                'id: "1234"\ntitle: "Getting Started"\nitem: "minecraft:stone"\n',
+                encoding="utf-8",
+            )
+            (pack / "config" / "ftbquests" / "quests" / "lang" / "en_us.snbt").write_text(
+                'quest.title: "Main Chapter"\n',
+                encoding="utf-8",
+            )
+            tasks: list[dict[str, object]] = []
+            mods = namespace["scan_mod_translations"](pack, export, tasks)  # type: ignore[operator]
+            quests = namespace["scan_quest_translations"](pack, export, tasks)  # type: ignore[operator]
+        self.assertEqual(mods["incomplete"][0]["needs_translation"], 1)
+        self.assertEqual(quests["files_with_tasks"], 2)
+        self.assertIn("Stone", {task["source_text"] for task in tasks})
+        self.assertIn("Getting Started", {task["source_text"] for task in tasks})
+        self.assertIn("Main Chapter", {task["source_text"] for task in tasks})
+        self.assertNotIn("minecraft:stone", {task["source_text"] for task in tasks})
 
     def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
         original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"
