@@ -646,7 +646,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
         text = re.sub(r"§.", "", str(value or "")).strip()
         if not text or re.fullmatch(r"[MDCLXVI]+", text):
             return True
-        if re.fullmatch(r"[\[(]?(?:SHIFT|CTRL|CONTROL|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})[\])]?", text, re.IGNORECASE):
+        if re.fullmatch(r"[\[(]?(?:SHIFT|CTRL|CONTROL|CMD|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})[\])]?", text, re.IGNORECASE):
             return True
         if text.casefold() in {"true", "false", "on", "off", "yes", "no", "default", "none", "auto", "enabled", "disabled"}:
             return True
@@ -654,8 +654,8 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
             return True
         return False
 
-    def translation_reason(source, current):
-        if nontranslatable_text(source):
+    def translation_reason(source, current, key=""):
+        if str(key or "").startswith("_") or nontranslatable_text(source):
             return ""
         if current is None:
             return "missing" if looks_english(source) else ""
@@ -724,7 +724,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
                         reason_counts = {"missing": 0, "identical_to_english": 0, "contains_english": 0}
                         for key, english_text in english.items():
                             current = russian.get(key)
-                            reason = translation_reason(english_text, current)
+                            reason = translation_reason(english_text, current, key)
                             if not reason:
                                 continue
                             reason_counts[reason] += 1
@@ -893,7 +893,7 @@ REMOTE_INSTANCE_MANAGER_PROGRAM = textwrap.dedent(
             reasons = {"missing": 0, "identical_to_english": 0, "contains_english": 0}
             for key, english_text in english.items():
                 current = russian.get(key)
-                reason = translation_reason(english_text, current)
+                reason = translation_reason(english_text, current, key)
                 if not reason:
                     continue
                 reasons[reason] += 1
