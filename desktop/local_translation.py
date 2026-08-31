@@ -29,6 +29,10 @@ NONTRANSLATABLE_EXACT_VALUES = {
     "9minecraft", "aether", "advanced netherite", "ftb library", "killer queen",
     "modid", "patchouli", "some text here", "the aether", "weezer",
 }
+DEVELOPMENT_PLACEHOLDER_VALUES = {
+    "example", "placeholder", "tbd", "test", "test2", "todo", "unused",
+}
+DEVELOPMENT_SOURCE_NAMES = {"debug", "example", "test"}
 
 
 def _normalized(value: Any) -> str:
@@ -55,6 +59,7 @@ def _nontranslatable_value(value: Any, key: Any = "") -> bool:
     lowered_key = str(key or "").casefold()
     if (
         not text
+        or lowered_key.startswith("_")
         or lowered_key in {"_comment", "comment", "credits", "author"}
         or any(part in lowered_key for part in NONTRANSLATABLE_KEY_PARTS)
         or _normalized(text) in NONTRANSLATABLE_EXACT_VALUES
@@ -62,7 +67,7 @@ def _nontranslatable_value(value: Any, key: Any = "") -> bool:
         return True
     if re.fullmatch(r"[MDCLXVI]+", text):
         return True
-    if re.fullmatch(r"(?:[\[(])?(?:(?:SHIFT|CTRL|CONTROL|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})(?:\s*\+?\s*|\+))+(?:%s)?(?:[\])])?", text, re.IGNORECASE):
+    if re.fullmatch(r"(?:[\[(])?(?:(?:SHIFT|CTRL|CONTROL|CMD|ALT|ENTER|ESC|ESCAPE|TAB|SPACE|LMB|RMB|MMB|WASD|F\d{1,2})(?:\s*\+?\s*|\+))+(?:%s)?(?:[\])])?", text, re.IGNORECASE):
         return True
     if text.casefold() in {"true", "false", "on", "off", "yes", "no", "default", "none", "auto", "enabled", "disabled"}:
         return True
@@ -111,6 +116,8 @@ def _ambiguous_short_name(value: Any, key: Any) -> bool:
 def _translation_decision(source: Any, current: Any | None, key: Any) -> tuple[str, str]:
     if _nontranslatable_value(source, key):
         return "", ""
+    if _normalized(source) in DEVELOPMENT_PLACEHOLDER_VALUES:
+        return "review_required", "development_placeholder"
     if current is None:
         return ("needs_translation", "missing") if _looks_english(source) else ("", "")
     source_normalized = _normalized(source)
@@ -128,6 +135,28 @@ def _translation_decision(source: Any, current: Any | None, key: Any) -> tuple[s
             return "review_required", "ambiguous_name"
         return "needs_translation", "contains_english"
     return "", ""
+
+
+def _move_development_quest_tasks(
+    tasks: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+) -> None:
+    kept: list[dict[str, Any]] = []
+    for task in tasks:
+        source_file = str(task.get("source_file") or "").replace("\\", "/")
+        source_name = Path(source_file).stem.casefold()
+        if str(task.get("kind") or "").startswith("quest_") and source_name in DEVELOPMENT_SOURCE_NAMES:
+            review = {key: value for key, value in task.items() if key != "task_id"}
+            review.update({
+                "review_id": f"review-{len(reviews) + 1:06d}",
+                "reason": "development_source",
+            })
+            reviews.append(review)
+            continue
+        kept.append(task)
+    for index, task in enumerate(kept, start=1):
+        task["task_id"] = f"translation-{index:06d}"
+    tasks[:] = kept
 
 
 def _parse_language(payload: bytes, suffix: str) -> dict[str, str]:
@@ -452,8 +481,9 @@ def build_combined_translation_export(
             raise ValueError("Не удалось прочитать задания квестов из серверного архива.") from error
         if not isinstance(tasks, list):
             raise ValueError("Сервер вернул некорректный список заданий перевода.")
-        shutil.rmtree(export_root / "mods", ignore_errors=True)
         reviews: list[dict[str, Any]] = []
+        _move_development_quest_tasks(tasks, reviews)
+        shutil.rmtree(export_root / "mods", ignore_errors=True)
         mods = _append_mod_tasks(export_root, catalog, tasks, reviews)
         try:
             manifest = json.loads((export_root / "manifest.json").read_text(encoding="utf-8"))
@@ -495,7 +525,7 @@ def build_combined_translation_export(
             f"- Модов/пространств с неполным итоговым переводом: {len(mods['incomplete'])}",
             f"- Файлов серверных квестов с английским текстом: {quest_files}",
             f"- Всего заданий на перевод: {len(tasks)}",
-            f"- Сомнительных смешанных строк для отдельной проверки: {len(reviews)}",
+            f"- Сомнительных строк для отдельной проверки: {len(reviews)}",
             "",
             "## Неполные итоговые переводы модов",
             "",
