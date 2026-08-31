@@ -90,11 +90,15 @@ class ProjectTests(unittest.TestCase):
     def test_translation_filter_removes_only_technical_values(self) -> None:
         ignored = [
             ("Ctrl + %s", "modifier.cloth-config.ctrl"),
+            ("CMD + %s", "jei.key.combo.command"),
+            ("Cmd", "key.nochatreports.cmd"),
             ("/lootr barrel | chest", "lootr.commands.usage"),
             ("dde9f4", "travelerstitles.aether.color"),
             ("[Quark]\\n", "quark.jei.hint_preamble"),
             ("Some text here", "book.example.page"),
             ("RAISES CLOUD HEIGHT", "cloud.height.__COMMENT"),
+            ("Note to translators", "_comment0"),
+            ("Collective", "_comment_modname_collective"),
             ("§eKiller Queen", "item.vp.killer"),
             ("Patchouli", "item.patchouli:intro_book.name"),
             ("Weezer", "item.iceandfire.weezer_blue_album"),
@@ -112,6 +116,14 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(
             _translation_decision("[Use Default Language]", None, "ftbquests.gui.language"),
             ("needs_translation", "missing"),
+        )
+        self.assertEqual(
+            _translation_decision("Unused", None, "mmorpg.affix.armor_eye"),
+            ("review_required", "development_placeholder"),
+        )
+        self.assertEqual(
+            _translation_decision("Test2", None, "kiwi.config.modules.test2"),
+            ("review_required", "development_placeholder"),
         )
         self.assertEqual(
             _translation_decision("Killer Queen", "Killer Queen", "item.vp.killer"),
@@ -279,6 +291,12 @@ class ProjectTests(unittest.TestCase):
                 "kind": "quest_text",
                 "source_text": "Server Quest",
             }
+            development_quest_task = {
+                "task_id": "translation-000002",
+                "kind": "quest_text",
+                "source_file": "config/ftbquests/quests/reward_tables/test.snbt",
+                "source_text": "Bow and Arrows",
+            }
             with zipfile.ZipFile(server_archive, "w") as archive:
                 archive.writestr(
                     "translation-export/manifest.json",
@@ -287,7 +305,10 @@ class ProjectTests(unittest.TestCase):
                         "statistics": {"quests": {"files_with_tasks": 1}},
                     }),
                 )
-                archive.writestr("translation-export/translation_tasks.json", json.dumps([quest_task]))
+                archive.writestr(
+                    "translation-export/translation_tasks.json",
+                    json.dumps([quest_task, development_quest_task]),
+                )
 
             destination = root / "translation.zip"
             result = build_combined_translation_export(client, server_archive, destination)
@@ -299,11 +320,18 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(result["tasks"], 2)
         self.assertEqual([task["source_text"] for task in tasks], ["Server Quest", "Battle Axe"])
         self.assertEqual(tasks[1]["task_id"], "translation-000002")
-        self.assertEqual({task["source_text"] for task in reviews}, {"Perfect! Let me get to it!", "Example Mod"})
+        self.assertEqual(
+            {task["source_text"] for task in reviews},
+            {"Bow and Arrows", "Perfect! Let me get to it!", "Example Mod"},
+        )
+        self.assertEqual(
+            next(task for task in reviews if task["source_text"] == "Bow and Arrows")["reason"],
+            "development_source",
+        )
         self.assertNotIn("Advanced Netherite settings", {task["source_text"] for task in reviews})
         self.assertEqual(manifest["client_scan"]["enabled_resourcepacks"], ["active.zip"])
         self.assertEqual(manifest["statistics"]["mods"]["incomplete"][0]["needs_translation"], 1)
-        self.assertEqual(manifest["statistics"]["review_required"], 2)
+        self.assertEqual(manifest["statistics"]["review_required"], 3)
 
     def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
         original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"
