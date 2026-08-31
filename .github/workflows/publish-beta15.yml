@@ -1,0 +1,68 @@
+name: Publish beta 15 once
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-beta15.yml
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: publish-beta-15-once
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and publish beta 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous_run_id=$(gh run list \
+            --workflow release.yml \
+            --branch main \
+            --event workflow_dispatch \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+          gh workflow run release.yml --ref main -f tag=v2.0.0-beta.15
+
+          run_id=""
+          for attempt in $(seq 1 30); do
+            candidate=$(gh run list \
+              --workflow release.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty')
+            if [ -n "$candidate" ] && [ "$candidate" != "$previous_run_id" ]; then
+              run_id="$candidate"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo "Release workflow run was not created." >&2
+            exit 1
+          fi
+
+          gh run watch "$run_id" --exit-status
+          gh release edit v2.0.0-beta.15 --prerelease=false --latest
+
+      - name: Remove this one-time workflow and synchronize branches
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/publish-beta15.yml
+          git commit -m "Remove one-time beta 15 workflow"
+          git push origin HEAD:main HEAD:v2
