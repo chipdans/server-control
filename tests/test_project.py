@@ -870,6 +870,16 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("временно потеряна", messages[0])
         self.assertIn("Скрыто повторных сообщений: 1", messages[1])
 
+    def test_agent_d1_quota_backoff(self) -> None:
+        config = Config(
+            hub_url="https://example.invalid", agent_api_key="test", poll_seconds=1,
+            heartbeat_seconds=15, request_timeout_seconds=5, minecraft={}, commands={},
+        )
+        agent = Agent(config)
+        with patch.object(agent, "_stderr"), patch("server_control_agent.time.monotonic", return_value=100):
+            agent._record_hub_failure(HubError('Hub returned HTTP 503: {"error":"d1_daily_quota_exceeded"}'))
+        self.assertEqual(agent.hub_retry_not_before, 400)
+
     def test_agent_sync_falls_back_during_a_rolling_worker_deploy(self) -> None:
         config = Config(
             hub_url="https://example.invalid", agent_api_key="unit-test-agent-placeholder", poll_seconds=1,
