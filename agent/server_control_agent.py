@@ -37,7 +37,7 @@ from sc_agent.instances import InstanceProfile
 from sc_agent.security import atomic_write_bytes, secure_path_within, validate_instance_id
 
 
-AGENT_VERSION = "2.0.5"
+AGENT_VERSION = "2.0.6"
 PROTOCOL_VERSION = 2
 MAX_EVENT_MESSAGE = 8000
 MAX_EVENT_BUFFER_EVENTS = 2_000
@@ -1290,7 +1290,10 @@ class Agent:
         # Error 1027 is Cloudflare's exhausted daily Workers Free allowance.
         # Hammering the edge cannot recover it and only creates more noise;
         # retry slowly until the quota resets at 00:00 UTC.
-        quota_exhausted = "HTTP 429" in str(error) or "1027" in str(error)
+        quota_exhausted = any(marker in str(error) for marker in (
+            "HTTP 429", "1027", "d1_daily_quota_exceeded",
+            "D1's free tier daily row", "D1 daily quota",
+        ))
         delay = 300.0 if quota_exhausted else min(HUB_RETRY_MAX_SECONDS, float(2 ** min(self.hub_failure_count - 1, 4)))
         self.hub_retry_not_before = now + delay
 
