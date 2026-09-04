@@ -41,6 +41,8 @@ class ApiClient:
         self.port = parsed.port or 443
         self.base_path = parsed.path.rstrip("/")
         self.token: str | None = None
+        self._quota_retry_at = 0.0
+        self._quota_message = ""
         self._request_lock = threading.Lock()
         self._address_cursor = 0
         self._ipv4_failed_at: dict[str, float] = {}
@@ -162,6 +164,8 @@ class ApiClient:
         *,
         timeout_seconds: float = 20,
     ) -> dict[str, Any]:
+        if time.monotonic() < self._quota_retry_at and path != "/health":
+            raise ApiError(503, "d1_daily_quota_exceeded", self._quota_message)
         headers = {
             "Accept": "application/json",
             "Accept-Encoding": "identity",
@@ -264,6 +268,13 @@ class ApiClient:
 
         parsed = self._parse_json(raw)
         if status >= 400:
+            if parsed.get("error") == "d1_daily_quota_exceeded":
+                try:
+                    delay = max(1, min(300, int(parsed.get("retry_after", 300))))
+                except (TypeError, ValueError, OverflowError):
+                    delay = 300
+                self._quota_message = str(parsed.get("message") or "Исчерпан суточный лимит Cloudflare D1.")
+                self._quota_retry_at = time.monotonic() + delay
             raise ApiError(status, str(parsed.get("error", "http_error")), str(parsed.get("message", "Ошибка сервера.")))
         return parsed
 
