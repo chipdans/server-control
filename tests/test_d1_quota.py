@@ -59,6 +59,10 @@ class D1QuotaTests(unittest.TestCase):
                 with patch("api.time.monotonic", return_value=401):
                     with self.assertRaises(ApiError): client.login("user", "password")
                 self.assertEqual(connect.call_count, 2)
+            # Windows cannot remove a temporary directory with an open log.
+            for handler in list(client._http_log.handlers):
+                handler.close()
+                client._http_log.removeHandler(handler)
 
 
 if __name__ == "__main__":
