@@ -1098,11 +1098,12 @@ export async function runScheduledMaintenance(env, helpers) {
     await saveInternalSetting(env, "_agent_offline_notified", false, now);
   }
   const autoCleanup = Boolean(await settingValue(env, "auto_cleanup", true));
-  if (autoCleanup) {
+  const lastCleanup = autoCleanup ? Number(await settingValue(env, "_last_retention_cleanup_at", 0)) : 0;
+  if (autoCleanup && (!lastCleanup || now - lastCleanup >= 60 * 60 * 1000)) {
     const consoleDays = Math.max(1, Math.min(365, Number(await settingValue(env, "console_retention_days", 30)) || 30));
     const jobDays = Math.max(1, Math.min(365, Number(await settingValue(env, "job_retention_days", 30)) || 30));
     const notificationDays = Math.max(1, Math.min(730, Number(await settingValue(env, "notification_retention_days", 90)) || 90));
-    const expired = await env.DB.prepare("SELECT id,object_key FROM transfers WHERE expires_at<? LIMIT 500").bind(now).all();
+    const expired = await env.DB.prepare("SELECT id,object_key FROM transfers WHERE expires_at<? ORDER BY expires_at LIMIT 500").bind(now).all();
     if (env.FILES) {
       for (const row of expired.results || []) {
         try { await env.FILES.delete(row.object_key); } catch { /* cleanup retries next hour */ }
@@ -1110,16 +1111,17 @@ export async function runScheduledMaintenance(env, helpers) {
     }
     const redactedResult = JSON.stringify({ redacted: true, message: "Подробный результат удалён по политике хранения." });
     await env.DB.batch([
-      env.DB.prepare("DELETE FROM console_events WHERE created_at<?").bind(now - consoleDays * 86_400_000),
-      env.DB.prepare("DELETE FROM jobs WHERE status IN ('completed','failed','cancelled') AND updated_at<?").bind(now - jobDays * 86_400_000),
+      env.DB.prepare("DELETE FROM console_events WHERE id IN (SELECT id FROM console_events WHERE created_at<? ORDER BY created_at LIMIT 500)").bind(now - consoleDays * 86_400_000),
+      env.DB.prepare("DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE status IN ('completed','failed','cancelled') AND updated_at<? ORDER BY updated_at LIMIT 500)").bind(now - jobDays * 86_400_000),
       env.DB.prepare(
         `UPDATE jobs SET result=? WHERE type IN ('file_read','log_read','minecraft_command','player_action')
          AND status IN ('completed','failed','cancelled') AND updated_at<? AND result IS NOT NULL AND result!=?`,
       ).bind(redactedResult, now - 60 * 60 * 1000, redactedResult),
-      env.DB.prepare("DELETE FROM notifications WHERE created_at<?").bind(now - notificationDays * 86_400_000),
-      env.DB.prepare("DELETE FROM transfers WHERE expires_at<?").bind(now),
-      env.DB.prepare("DELETE FROM command_queue WHERE status IN ('completed','failed') AND completed_at<?").bind(now - jobDays * 86_400_000),
+      env.DB.prepare("DELETE FROM notifications WHERE id IN (SELECT id FROM notifications WHERE created_at<? ORDER BY created_at LIMIT 500)").bind(now - notificationDays * 86_400_000),
+      env.DB.prepare("DELETE FROM transfers WHERE id IN (SELECT id FROM transfers WHERE expires_at<? ORDER BY expires_at LIMIT 500)").bind(now),
+      env.DB.prepare("DELETE FROM command_queue WHERE id IN (SELECT id FROM command_queue WHERE status IN ('completed','failed') AND completed_at<? ORDER BY completed_at LIMIT 500)").bind(now - jobDays * 86_400_000),
     ]);
+    await saveInternalSetting(env, "_last_retention_cleanup_at", now, now);
   }
   const owner = await env.DB.prepare("SELECT * FROM users WHERE role='owner' AND enabled=1 ORDER BY created_at LIMIT 1").first();
   const statusRow = agentStatusRow;
