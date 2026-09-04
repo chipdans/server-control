@@ -10,6 +10,7 @@ import {
   routeControlPlane,
   runScheduledMaintenance,
 } from "./control_plane.js";
+import { isD1DailyQuotaError, pauseForD1Quota, quotaResponse, quotaRetrySeconds } from "./d1_quota.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -88,8 +89,16 @@ export default {
     }
 
     try {
+      if (new URL(request.url).pathname !== "/health" && quotaRetrySeconds(env.DB)) {
+        return quotaResponse(env.DB);
+      }
       return await route(request, env, ctx);
     } catch (error) {
+      if (isD1DailyQuotaError(error)) {
+        pauseForD1Quota(env.DB);
+        console.warn("D1 daily quota exhausted; database requests paused temporarily.");
+        return quotaResponse(env.DB);
+      }
       if (error instanceof ApiError) {
         return json({ error: error.code, message: error.message }, error.status);
       }
@@ -98,7 +107,12 @@ export default {
     }
   },
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runScheduledMaintenance(env, { ApiError, json, readJson, safeJson, requirePermission, requireAnyPermission, addAudit }));
+    if (quotaRetrySeconds(env.DB)) return;
+    ctx.waitUntil(runScheduledMaintenance(env, { ApiError, json, readJson, safeJson, requirePermission, requireAnyPermission, addAudit }).catch((error) => {
+      if (!isD1DailyQuotaError(error)) throw error;
+      pauseForD1Quota(env.DB);
+      console.warn("D1 daily quota exhausted; maintenance paused temporarily.");
+    }));
   },
 };
 
