@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: publish-beta-16-once
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   publish:
@@ -34,6 +34,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          old_status=$(gh run view 33880924130 --json status --jq .status)
+          if [ "$old_status" != "completed" ]; then
+            gh run cancel 33880924130
+          fi
           previous_run_id=$(gh run list --workflow release.yml --branch main --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // empty')
           gh workflow run release.yml --ref main -f tag=v2.0.0-beta.16
           run_id=""
