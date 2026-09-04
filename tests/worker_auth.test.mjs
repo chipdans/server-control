@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
 import worker from "../worker/src/index.js";
+import { isD1DailyQuotaError, pauseForD1Quota, quotaRetrySeconds } from "../worker/src/d1_quota.js";
 import {
   AGENT_ONLINE_MAX_AGE_MS,
   boundedJobResult,
@@ -14,7 +15,93 @@ import {
   normalizeRelativePath,
   redactJobValue,
   routeSync,
+  runScheduledMaintenance,
 } from "../worker/src/control_plane.js";
+
+test("D1 daily quota detection is specific and understands nested causes", () => {
+  const cause = new Error("D1_ERROR: Your account has exceeded D1's free tier daily row read limit.");
+  assert.equal(isD1DailyQuotaError(new Error("D1 query failed", { cause })), true);
+  assert.equal(isD1DailyQuotaError(new Error("D1_ERROR: exceeded daily row write limit")), true);
+  assert.equal(isD1DailyQuotaError(new Error("D1_ERROR: no such table: users")), false);
+  assert.equal(isD1DailyQuotaError(new Error("Worker daily limit exceeded")), false);
+  const db = {};
+  pauseForD1Quota(db, 86_399_000);
+  assert.equal(quotaRetrySeconds(db, 86_399_000), 1);
+  assert.equal(quotaRetrySeconds(db, 86_400_000), 0);
+});
+
+test("quota returns a safe 503 and pauses login and scheduled D1 calls", async () => {
+  let queries = 0;
+  const env = { DB: { prepare() {
+    queries++;
+    throw new Error("D1_ERROR: Your account has exceeded D1's free tier daily row read limit.");
+  } } };
+  const request = () => new Request("https://test.invalid/v1/login", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "tester", password: "password" }),
+  });
+  const first = await worker.fetch(request(), env, {});
+  assert.equal(first.status, 503);
+  assert.equal((await first.json()).error, "d1_daily_quota_exceeded");
+  assert.ok(Number(first.headers.get("retry-after")) > 0);
+  const second = await worker.fetch(request(), env, {});
+  assert.equal(second.status, 503);
+  await worker.scheduled({}, env, { waitUntil() { assert.fail("maintenance must stay paused"); } });
+  assert.equal(queries, 1);
+  const health = await worker.fetch(new Request("https://test.invalid/health"), env, {});
+  assert.equal(health.status, 200);
+});
+
+test("retention runs once an hour, persists its schedule and retries failures", async () => {
+  let now = 1_800_000_000_000;
+  const originalNow = Date.now;
+  Date.now = () => now;
+  const settings = new Map();
+  const helpers = { safeJson: JSON.parse };
+  let batches = 0;
+  let failBatch = false;
+  const db = { prepare(sql) {
+    let args = [];
+    return { bind(...values) { args = values; return this; },
+      async first() {
+        if (sql.includes("FROM agent_status")) return { status: "{}", updated_at: now };
+        if (sql.includes("FROM settings")) return settings.has(args[0]) ? { value: settings.get(args[0]) } : null;
+        if (sql.includes("FROM users")) return null;
+        throw new Error(sql);
+      },
+      async all() { return { results: [] }; },
+      async run() {
+        if (sql.includes("INSERT INTO settings")) settings.set(args[0], args[1]);
+        return { success: true };
+      }, sql,
+    };
+  }, async batch(statements) {
+    if (failBatch) throw new Error("temporary database failure");
+    batches++;
+    for (const statement of statements) {
+      if (statement.sql.startsWith("DELETE")) assert.match(statement.sql, /LIMIT 500/);
+    }
+  } };
+  try {
+    await runScheduledMaintenance({ DB: db }, helpers);
+    assert.equal(batches, 1);
+    now += 60_000;
+    await runScheduledMaintenance({ DB: db }, helpers);
+    assert.equal(batches, 1);
+    now += 3_600_000;
+    const saved = settings.get("_last_retention_cleanup_at");
+    failBatch = true;
+    await assert.rejects(runScheduledMaintenance({ DB: db }, helpers), /temporary database failure/);
+    assert.equal(settings.get("_last_retention_cleanup_at"), saved);
+    failBatch = false;
+    await runScheduledMaintenance({ DB: db }, helpers);
+    assert.equal(batches, 2);
+    settings.set("auto_cleanup", "false");
+    now += 3_600_000;
+    await runScheduledMaintenance({ DB: db }, helpers);
+    assert.equal(batches, 2);
+  } finally { Date.now = originalNow; }
+});
 
 class TestApiError extends Error {
   constructor(status, code, message) {
