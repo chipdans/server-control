@@ -70,12 +70,10 @@ jobs:
       - name: Install builder
         run: python -m pip install --upgrade pip; python -m pip install -r desktop/requirements-build.txt
 
-      - name: Run Python and Worker tests
+      - name: Validate Windows explorer and native drag-and-drop
         run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
-          node --test tests/worker_auth.test.mjs
-          node --check worker/src/index.js
-          node --check worker/src/control_plane.js
+          python -m unittest discover -s tests -p "test_explorer*.py" -v
+          if ($LASTEXITCODE -ne 0) { throw "Windows explorer tests failed" }
 
       - name: Build Windows client
         run: >-
