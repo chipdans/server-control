@@ -17,6 +17,7 @@ from pages_base import BasePage
 from pages_console_v2 import ConsolePage
 from pages_dashboard_v2 import DashboardPage
 from pages_instances_v2 import InstancesPage
+from pages_explorer import ExplorerPage
 from pages_users_v2 import AccountPage, UsersPage
 from state import AppState, LocalPreferences
 
@@ -125,12 +126,14 @@ class ControlPanel(ttk.Frame):
             self.state.has_permission(permission) for permission in instance_permissions
         ):
             page_types.append(InstancesPage)
+        if self.state.has_permission("terminal.linux") and self.state.has_permission("minecraft.files.read"):
+            page_types.append(ExplorerPage)
         if self.state.has_permission("terminal.linux") or self.state.has_permission("terminal.minecraft"):
             page_types.append(ConsolePage)
         if self.state.has_permission("users.manage"):
             page_types.append(UsersPage)
         page_types.append(AccountPage)
-        nav_icons = {"dashboard": "⌂", "console": "▣", "instances": "◆", "users": "♙", "account": "○"}
+        nav_icons = {"dashboard": "⌂", "console": "▣", "instances": "◆", "files": "▤", "users": "♙", "account": "○"}
         for page_type in page_types:
             page = page_type(self.page_container, self)
             self.pages[page.page_id] = page
@@ -170,6 +173,9 @@ class ControlPanel(ttk.Frame):
             console = self.pages.get("console")
             if console and hasattr(console, "close"):
                 console.close()
+            files = self.pages.get("files")
+            if files:
+                files.close()
             self.status("Права изменились. Активные консоли закрыты; повторно войдите для обновления меню.")
         account = self.pages.get("account")
         if account:

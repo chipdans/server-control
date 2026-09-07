@@ -37,7 +37,7 @@ from widgets import (
 )
 
 
-APP_VERSION = "2.0.0-beta.16"
+APP_VERSION = "2.0.0-beta.17"
 APP_TITLE = "Server Control"
 
 
@@ -422,7 +422,12 @@ class ServerControlApp:
 
 
 def main() -> None:
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD
+    except ImportError:
+        root = tk.Tk()
+    else:
+        root = TkinterDnD.Tk()
     ServerControlApp(root)
     root.mainloop()
 

@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -76,7 +80,7 @@ jobs:
       - name: Build Windows client
         run: >-
           pyinstaller --noconfirm --clean --onefile --windowed
-          --name ServerControl --add-data "desktop/assets;assets" desktop/main.py
+          --name ServerControl --collect-all tkinterdnd2 --add-data "desktop/assets;assets" desktop/main.py
 
       - name: Build updater
         run: >-
@@ -152,7 +156,7 @@ jobs:
           $agentHash = (Get-FileHash ServerControl-Agent.zip -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path ServerControl-Agent.zip.sha256 -Value "$agentHash  ServerControl-Agent.zip" -Encoding ascii
 
-      - name: Create or update GitHub Release
+      - name: Publish complete release as latest
         env:
           GH_TOKEN: ${{ secrets.RELEASE_REPOSITORY_TOKEN || github.token }}
         run: |
@@ -161,13 +165,15 @@ jobs:
           if ($tag -notmatch '^v\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') { throw "Release tag must be semantic" }
           $releaseRepository = "${{ vars.RELEASE_REPOSITORY }}"
           if ($releaseRepository -eq "") { $releaseRepository = "${{ github.repository }}" }
-          gh release view $tag --repo $releaseRepository 2>$null
+          $draftState = gh release view $tag --repo $releaseRepository --json isDraft --jq .isDraft 2>$null
           if ($LASTEXITCODE -eq 0) {
+            if ($draftState -ne "true") { throw "Refusing to replace assets of a published release: $tag" }
             gh release upload $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not upload release assets" }
           } else {
             $releaseTarget = "${{ github.sha }}"
-            if ("${{ github.event_name }}" -eq "workflow_dispatch") { $releaseTarget = "${{ github.ref_name }}" }
-            $releaseFlags = @("--target", $releaseTarget)
-            if ($tag.Contains("-")) { $releaseFlags += "--prerelease" }
-            gh release create $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --title $tag --generate-notes @releaseFlags
+            gh release create $tag ServerControl-Setup.zip ServerControl-Setup.zip.sha256 ServerControl-Update.zip ServerControl-Update.zip.sha256 ServerControl-Agent.zip ServerControl-Agent.zip.sha256 --repo $releaseRepository --title $tag --generate-notes --draft --target $releaseTarget
+            if ($LASTEXITCODE -ne 0) { throw "Could not create draft release" }
           }
+          gh release edit $tag --repo $releaseRepository --draft=false --prerelease=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish release" }

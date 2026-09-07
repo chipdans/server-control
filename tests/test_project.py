@@ -52,8 +52,6 @@ from apply_update import safe_extract as safe_extract_update  # noqa: E402
 from api import ApiClient, ApiError  # noqa: E402
 from direct_instances import MANAGED_INSTANCE_RUNNER_PROGRAM, REMOTE_INSTANCE_MANAGER_PROGRAM, manager_command  # noqa: E402
 from direct_status import dashboard_envelope  # noqa: E402
-from local_translation import build_combined_translation_export  # noqa: E402
-from local_translation import _translation_decision  # noqa: E402
 from pages_dashboard_v2 import selected_minecraft_status  # noqa: E402
 from pages_instances_v2 import parse_server_properties, update_server_properties  # noqa: E402
 from state import AppState  # noqa: E402
@@ -87,48 +85,6 @@ class ProjectTests(unittest.TestCase):
         self.assertIn(legacy, source)
         self.assertLess(source.index(managed), source.index(legacy))
 
-    def test_translation_filter_removes_only_technical_values(self) -> None:
-        ignored = [
-            ("Ctrl + %s", "modifier.cloth-config.ctrl"),
-            ("CMD + %s", "jei.key.combo.command"),
-            ("Cmd", "key.nochatreports.cmd"),
-            ("/lootr barrel | chest", "lootr.commands.usage"),
-            ("dde9f4", "travelerstitles.aether.color"),
-            ("[Quark]\\n", "quark.jei.hint_preamble"),
-            ("Some text here", "book.example.page"),
-            ("RAISES CLOUD HEIGHT", "cloud.height.__COMMENT"),
-            ("Note to translators", "_comment0"),
-            ("Collective", "_comment_modname_collective"),
-            ("§eKiller Queen", "item.vp.killer"),
-            ("Patchouli", "item.patchouli:intro_book.name"),
-            ("Weezer", "item.iceandfire.weezer_blue_album"),
-        ]
-        for value, key in ignored:
-            self.assertEqual(_translation_decision(value, value, key), ("", ""), (value, key))
-        self.assertEqual(
-            _translation_decision("Hold shift to view details.", None, "tooltip.example"),
-            ("needs_translation", "missing"),
-        )
-        self.assertEqual(
-            _translation_decision("/kill doesn't even bother me", None, "legendary.message"),
-            ("needs_translation", "missing"),
-        )
-        self.assertEqual(
-            _translation_decision("[Use Default Language]", None, "ftbquests.gui.language"),
-            ("needs_translation", "missing"),
-        )
-        self.assertEqual(
-            _translation_decision("Unused", None, "mmorpg.affix.armor_eye"),
-            ("review_required", "development_placeholder"),
-        )
-        self.assertEqual(
-            _translation_decision("Test2", None, "kiwi.config.modules.test2"),
-            ("review_required", "development_placeholder"),
-        )
-        self.assertEqual(
-            _translation_decision("Killer Queen", "Killer Queen", "item.vp.killer"),
-            ("", ""),
-        )
 
     def test_direct_ssh_snapshot_uses_dashboard_shape(self) -> None:
         payload = dashboard_envelope({
@@ -155,8 +111,6 @@ class ProjectTests(unittest.TestCase):
         self.assertIn('LEGACY_STORE = CONFIG_DIR / "minecraft-instances.json"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         self.assertIn('action == "properties_get"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         self.assertIn('action == "properties_set"', REMOTE_INSTANCE_MANAGER_PROGRAM)
-        self.assertIn('action == "translation_scan"', REMOTE_INSTANCE_MANAGER_PROGRAM)
-        self.assertIn('action == "translation_cleanup"', REMOTE_INSTANCE_MANAGER_PROGRAM)
         command = manager_command({"action": "start", "id": "dragonfyre"})
         self.assertTrue(command.startswith("sudo -n /usr/bin/python3 -c "))
         self.assertIn("dragonfyre", command)
@@ -178,160 +132,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(detected["loader"], "Forge")
         self.assertEqual(detected["port"], 25570)
 
-    def test_translation_scanner_extracts_missing_mod_and_quest_text(self) -> None:
-        namespace: dict[str, object] = {"__name__": "translation_scanner_test"}
-        exec(compile(REMOTE_INSTANCE_MANAGER_PROGRAM, "<direct-instance-manager>", "exec"), namespace)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            pack = root / "pack"
-            export = root / "export"
-            (pack / "mods").mkdir(parents=True)
-            (pack / "config" / "ftbquests" / "quests" / "lang").mkdir(parents=True)
-            with zipfile.ZipFile(pack / "mods" / "example.jar", "w") as jar:
-                jar.writestr(
-                    "assets/example/lang/en_us.json",
-                    json.dumps({"hello": "Hello world", "stone": "Stone", "technical": "minecraft:stone"}),
-                )
-                jar.writestr(
-                    "assets/example/lang/ru_ru.json",
-                    json.dumps({"hello": "Привет, мир", "stone": "Stone"}, ensure_ascii=False),
-                )
-            (pack / "config" / "ftbquests" / "quests" / "chapter.snbt").write_text(
-                'id: "1234"\n'
-                'dependencies: ["disabled"]\n'
-                'shape: "circle"\n'
-                'dependency_requirement: "linear"\n'
-                'title: "Getting Started"\n'
-                'description: [\n  "Build a safe shelter"\n]\n'
-                'description: "Русский текст про Ars Nouveau"\n'
-                'item: "minecraft:stone"\n',
-                encoding="utf-8",
-            )
-            (pack / "config" / "ftbquests" / "quests_BACKUP_3B").mkdir(parents=True)
-            (pack / "config" / "ftbquests" / "quests_BACKUP_3B" / "old.snbt").write_text(
-                'title: "Backup Quest Must Be Ignored"\n', encoding="utf-8",
-            )
-            (pack / "config" / "ftbquests" / "quests" / "chapter.json").write_text(
-                json.dumps({
-                    "title": "Boss Fight",
-                    "dependencies": ["disabled"],
-                    "shape": "circle",
-                    "layout": "linear",
-                    "task": {"type": "item", "item": "minecraft:stone"},
-                }),
-                encoding="utf-8",
-            )
-            (pack / "config" / "ftbquests" / "quests" / "lang" / "en_us.snbt").write_text(
-                'quest.title: "Main Chapter"\n',
-                encoding="utf-8",
-            )
-            tasks: list[dict[str, object]] = []
-            mods = namespace["scan_mod_translations"](pack, export, tasks)  # type: ignore[operator]
-            quests = namespace["scan_quest_translations"](pack, export, tasks)  # type: ignore[operator]
-        self.assertEqual(mods["incomplete"][0]["needs_translation"], 1)
-        self.assertEqual(quests["files_with_tasks"], 3)
-        texts = {task["source_text"] for task in tasks}
-        self.assertIn("Stone", texts)
-        self.assertIn("Getting Started", texts)
-        self.assertIn("Build a safe shelter", texts)
-        self.assertIn("Boss Fight", texts)
-        self.assertIn("Main Chapter", texts)
-        self.assertTrue({
-            "minecraft:stone", "disabled", "circle", "linear", "Русский текст про Ars Nouveau",
-            "Backup Quest Must Be Ignored",
-        }.isdisjoint(texts))
 
-    def test_client_translation_export_applies_only_enabled_resourcepacks(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            client = root / "client"
-            (client / "mods").mkdir(parents=True)
-            (client / "resourcepacks").mkdir()
-            with zipfile.ZipFile(client / "mods" / "example.jar", "w") as jar:
-                jar.writestr(
-                    "assets/example/lang/en_us.json",
-                    json.dumps({
-                        "hello": "Hello world",
-                        "stone": "Stone Block",
-                        "axe": "Battle Axe",
-                        "enchantment.level.12": "XII",
-                        "tooltip.shift": "[SHIFT]",
-                        "config.example.tooltip": "Advanced Netherite settings",
-                        "message.example.partial": "Perfect! Let me get to it!",
-                        "itemGroup.example": "Example Mod",
-                    }),
-                )
-                jar.writestr(
-                    "assets/example/lang/ru_ru.json",
-                    json.dumps({
-                        "hello": "Привет, мир",
-                        "stone": "Stone Block",
-                        "enchantment.level.12": "XII",
-                        "tooltip.shift": "[SHIFT]",
-                        "config.example.tooltip": "Настройки Advanced Netherite",
-                        "message.example.partial": "Идеально! Let me get to it!",
-                        "itemGroup.example": "Example Mod",
-                    }, ensure_ascii=False),
-                )
-            with zipfile.ZipFile(client / "resourcepacks" / "active.zip", "w") as pack:
-                pack.writestr(
-                    "assets/example/lang/ru_ru.json",
-                    json.dumps({"stone": "Каменный блок"}, ensure_ascii=False),
-                )
-            with zipfile.ZipFile(client / "resourcepacks" / "disabled.zip", "w") as pack:
-                pack.writestr(
-                    "assets/example/lang/ru_ru.json",
-                    json.dumps({"axe": "Боевой топор"}, ensure_ascii=False),
-                )
-            (client / "options.txt").write_text('resourcePacks:["vanilla","file/active.zip"]\n', encoding="utf-8")
-
-            server_archive = root / "server.zip"
-            quest_task = {
-                "task_id": "translation-000001",
-                "kind": "quest_text",
-                "source_text": "Server Quest",
-            }
-            development_quest_task = {
-                "task_id": "translation-000002",
-                "kind": "quest_text",
-                "source_file": "config/ftbquests/quests/reward_tables/test.snbt",
-                "source_text": "Bow and Arrows",
-            }
-            with zipfile.ZipFile(server_archive, "w") as archive:
-                archive.writestr(
-                    "translation-export/manifest.json",
-                    json.dumps({
-                        "instance": {"id": "example", "name": "Example"},
-                        "statistics": {"quests": {"files_with_tasks": 1}},
-                    }),
-                )
-                archive.writestr(
-                    "translation-export/translation_tasks.json",
-                    json.dumps([quest_task, development_quest_task]),
-                )
-
-            destination = root / "translation.zip"
-            result = build_combined_translation_export(client, server_archive, destination)
-            with zipfile.ZipFile(destination) as archive:
-                tasks = json.loads(archive.read("translation-export/translation_tasks.json"))
-                reviews = json.loads(archive.read("translation-export/review_required.json"))
-                manifest = json.loads(archive.read("translation-export/manifest.json"))
-
-        self.assertEqual(result["tasks"], 2)
-        self.assertEqual([task["source_text"] for task in tasks], ["Server Quest", "Battle Axe"])
-        self.assertEqual(tasks[1]["task_id"], "translation-000002")
-        self.assertEqual(
-            {task["source_text"] for task in reviews},
-            {"Bow and Arrows", "Perfect! Let me get to it!", "Example Mod"},
-        )
-        self.assertEqual(
-            next(task for task in reviews if task["source_text"] == "Bow and Arrows")["reason"],
-            "development_source",
-        )
-        self.assertNotIn("Advanced Netherite settings", {task["source_text"] for task in reviews})
-        self.assertEqual(manifest["client_scan"]["enabled_resourcepacks"], ["active.zip"])
-        self.assertEqual(manifest["statistics"]["mods"]["incomplete"][0]["needs_translation"], 1)
-        self.assertEqual(manifest["statistics"]["review_required"], 3)
 
     def test_server_properties_editor_preserves_comments_and_custom_values(self) -> None:
         original = "# Minecraft server properties\nonline-mode=true\ndifficulty=normal\nmod-custom=value\nonline-mode=false\n"
