@@ -167,7 +167,11 @@ class DashboardPage(BasePage):
             "UNKNOWN": "Неизвестно",
         }.get(minecraft_state.upper(), minecraft_state or "Неизвестно")
         players = mapping(instance.get("players"))
-        detail = f"Игроков: {players.get('online', '—')}/{players.get('max', '—')}"
+        online_count, maximum_count = players.get("online"), players.get("max")
+        detail = (
+            f"Игроков: {online_count if online_count is not None else '—'}/{maximum_count if maximum_count is not None else '—'}"
+            if online_count is not None or maximum_count is not None else "Число игроков недоступно"
+        )
         startup = mapping(instance.get("startup"))
         if startup.get("label"):
             detail += f" · {startup.get('label')} {startup.get('progress', 0)}%"

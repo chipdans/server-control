@@ -255,17 +255,24 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             output.extend(chunk)
         return bytes(output)
 
-    def minecraft_ping(port):
+    def minecraft_ping(port, host="127.0.0.1"):
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.8) as stream:
-                stream.settimeout(0.8)
-                host = b"127.0.0.1"
-                handshake = varint(0) + varint(763) + varint(len(host)) + host + struct.pack(">H", port) + varint(1)
+            with socket.create_connection((host, port), timeout=2) as stream:
+                stream.settimeout(2)
+                encoded_host = host.encode("utf-8")
+                handshake = varint(0) + varint(763) + varint(len(encoded_host)) + encoded_host + struct.pack(">H", port) + varint(1)
                 stream.sendall(varint(len(handshake)) + handshake + b"\x01\x00")
-                read_varint(stream)
+                packet_length = read_varint(stream)
+                if not 1 <= packet_length <= 1048576:
+                    raise OSError("invalid Minecraft packet length")
                 if read_varint(stream) != 0:
                     raise OSError("unexpected Minecraft packet")
-                payload = json.loads(read_exact(stream, read_varint(stream)).decode("utf-8", "replace"))
+                length = read_varint(stream)
+                if not 0 < length < packet_length:
+                    raise OSError("invalid Minecraft status length")
+                payload = json.loads(read_exact(stream, length).decode("utf-8", "replace"))
+                if not isinstance(payload, dict) or not any(key in payload for key in ("version", "players", "description")):
+                    raise ValueError("invalid Minecraft status object")
                 players = payload.get("players") if isinstance(payload.get("players"), dict) else {}
                 return True, players.get("online"), players.get("max")
         except (OSError, ValueError, json.JSONDecodeError):
@@ -324,6 +331,60 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
                     pass
         return port if 1 <= port <= 65535 else 25565
 
+    def minecraft_host(directory):
+        for line in read_text(directory / "server.properties").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "server-ip":
+                value = value.strip()
+                return "127.0.0.1" if value in ("", "0.0.0.0") else "::1" if value == "::" else value
+        return "127.0.0.1"
+
+    def startup_evidence(log_path, session_id, started_epoch, ping_ready, cache_path):
+        # Keep readiness for this service run and scan long Forge logs incrementally.
+        try:
+            info = log_path.stat()
+        except OSError:
+            return ping_ready, []
+        if started_epoch and info.st_mtime + 1 < started_epoch:
+            return ping_ready, []
+        key = [session_id, str(log_path), info.st_dev, info.st_ino]
+        try:
+            cache = json.loads(read_text(cache_path))
+            if not isinstance(cache, dict):
+                cache = {}
+        except (ValueError, TypeError):
+            cache = {}
+        offset = cache.get("offset", 0)
+        if not session_id or cache.get("key") != key or not isinstance(offset, int) or not 0 <= offset <= info.st_size:
+            cache, offset = {}, 0
+        ready = ping_ready or bool(cache.get("ready"))
+        lines = cache.get("lines", [])
+        lines = lines if isinstance(lines, list) else []
+        if not ready:
+            try:
+                with open(log_path, "rb") as source:
+                    source.seek(offset)
+                    chunk = source.read(4 * 1024 * 1024)
+                    # Keep a partial final line for the next poll.
+                    end = chunk.rfind(b"\n") + 1
+                    if not end and len(chunk) == 4 * 1024 * 1024:
+                        end = len(chunk)
+                    current = chunk[:end].decode("utf-8", "replace").splitlines()
+                    offset += end
+                    ready = completed_startup(current)
+                    lines = select_startup_markers(lines + current, count=200)
+            except OSError:
+                pass
+        if session_id:
+            try:
+                cache_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                temporary = cache_path.with_name(cache_path.name + "." + str(os.getpid()))
+                temporary.write_text(json.dumps({"key": key, "offset": info.st_size if ready else offset, "ready": ready, "lines": [] if ready else lines}), encoding="utf-8")
+                os.replace(temporary, cache_path)
+            except OSError:
+                pass
+        return ready, lines
+
     try:
         uptime = max(0, int(float(read_text("/proc/uptime", 128).split()[0])))
     except (IndexError, ValueError):
@@ -358,23 +419,28 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     active_profile = active_minecraft_profile()
     minecraft_directory = Path(active_profile["directory"])
     port = minecraft_port(minecraft_directory, active_profile.get("port"))
-    ready, online_players, maximum_players = minecraft_ping(port)
+    ready, online_players, maximum_players = minecraft_ping(port, minecraft_host(minecraft_directory))
     try:
         start_id = int(service.get("ExecMainStartTimestampMonotonic", "0") or 0)
     except ValueError:
         start_id = 0
     log_directory = minecraft_directory / "logs"
     latest_log = log_directory / "latest.log"
-    current_lines = read_log_start(latest_log)
-    if start_id:
-        try:
-            boot_epoch = time.time() - float(read_text("/proc/uptime", 128).split()[0])
-            service_started_epoch = boot_epoch + start_id / 1000000
-            if latest_log.stat().st_mtime + 1 < service_started_epoch:
-                current_lines = []
-        except (OSError, IndexError, ValueError):
-            pass
-    reference = startup_reference(log_directory, current_lines)
+    service_started_epoch = 0
+    try:
+        if start_id:
+            service_started_epoch = time.time() - float(read_text("/proc/uptime", 128).split()[0]) + start_id / 1000000
+    except (IndexError, ValueError):
+        pass
+    session_id = ":".join((read_text("/proc/sys/kernel/random/boot_id", 128).strip(), str(start_id), service.get("MainPID", "0"))) if start_id else ""
+    current_lines, reference = [], []
+    if active_state in ("active", "activating") and not restart_loop:
+        ready, current_lines = startup_evidence(
+            latest_log, session_id, service_started_epoch, ready,
+            Path("/run/server-control-status/readiness.json"),
+        )
+        if not ready:
+            reference = startup_reference(log_directory, current_lines)
     if active_state == "failed" or restart_loop:
         minecraft_state = "CRASHED"
     elif active_state == "deactivating":
