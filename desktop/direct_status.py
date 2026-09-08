@@ -18,6 +18,7 @@ from typing import Any, Callable
 import paramiko
 
 from direct_instances import MAX_MANAGER_RESPONSE_BYTES, manager_command
+from direct_performance import REMOTE_PERFORMANCE_PROGRAM
 from ssh_terminal import HostFingerprintPolicy, connection_targets, load_private_key
 
 
@@ -315,6 +316,7 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             "name": str(selected.get("name") or selected.get("id") or fallback["name"]),
             "directory": str(directory),
             "port": selected.get("port", fallback["port"]),
+            "loader": str(selected.get("loader") or ""),
         }
 
     def minecraft_port(directory, configured):
@@ -385,6 +387,8 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
                 pass
         return ready, lines
 
+    __PERFORMANCE_PROGRAM__
+
     try:
         uptime = max(0, int(float(read_text("/proc/uptime", 128).split()[0])))
     except (IndexError, ValueError):
@@ -397,7 +401,7 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     disk_used = disk.total - disk.free
     code, service_output = run([
         "systemctl", "show", "dragonfyre.service",
-        "--property=ActiveState,SubState,MainPID,ExecMainStartTimestampMonotonic,Result,NRestarts,ExecMainStatus", "--no-pager",
+        "--property=ActiveState,SubState,MainPID,ControlGroup,ExecMainStartTimestampMonotonic,Result,NRestarts,ExecMainStatus", "--no-pager",
     ])
     service = {}
     if code == 0:
@@ -419,7 +423,8 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
     active_profile = active_minecraft_profile()
     minecraft_directory = Path(active_profile["directory"])
     port = minecraft_port(minecraft_directory, active_profile.get("port"))
-    ready, online_players, maximum_players = minecraft_ping(port, minecraft_host(minecraft_directory))
+    minecraft_address = minecraft_host(minecraft_directory)
+    ready, online_players, maximum_players = minecraft_ping(port, minecraft_address)
     try:
         start_id = int(service.get("ExecMainStartTimestampMonotonic", "0") or 0)
     except ValueError:
@@ -461,10 +466,15 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             },
             "STOPPED": {"progress": 0, "label": "Служба остановлена", "ready": False},
         }[minecraft_state]
+    ip_addresses = run(["hostname", "-I"], timeout=2)[1].split()
+    process, performance = collect_minecraft_telemetry(
+        service, active_profile, minecraft_state, session_id, minecraft_address,
+        ip_addresses, Path("/run/server-control-status/telemetry.json"),
+    )
     collected_at = int(time.time() * 1000)
     snapshot = {
         "hostname": socket.gethostname(),
-        "ip_addresses": run(["hostname", "-I"], timeout=2)[1].split(),
+        "ip_addresses": ip_addresses,
         "metrics": {
             "cpu": {"percent": cpu_percent(), "load_average": loads},
             "memory": memory_status(),
@@ -486,13 +496,14 @@ REMOTE_STATUS_PROGRAM = textwrap.dedent(
             "exit_status": exit_status, "restart_loop": restart_loop,
             "pid": int(service.get("MainPID", "0") or 0) or None,
             "port": port, "startup": startup,
+            "process": process, "performance": performance,
             "players": {"online": online_players, "max": maximum_players, "names": []},
         },
         "collected_at": collected_at,
     }
     print(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
     """
-).strip()
+).strip().replace("__PERFORMANCE_PROGRAM__", REMOTE_PERFORMANCE_PROGRAM)
 
 _REMOTE_CODE = "import base64;exec(compile(base64.b64decode(" + repr(
     base64.b64encode(REMOTE_STATUS_PROGRAM.encode("utf-8")).decode("ascii")

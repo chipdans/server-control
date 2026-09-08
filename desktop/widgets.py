@@ -590,8 +590,10 @@ class MetricCard(ttk.Frame):
         icon: str = "◆",
         accent: str = "#2f80ff",
         mode: str = "bar",
+        wrap_detail: bool = False,
+        height: int = 182,
     ) -> None:
-        super().__init__(parent, style="Card.TFrame", padding=15, height=182)
+        super().__init__(parent, style="Card.TFrame", padding=15, height=height)
         self.pack_propagate(False)
         self.grid_propagate(False)
         self.accent = accent
@@ -616,7 +618,10 @@ class MetricCard(ttk.Frame):
         badge.pack(side="left")
         ttk.Label(header, text=title, style="MetricTitle.TLabel").pack(side="left", padx=(10, 0))
         ttk.Label(self, textvariable=self.value, style="MetricValue.TLabel").pack(anchor="w", pady=(14, 0))
-        ttk.Label(self, textvariable=self.detail, style="MetricDetail.TLabel").pack(anchor="w", pady=(3, 7))
+        self.detail_label = ttk.Label(self, textvariable=self.detail, style="MetricDetail.TLabel")
+        self.detail_label.pack(anchor="w", pady=(3, 7))
+        if wrap_detail:
+            self.bind("<Configure>", lambda event: self.detail_label.configure(wraplength=max(100, event.width - 32)))
         self.graph = tk.Canvas(self, height=46, background="#0c1724", highlightthickness=0)
         self.graph.pack(side="bottom", fill="x")
         self.graph.bind("<Configure>", lambda _event: self._draw())

@@ -74,6 +74,8 @@ jobs:
         run: |
           python -m unittest discover -s tests -p "test_explorer*.py" -v
           if ($LASTEXITCODE -ne 0) { throw "Windows explorer tests failed" }
+          python -m unittest discover -s tests -p "test_dashboard_gui.py" -v
+          if ($LASTEXITCODE -ne 0) { throw "Windows dashboard tests failed" }
 
       - name: Build Windows client
         run: >-

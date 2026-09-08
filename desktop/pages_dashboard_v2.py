@@ -30,6 +30,57 @@ def selected_minecraft_status(status: dict[str, Any], fallback_selected_id: str 
     return mapping(status.get("minecraft"))
 
 
+def minecraft_diagnostics(instance: dict[str, Any], metrics: dict[str, Any], online: bool) -> dict[str, Any]:
+    """Describe measured tick health without guessing a CPU or mod bottleneck."""
+
+    performance = mapping(instance.get("performance"))
+    process = mapping(instance.get("process")) if online else {}
+    state = str(instance.get("state") or "UNKNOWN").upper()
+    age = numeric_value(performance.get("age_seconds"))
+    tps, mspt = numeric_value(performance.get("tps")), numeric_value(performance.get("mspt"))
+    fresh = online and state == "RUNNING" and performance.get("status") == "ok" and age is not None and age <= 75
+    if not fresh:
+        tps, mspt = None, None
+    tone = "warning"
+    if not online:
+        message = "Нет связи с сервером. Новые измерения временно недоступны."
+    elif state == "STARTING":
+        message = "Сборка запускается. TPS и время тика появятся после загрузки мира."
+    elif state == "CRASHED":
+        message, tone = "Minecraft завершился с ошибкой. Подробности — в консоли и журнале сборки.", "danger"
+    elif state != "RUNNING":
+        message = "Minecraft сейчас не работает; скорость симуляции не измеряется."
+    elif tps is None or mspt is None:
+        messages = {
+            "disabled": "Для TPS и времени тика нужен включённый RCON. CPU и память Java измеряются независимо.",
+            "unconfigured": "Для TPS задайте порт и пароль RCON в настройках сервера, затем перезапустите Minecraft.",
+            "auth_failed": "Сервер отклонил пароль RCON. Проверьте настройки и перезапустите Minecraft после их изменения.",
+            "unsupported": "Сервер не отдаёт итоговые TPS/MSPT через команды Forge или NeoForge. CPU и память Java доступны.",
+            "timeout": "Minecraft не ответил на запрос TPS вовремя. Это не означает, что сервер остановлен.",
+        }
+        message = messages.get(str(performance.get("status")), "Свежие TPS/MSPT пока недоступны. CPU и память Java измеряются независимо.")
+    elif tps < 18 or mspt > 50:
+        message, tone = "Сервер замедляется: обработка мира не укладывается в темп 20 тиков/с. Для поиска причины нужен профиль нагрузки.", "danger"
+    elif tps < 19.5 or mspt >= 40:
+        message = "Запас производительности небольшой. При дополнительной нагрузке возможны задержки."
+    else:
+        message, tone = "Скорость симуляции в норме. Одно измерение не исключает короткие зависания между опросами.", "success"
+    if online and state == "RUNNING":
+        memory_percent = numeric_value(mapping(metrics.get("memory")).get("percent"))
+        disk_free = numeric_value(mapping(metrics.get("filesystem")).get("available_bytes"))
+        if memory_percent is not None and memory_percent >= 90:
+            message += " На компьютере мало свободной памяти."
+            tone = "warning" if tone == "success" else tone
+        if disk_free is not None and disk_free < 5 * 1024 ** 3:
+            message += " На диске осталось меньше 5 ГБ."
+            tone = "warning" if tone == "success" else tone
+    return {
+        "tps": tps, "mspt": mspt, "process": process, "message": message, "tone": tone,
+        "age_seconds": age if fresh else None,
+        "sample_id": performance.get("measured_at") if fresh else None,
+    }
+
+
 class StateCard(ttk.Frame):
     def __init__(self, parent: tk.Misc, title: str, *, icon: str, accent: str) -> None:
         super().__init__(parent, style="Card.TFrame", padding=18, height=206)
@@ -82,7 +133,17 @@ class DashboardPage(BasePage):
 
     def __init__(self, parent: tk.Misc, panel: Any) -> None:
         super().__init__(parent, panel)
-        summary = ttk.Frame(self)
+        # Keep the dashboard usable at the application's minimum window height.
+        self.canvas = tk.Canvas(self, highlightthickness=0, background="#07111d")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        body = ttk.Frame(self.canvas)
+        body_id = self.canvas.create_window((0, 0), window=body, anchor="nw")
+        self.canvas.bind("<Configure>", lambda event: self.canvas.itemconfigure(body_id, width=event.width))
+        body.bind("<Configure>", lambda _event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        summary = ttk.Frame(body)
         summary.pack(fill="x")
         self.hub = StateCard(summary, "Приложение", icon="⌁", accent="#ff545d")
         self.power = StateCard(summary, "Питание сервера", icon="⏻", accent="#62d84e")
@@ -93,7 +154,7 @@ class DashboardPage(BasePage):
             summary.columnconfigure(column, weight=1)
         summary.rowconfigure(0, weight=1)
 
-        actions = ttk.Frame(self)
+        actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(10, 12))
         if panel.state.has_permission("server.power") or panel.state.has_permission("power_control"):
             ttk.Button(actions, text="⏻  Включить питание", style="Success.TButton", command=lambda: panel.power_action(True)).pack(side="left")
@@ -109,22 +170,58 @@ class DashboardPage(BasePage):
                 command=panel.restart_minecraft,
             ).pack(side="right")
 
-        metrics = ttk.Frame(self)
-        metrics.pack(fill="x")
+        tabs = ttk.Notebook(body)
+        tabs.pack(fill="x")
+        minecraft_metrics = ttk.Frame(tabs, padding=(0, 8, 0, 0))
+        metrics = ttk.Frame(tabs, padding=(0, 8, 0, 0))
+        tabs.add(minecraft_metrics, text="Minecraft")
+        tabs.add(metrics, text="Домашний сервер")
+        self.tps = MetricCard(minecraft_metrics, "Скорость · TPS", icon="◆", accent="#62d84e", mode="line", wrap_detail=True, height=204)
+        self.mspt = MetricCard(minecraft_metrics, "Время тика", icon="◷", accent="#a767ff", mode="line", wrap_detail=True, height=204)
+        self.java_cpu = MetricCard(minecraft_metrics, "CPU Java", icon="▦", accent="#2f80ff", mode="line", wrap_detail=True, height=204)
+        self.java_memory = MetricCard(minecraft_metrics, "Память Java", icon="▤", accent="#62d84e", wrap_detail=True, height=204)
+        for column, card in enumerate((self.tps, self.mspt, self.java_cpu, self.java_memory)):
+            card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 7, 0 if column == 3 else 7))
+            minecraft_metrics.columnconfigure(column, weight=1, uniform="minecraft_metrics")
+        self._diagnostic_session = None
+        self.diagnostic_text = tk.StringVar(value="Ожидаю измерения Minecraft…")
+        self.diagnostic_label = ttk.Label(
+            minecraft_metrics, textvariable=self.diagnostic_text, style="Subtle.TLabel", wraplength=900, padding=(4, 10),
+        )
+        self.diagnostic_label.grid(row=1, column=0, columnspan=4, sticky="ew")
+        minecraft_metrics.bind("<Configure>", lambda event: self.diagnostic_label.configure(wraplength=max(200, event.width - 16)))
         self.cpu = MetricCard(metrics, "CPU", icon="▦", accent="#2f80ff", mode="line")
         self.memory = MetricCard(metrics, "Оперативная память", icon="▤", accent="#62d84e")
         self.disk = MetricCard(metrics, "Диск /", icon="▱", accent="#2f80ff")
         self.temperature = MetricCard(metrics, "Температура и аптайм", icon="♨", accent="#ff8a1f", mode="line")
         for column, card in enumerate((self.cpu, self.memory, self.disk, self.temperature)):
             card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 7, 0 if column == 3 else 7))
-            metrics.columnconfigure(column, weight=1)
+            metrics.columnconfigure(column, weight=1, uniform="host_metrics")
         metrics.rowconfigure(0, weight=1)
 
         self.info = tk.StringVar(value="Подключаюсь к серверу напрямую по SSH…")
-        info = ttk.Frame(self, style="Card.TFrame", padding=(15, 11))
+        info = ttk.Frame(body, style="Card.TFrame", padding=(15, 11))
         info.pack(fill="x", pady=(14, 0))
         ttk.Label(info, text="ⓘ", style="Surface.TLabel", foreground="#2f80ff", font=("Segoe UI Symbol", 13)).pack(side="left", padx=(0, 10))
-        ttk.Label(info, textvariable=self.info, style="SurfaceSubtle.TLabel", wraplength=1050).pack(side="left", fill="x", expand=True)
+        info_label = ttk.Label(info, textvariable=self.info, style="SurfaceSubtle.TLabel", wraplength=900)
+        info_label.pack(side="left", fill="x", expand=True)
+        info.bind("<Configure>", lambda event: info_label.configure(wraplength=max(200, event.width - 65)))
+        self._bind_scroll(body)
+        self.canvas.bind("<MouseWheel>", self._scroll)
+        self.canvas.bind("<Button-4>", self._scroll)
+        self.canvas.bind("<Button-5>", self._scroll)
+
+    def _bind_scroll(self, widget: tk.Misc) -> None:
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, self._scroll, add="+")
+        for child in widget.winfo_children():
+            self._bind_scroll(child)
+
+    def _scroll(self, event: tk.Event) -> str:
+        if self.canvas.yview() != (0.0, 1.0):
+            step = -1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1
+            self.canvas.yview_scroll(step * 3, "units")
+        return "break"
 
     def update_state(self, _changes: dict[str, Any] | None = None) -> None:
         state = self.panel.state
@@ -186,6 +283,37 @@ class DashboardPage(BasePage):
         startup_progress = numeric_value(startup.get("progress")) if minecraft_state.upper() == "STARTING" else None
         self.minecraft.set(minecraft_label, detail, tone=minecraft_tone, progress=startup_progress)
 
+        diagnostic = minecraft_diagnostics(instance, metrics, online and state.connected)
+        process = mapping(diagnostic["process"])
+        session = (instance.get("id"), startup.get("start_id"), process.get("pid"))
+        if session != self._diagnostic_session or not online or not state.connected or minecraft_state.upper() != "RUNNING":
+            for card in (self.tps, self.mspt, self.java_cpu, self.java_memory):
+                card.history.clear()
+                card._sample_id = object()
+            self._diagnostic_session = session
+        tps, mspt = diagnostic["tps"], diagnostic["mspt"]
+        sample_id = diagnostic["sample_id"]
+        age = diagnostic["age_seconds"]
+        age_text = f" · {int(age)} с назад" if age is not None else ""
+        for card, value in ((self.tps, tps), (self.mspt, mspt)):
+            if value is None:
+                card.history.clear()
+        self.tps.set(f"{tps:.1f} / 20" if tps is not None else "—", detail="Норма: 20 тиков/с" + age_text, progress=tps * 5 if tps is not None else None, sample_id=sample_id)
+        self.mspt.set(f"{mspt:.1f} мс" if mspt is not None else "—", detail="Бюджет тика: 50 мс", progress=mspt, sample_id=sample_id)
+        java_percent, java_text = display_percent(process.get("cpu_percent"))
+        self.java_cpu.set(
+            java_text, detail="Доля общей мощности CPU", progress=java_percent if process.get("cpu_percent") is not None else None,
+            sample_id=(session, metrics.get("collected_at")),
+        )
+        total_memory = numeric_value(mapping(metrics.get("memory")).get("total_bytes"))
+        java_bytes = numeric_value(process.get("memory_bytes"))
+        self.java_memory.set(
+            display_bytes(java_bytes), detail="Занято процессом · не лимит Java",
+            progress=java_bytes * 100 / total_memory if java_bytes is not None and total_memory else None,
+        )
+        self.diagnostic_text.set(diagnostic["message"])
+        self.diagnostic_label.configure(foreground={"success": "#62d84e", "warning": "#ffbd4a", "danger": "#ff545d"}[diagnostic["tone"]])
+
         cpu = mapping(metrics.get("cpu"))
         cpu_percent, cpu_text = display_percent(cpu.get("percent"))
         loads = cpu.get("load_average") if isinstance(cpu.get("load_average"), list) else []
@@ -213,6 +341,6 @@ class DashboardPage(BasePage):
 
         addresses = mapping(status.get("system")).get("ip_addresses")
         self.info.set(
-            f"Прямой SSH · IP: {', '.join(str(value) for value in addresses) if isinstance(addresses, list) and addresses else '—'} · "
-            "Agent для сбора состояния не используется; обновление каждые 5 секунд."
+            f"IP: {', '.join(str(value) for value in addresses) if isinstance(addresses, list) and addresses else '—'} · "
+            "Состояние: каждые 5 секунд · TPS/MSPT: каждые 30 секунд."
         )
